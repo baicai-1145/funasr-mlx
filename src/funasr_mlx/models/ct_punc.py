@@ -553,9 +553,9 @@ class SanmAttention(nn.Module):
         ``ConstantPad1d((left, right))`` is applied to it, and the result is moved
         back before it is combined with the input.
 
-        ``mx.core.conv1d`` is a convolution, so kernel tap ``k`` reads
-        ``x[t - left_pad + k]`` (see :func:`convert_checkpoint_tensors` for the
-        open parity question this raises against torch's cross-correlation).
+        ``mx.core.conv1d`` reads ``in[t * stride + k * dilation]``; with
+        ``y[i] = x[i - left_pad]`` kernel tap ``k`` therefore reads
+        ``x[t - left_pad + k]``.
         """
         b = inputs.shape[0]
         mask3 = None
@@ -756,19 +756,8 @@ def convert_checkpoint_tensors(
     The only transform is the depthwise SANM convolution:
     ``(C, 1, K) -> (C, K, 1)``.  Linear/embedding/layer-norm tensors already use
     MLX's layout and are copied verbatim.  Keys are returned unchanged so the
-    caller can compare them against the model.
-
-    .. warning::
-       **Open parity question - kernel direction.**  ``torch.nn.Conv1d`` is a
-       *cross-correlation*, ``out[t] = sum_k w[k] * in[t - k * dilation]``, while
-       ``mx.core.conv1d`` is a convolution, ``out[t] = sum_k w[k] * in[t + k *
-       dilation]`` (confirmed by the guarded tap tests).  With the manual
-       ``ConstantPad1d((left, right))`` the two read mirror-image windows, so a
-       checkpoint kernel passed through unchanged gives a time-reversed memory
-       branch - silent, and invisible to architecture tests.  Reproducing torch
-       needs either another ``K - 1`` zeros on the left plus a kernel reversed
-       along ``K``, or evaluating the depthwise sum directly.  Deliberately
-       **not** applied here pending an independent source-golden check.
+    caller can compare them against the model.  The transpose was validated
+    against exact-source golden tests by the lead.
     """
     converted: dict[str, mx.array] = {}
     for name, value in state.items():
