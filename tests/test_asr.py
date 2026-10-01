@@ -12,6 +12,8 @@ skips itself when MLX is not installed, so collection never fails.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 mx = pytest.importorskip("mlx.core", reason="mlx is required for the model ports")
@@ -35,7 +37,11 @@ from funasr_mlx.models.sanm import (  # noqa: E402
     CONV2D_LAYOUT,
     IDENTITY_LAYOUT,
     CheckpointKeyError,
+    Conv2dSubsampling,
     ModuleStack,
+    PositionalEncoding,
+    SinusoidalPositionEncoder,
+    attention_blocked,
     check_short_utt,
     constant_pad_1d,
     convert_checkpoint_tensor,
@@ -456,6 +462,181 @@ def test_cif_tail_without_mask_appends_the_threshold():
     assert token_num.tolist() == [0.0, 0.0]
 
 
+def _deterministic_cif_predictor(tail_threshold: float) -> CifPredictorV2:
+    """A CIF predictor whose alphas are a known constant.
+
+    Zeroing both conv/linear weights and setting ``cif_output.bias = 2.0`` makes
+    every frame emit ``relu(sigmoid(2.0) - 0.0) == sigmoid(2.0)``, so the alpha
+    sum is exactly ``frames * sigmoid(2.0)``.  No random initialisation is
+    involved, so the assertions below are exact rather than merely plausible.
+    """
+    predictor = CifPredictorV2(idim=4, tail_threshold=tail_threshold)
+    predictor.cif_conv1d.weight = mx.zeros((4, 3, 4))
+    predictor.cif_conv1d.bias = mx.zeros((4,))
+    predictor.cif_output.weight = mx.zeros((1, 4))
+    predictor.cif_output.bias = mx.array([[2.0]])
+    return predictor
+
+
+def test_cif_token_num_is_not_floored_when_the_tail_is_disabled():
+    """Regression: the ``tail_threshold <= 0`` path must return the raw sum.
+
+    Reference ``cif_predictor.py:293`` is ``token_num = alphas.sum(-1)`` with no
+    floor; only ``tail_process_fn`` floors (``:461``).  Flooring here would change
+    the downstream ``round(token_num)`` applied by ``Paraformer.forward``.
+    """
+    predictor = _deterministic_cif_predictor(tail_threshold=0.0)
+    hidden = mx.zeros((1, 6, 4))
+    _, token_num, alphas, _ = predictor(hidden, None)
+
+    expected = 6.0 * (1.0 / (1.0 + math.exp(-2.0)))
+    assert mx.allclose(alphas, mx.full((1, 6), 1.0 / (1.0 + math.exp(-2.0))), atol=1e-6).item()
+    assert mx.allclose(token_num, mx.array([expected]), atol=1e-6).item()
+    # The exact value is fractional, and it must NOT have been floored to 5.0.
+    assert expected > math.floor(expected)
+    assert not mx.allclose(token_num, mx.array([float(math.floor(expected))]), atol=1e-6).item()
+
+
+def test_cif_token_num_is_floored_only_on_the_tail_path():
+    """With ``tail_threshold > 0`` the floor from ``tail_process_fn`` applies."""
+    predictor = _deterministic_cif_predictor(tail_threshold=0.45)
+    hidden = mx.zeros((1, 6, 4))
+    mask = mx.ones((1, 1, 6))
+    _, token_num, alphas, _ = predictor(hidden, mask)
+
+    raw = 6.0 * (1.0 / (1.0 + math.exp(-2.0))) + 0.45  # + the appended tail
+    assert mx.allclose(token_num, mx.array([float(math.floor(raw))]), atol=1e-6).item()
+
+
+# --------------------------------------------------------------------------- #
+# review regressions: positional encoding, mask normalisation, containers
+# --------------------------------------------------------------------------- #
+def test_positional_encoding_interleaves_sin_and_cos():
+    """Regression: the reference writes ``pe[:, 0::2]=sin`` / ``pe[:, 1::2]=cos``.
+
+    Concatenating ``[sin, cos]`` instead silently corrupts every column from
+    ``d_model // 2`` onward.  Position 0 has phase 0 everywhere, so an
+    interleaved row is ``[0, 1, 0, 1, ...]`` while a concatenated row would be
+    ``[0] * 4 + [1] * 4`` -- an unambiguous discriminator.
+    """
+    d_model = 8
+    pe = PositionalEncoding(d_model=d_model)
+    table = pe._table(3, mx.float32)
+    assert table.shape == (3, d_model)
+    assert [round(v, 6) for v in table[0].tolist()] == [0.0, 1.0] * (d_model // 2)
+
+    # Even columns are sin, odd columns are cos, at a non-trivial position too.
+    div_term = [math.exp(-math.log(10000.0) / d_model * (2 * i)) for i in range(d_model // 2)]
+    expected_row1 = []
+    for phase in div_term:
+        expected_row1 += [math.sin(1.0 * phase), math.cos(1.0 * phase)]
+    assert [round(v, 6) for v in table[1].tolist()] == [round(v, 6) for v in expected_row1]
+
+
+def test_sinusoidal_position_encoder_stays_concatenated():
+    """The opposite convention: FunASR's ``SinusoidalPositionEncoder`` truly
+    concatenates sin-then-cos.  The two must not be made to match."""
+    d_model = 8
+    encoder = SinusoidalPositionEncoder(d_model=d_model)
+    encoded = encoder.encode(mx.array([[0]]), depth=d_model).squeeze(0).squeeze(0)
+    assert [round(v, 6) for v in encoded.tolist()] == [0.0] * 4 + [1.0] * 4
+    # ... and it genuinely differs from the interleaved PositionalEncoding table.
+    interleaved = PositionalEncoding(d_model=d_model)._table(1, mx.float32).squeeze(0)
+    assert [round(v, 6) for v in interleaved.tolist()] == [0.0, 1.0] * 4
+
+
+def test_attention_blocked_is_dtype_explicit():
+    """Regression: boolean masks must block padding too.
+
+    ``mask == 0`` is only meaningful for numeric masks; on a boolean array its
+    answer depends on MLX's cross-type comparison promotion, which is not
+    something to assume.  ``attention_blocked`` branches on the dtype, so both
+    conventions agree without relying on that promotion.
+    """
+    numeric = mx.array([[1.0, 0.0, 0.0]])
+    boolean = mx.array([[True, False, False]])
+    for mask in (numeric, boolean):
+        blocked = attention_blocked(mask)
+        assert blocked.dtype == mx.bool_
+        assert blocked.shape == (1, 1, 3)
+        assert blocked.tolist() == [[[False, True, True]]]
+
+
+def test_conv2d_subsampling_is_batch_size_independent():
+    """Regression: ``ModuleStack`` must not unpack the batch axis.
+
+    ``conv = [Conv2d, ReLU, Conv2d, ReLU]`` returns a single array, so feeding a
+    block's return value back as ``*args`` would hand the next block ``B``
+    arguments.  That only worked at batch size 1.
+    """
+    sub = Conv2dSubsampling(idim=8, odim=6)
+    x1 = mx.arange(1 * 12 * 8, dtype=mx.float32).reshape(1, 12, 8) / 97.0
+    x2 = mx.concatenate([x1, x1], axis=0)
+
+    out1, mask1 = sub(x1, mx.ones((1, 1, 12)))
+    out2, mask2 = sub(x2, mx.ones((2, 1, 12)))
+
+    assert out1.shape == (1, 2, 6)
+    assert out2.shape == (2, 2, 6)
+    assert mask1.shape == (1, 1, 2)
+    assert mask2.shape == (2, 1, 2)
+    assert mx.allclose(out2[0], out1[0], atol=1e-5).item()
+    assert mx.allclose(out2[1], out1[0], atol=1e-5).item()
+
+
+def test_module_stack_threads_the_leading_argument_only():
+    """Regression: the chain keeps trailing args/keywords fixed across blocks."""
+    seen = []
+
+    class _Spy(mxnn.Module):
+        def __init__(self, tag: str) -> None:
+            super().__init__()
+            self._tag = tag
+
+        def __call__(self, x: mx.array, extra=None):
+            seen.append((self._tag, tuple(x.shape), extra))
+            return x + 1
+
+    stack = ModuleStack([_Spy("a"), _Spy("b")])
+    out = stack(mx.zeros((4, 3)), extra="k")
+    assert out.shape == (4, 3)
+    assert mx.allclose(out, mx.full((4, 3), 2.0)).item()
+    assert [tag for tag, _, _ in seen] == ["a", "b"]
+    # Each block received the whole batch, not B separate scalars.
+    assert all(shape == (4, 3) for _, shape, _ in seen)
+    assert all(extra == "k" for _, _, extra in seen)
+    with pytest.raises(TypeError):
+        stack()
+
+
+def test_decoder_output_is_invariant_to_the_padded_memory_tail():
+    """Regression: a padded memory frame must not influence the logits.
+
+    Garbage is written into the padded region of the cross-attention memory; the
+    masked decoder output for the valid frames must be unchanged.
+    """
+    decoder = ParaformerSANMDecoder(
+        vocab_size=13, encoder_output_size=8, config=_paraformer_config().decoder_conf
+    )
+    decoder.eval()
+    tokens = mx.array([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=mx.int32)
+    lens = mx.array([3, 2])
+    memory = mx.arange(2 * 8 * 8, dtype=mx.float32).reshape(2, 8, 8) / 53.0
+    hlens = mx.array([5, 3])
+
+    clean, _ = decoder(memory, hlens, tokens, lens)
+
+    # Ragged batch: hlens = [5, 3].  Corrupt *each row's own* padded frames only
+    # (frames >= hlens[b]) and leave every valid frame untouched.  A correctly
+    # masked decoder must return bit-identical logits.
+    padded = mx.logical_not(mx.arange(8)[None, :] < hlens[:, None])  # (2, 8)
+    corrupted = mx.where(mx.expand_dims(padded, -1), memory + 1000.0, memory)
+    dirty, _ = decoder(corrupted, hlens, tokens, lens)
+    assert mx.allclose(clean, dirty, atol=1e-4).item()
+    # Sanity: the corruption really did reach the padded region.
+    assert not mx.allclose(mx.sum(corrupted, axis=-1), mx.sum(memory, axis=-1)).item()
+
+
 def test_cif_predictor_config_defaults_follow_paraformer():
     cfg = CifPredictorConfig()
     assert (cfg.threshold, cfg.l_order, cfg.r_order, cfg.tail_threshold) == (
@@ -677,10 +858,23 @@ def test_ctc_greedy_decode_collapses_before_dropping_blanks():
 
 
 def test_ctc_greedy_decode_respects_lengths():
-    log_probs = mx.zeros((2, 4, 3))
-    ids = mx.argmax(log_probs, axis=-1)  # all zeros -> token 0 == blank
-    assert ctc_greedy_decode(log_probs, mx.array([4, 2]), blank_id=0) == [[], []]
-    assert ids.tolist() == [[0, 0, 0, 0], [0, 0, 0, 0]]
+    # Deterministic known logits, so the assertion has teeth: both rows have
+    # *non-blank* argmax tokens inside their valid frames and deliberately
+    # different spurious tokens in the padded tail.  Lengths must truncate them.
+    #   row 0 (ilen=3): argmax [1, 1, 1, 2]  -> tail's 2 must be dropped
+    #   row 1 (ilen=1): argmax [1, 2, 2, 1]  -> tail's 2, 2, 1 must be dropped
+    log_probs = mx.log(
+        mx.array(
+            [
+                [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+            ]
+        )
+    )
+    assert mx.argmax(log_probs, axis=-1).tolist() == [[1, 1, 1, 2], [1, 2, 2, 1]]
+    assert ctc_greedy_decode(log_probs, mx.array([3, 1]), blank_id=0) == [[1, 1, 1], [1]]
+    # Decoding the full padded batch instead would leak the tail tokens.
+    assert ctc_greedy_decode(log_probs, mx.array([4, 4]), blank_id=0) == [[1, 1, 1, 2], [1, 2, 1]]
 
 
 # --------------------------------------------------------------------------- #

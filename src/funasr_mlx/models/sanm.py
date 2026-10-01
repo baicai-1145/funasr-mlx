@@ -42,6 +42,38 @@ Design rules enforced here
 4. **Inference only.**  Every dropout in the reference is an identity in eval
    mode and is therefore elided; stochastic depth (train-time only) is dropped.
    No training losses are ported.
+
+Known deviations and deliberately not-ported surface
+-----------------------------------------------------
+These are intentional and reviewed; none of them is a silent partial
+implementation.
+
+* **Streaming / chunked paths are not ported.**  ``forward_chunk``,
+  ``mask_shfit_chunk``, ``mask_chunk_predictor``, ``forward_one_step``,
+  ``forward_asf2``, ``SANMVadEncoder`` / ``SANMEncoder.forward(vad_indexes=...)``,
+  ``mask_att_chunk_encoder``, and the ``fa-zh`` timestamp prediction are
+  training/streaming-only in the reference and are absent here.
+* **``MultiHeadedAttentionSANMDecoder`` cache layout deviates (NLC, not NCL).**
+  The reference keeps the streaming cache in ``(b, d, L)`` (``cache = x`` taken
+  before the transpose); this port keeps ``(b, L, d)``.  Internally consistent
+  and behaviourally identical for offline inference, but it is a *different
+  runtime contract* from the reference's export/streaming path, so a cache
+  written by one cannot be read by the other.  Two further reference branches
+  are streaming-only and therefore absent: the
+  ``if x.size(1) != inputs.size(1): inputs = inputs[:, -1, :]`` step-position
+  guard, and populating the cache on the first (``cache is None``) call.
+* **``decimate_mask`` emulates ``x_mask[:, :, :-2:2][:, :, :-2:2]``** with an
+  explicit index list plus ``mx.take(..., axis=-1)``.  Behaviourally identical to
+  the slice, just not as cheap.
+* **CIF accumulation is float32.**  The reference uses float64 in
+  ``cif_v1``/``cif_wo_hidden_v1``; the peak-index thresholding in ``cif_v1`` is
+  the sensitive part and can differ by a hair near an exact tie.
+* **``cif_v1`` clamps ``max_label_len = min(max_label_len, t)``**; the reference
+  has no clamp (``cif_predictor.py:880``).  It is unreachable in practice since
+  ``alphas <= 1`` per frame plus at most one 0.45 tail gives ``floor(sum) <= t``.
+* **``PositionalEncoding(reverse=True)``** flips the position index where the
+  reference reverses an already-built table of length ``max_len``.  Identical for
+  ``reverse=False``, the only configured path.
 """
 
 from __future__ import annotations
@@ -58,6 +90,7 @@ __all__ = [
     "CONV2D_LAYOUT",
     "IDENTITY_LAYOUT",
     "LAYOUT_RULES",
+    "attention_blocked",
     "CheckpointKeyError",
     "Conv2dSubsampling",
     "Conv2dSubsampling2",
@@ -252,6 +285,33 @@ def _flatten(module: mxnn.Module, prefix: str = "") -> tuple[dict[str, mx.array]
     return tensors, rules
 
 
+def attention_blocked(mask: mx.array) -> mx.array:
+    """Boolean ``True`` where attention is blocked, for any mask dtype.
+
+    The reference does ``mask.unsqueeze(1).eq(0)`` on the **float** 1.0/0.0 mask
+    that FunASR's ``sequence_mask`` produces (its ``dtype`` defaults to
+    ``torch.float32``), so ``.eq(0)`` marks the padded positions.
+
+    Rather than re-implementing ``== 0`` on a dtype-agnostic array -- whose
+    answer depends on MLX's comparison type promotion between ``bool`` and
+    ``int``, i.e. whether ``False == 0`` is honoured -- this branches on the
+    mask's own dtype explicitly:
+
+    * ``bool`` masks mean "True = valid", so blocked is the logical negation.
+      ``logical_not`` is unambiguous and needs no promotion.
+    * numeric masks reproduce the reference's ``.eq(0)`` exactly, comparing
+      within a single dtype.
+
+    Both conversions are exact for the float masks this port actually produces,
+    so behaviour is unchanged while a boolean mask stops being silently ignored.
+    """
+    if mask.dtype == mx.bool_:
+        blocked = mx.logical_not(mask)
+    else:
+        blocked = mask == 0
+    return mx.expand_dims(blocked, 1)
+
+
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
     """Collect tensors from a module tree.
 
@@ -423,10 +483,20 @@ class ModuleStack(mxnn.Module):
         return dict.__getitem__(self, key)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        result: Any = args
+        """Chain blocks with canonical ``nn.Sequential`` semantics.
+
+        The leading argument is threaded through the chain while the remaining
+        positional arguments and the keywords stay fixed.  Feeding a block's
+        *return value* back as ``*args`` instead would unpack an ``mx.array``
+        along axis 0 and hand the next block ``B`` separate arguments, which
+        only works at batch size 1 or when the arities happen to line up.
+        """
+        if not args:
+            raise TypeError(f"{type(self).__name__}.__call__() requires at least one argument")
+        head, *rest = args
         for block in self:
-            result = block(*result, **kwargs)
-        return result
+            head = block(head, *rest, **kwargs)
+        return head
 
 
 def repeat(num_blocks: int, factory: Callable[[int], mxnn.Module]) -> ModuleStack:
@@ -479,6 +549,14 @@ class PositionalEncoding(mxnn.Module):
     Fixed sin/cos table scaled by ``sqrt(d_model)``.  The table is not a
     checkpoint parameter in FunASR (it is a plain attribute there), so it is
     regenerated on demand here instead of being stored as a buffer.
+
+    **Interleaved, not concatenated.**  The reference writes
+    ``pe[:, 0::2] = sin(...)`` / ``pe[:, 1::2] = cos(...)``, i.e. even columns
+    hold sin and odd columns hold cos.  Do not "simplify" this into a
+    ``concatenate([sin, cos])``: that is a different table and every column from
+    ``d_model // 2`` onward would be wrong.  Note that
+    :class:`SinusoidalPositionEncoder` genuinely *does* concatenate (see
+    ``embedding.py``), so the two must not be made to match.
     """
 
     def __init__(
@@ -495,16 +573,25 @@ class PositionalEncoding(mxnn.Module):
         self._xscale = math.sqrt(float(d_model))
 
     def _table(self, length: int, dtype: Any) -> mx.array:
+        # ``reverse`` flips the position index here; the reference instead
+        # reverses an already-built table of length ``max_len``.  Identical for
+        # ``reverse=False``, which is the only configured path.
         if self._reverse:
             positions = mx.arange(length - 1, -1, -1).astype(mx.float32)[:, None]
         else:
             positions = mx.arange(0, length).astype(mx.float32)[:, None]
+        # reference: torch.arange(0, d_model, 2) * -(log(10000) / d_model)
         div_term = mx.exp(
             mx.arange(0, self._d_model, 2).astype(mx.float32) * -(math.log(10000.0) / self._d_model)
         )
-        sin_part = mx.sin(positions * div_term)
-        cos_part = mx.cos(positions * div_term)
-        return mx.concatenate([sin_part, cos_part], axis=-1).astype(dtype)
+        phase = positions * div_term  # (length, d_model // 2)
+        # stack(...).reshape(...) yields [sin0, cos0, sin1, cos1, ...], which is
+        # exactly pe[:, 0::2] = sin / pe[:, 1::2] = cos.
+        return (
+            mx.stack([mx.sin(phase), mx.cos(phase)], axis=-1)
+            .reshape(length, self._d_model)
+            .astype(dtype)
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         return x * self._xscale + self._table(x.shape[1], x.dtype)[None, : x.shape[1]]
@@ -643,7 +730,7 @@ class MultiHeadedAttentionSANM(mxnn.Module):
     def forward_attention(self, value: mx.array, scores: mx.array, mask: mx.array | None):
         if mask is not None:
             # (B, 1, T) -> (B, 1, 1, T) boolean "is padding" mask.
-            blocked = mx.expand_dims(mask == 0, 1)
+            blocked = attention_blocked(mask)
             neg_inf = mx.array(-float("inf"), scores.dtype)
             scores = mx.where(blocked, neg_inf, scores)
             attn = mx.softmax(scores, axis=-1)
@@ -668,6 +755,11 @@ class MultiHeadedAttentionSANMDecoder(mxnn.Module):
 
     Pure FSMN memory block over the decoder input.  ``cache`` mirrors the
     reference streaming state; offline inference passes ``None``.
+
+    Deviation: the cache is kept channels-last ``(b, L, d)`` whereas the
+    reference keeps ``(b, d, L)``.  See the module docstring's "Known
+    deviations" section -- this matters only for the streaming/export contract,
+    not for offline inference.
     """
 
     def __init__(
@@ -755,7 +847,7 @@ class MultiHeadedAttentionCrossAtt(mxnn.Module):
         ret_attn: bool = False,
     ):
         if mask is not None:
-            blocked = mx.expand_dims(mask == 0, 1)
+            blocked = attention_blocked(mask)
             neg_inf = mx.array(-float("inf"), scores.dtype)
             scores = mx.where(blocked, neg_inf, scores)
             attn = mx.softmax(scores, axis=-1)

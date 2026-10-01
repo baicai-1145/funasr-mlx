@@ -572,10 +572,22 @@ class CifPredictorV2(mxnn.Module):
     def tail_process_fn(self, hidden: mx.array, alphas: mx.array, mask: mx.array | None):
         """Port of ``CifPredictorV2.tail_process_fn`` with ``tail_mask=True``.
 
-        The reference builds ``tail_threshold * (shift(ones) - shift(mask))`` and
-        adds the result to a zero-padded ``alphas``.  Consequence, reproduced
-        here on purpose: an utterance that fills the whole padded window
-        (``mask`` all ones) receives a **zero** tail.
+        The reference builds ``tail_threshold * (cat([ones, mask]) - cat([mask,
+        zeros]))`` and adds it to a zero-padded ``alphas``.  Working through that
+        shift-and-subtract, the coefficient is ``1.0`` at index ``i`` when
+        ``mask[i-1] != mask[i]``, and at the **appended** slot when
+        ``mask[T-1] == 1``.  So:
+
+        * a **full** mask (the utterance fills the padded window) puts the
+          threshold on the **appended** column -- it is *not* zeroed;
+        * a **padded** mask puts it on the **first padded frame**, and the
+          appended column stays zero.
+
+        Both branches are reproduced verbatim; see
+        ``tests/test_asr.py::test_cif_tail_lands_on_the_first_padded_frame_or_the_appended_slot``.
+
+        ``token_num`` is floored here (reference ``cif_predictor.py:461``), which
+        is the only place a floor belongs.
         """
         b, _, d = hidden.shape
         if mask is not None and self._tail_mask:
@@ -616,7 +628,12 @@ class CifPredictorV2(mxnn.Module):
         if self._tail_threshold > 0.0:
             hidden, alphas, token_num = self.tail_process_fn(hidden, alphas, mask_2d)
         else:
-            token_num = mx.floor(mx.sum(alphas, axis=-1))
+            # Reference ``cif_predictor.py:293`` is a plain ``alphas.sum(-1)`` with
+            # **no floor**; ``hidden`` is likewise left unextended because the
+            # reference has no ``else`` branch at all when tail_threshold <= 0.
+            # Flooring here would change ``round(token_num)`` downstream, which
+            # the reference's ``Paraformer.forward`` applies to the raw sum.
+            token_num = mx.sum(alphas, axis=-1)
 
         acoustic_embeds, cif_peak = cif_v1(hidden, alphas, self._threshold)
         if self._tail_threshold > 0.0:
