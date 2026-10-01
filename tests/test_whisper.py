@@ -23,6 +23,7 @@ from funasr_mlx.models.whisper import (  # noqa: E402
     GreedyDecodeConfig,
     ModelDimensions,
     MultiHeadAttention,
+    ResidualAttentionBlock,
     TextDecoder,
     Whisper,
     convert_checkpoint_tensor,
@@ -270,10 +271,58 @@ def test_detect_language_returns_sorted_logprobs():
     assert logprobs == sorted(logprobs, reverse=True)
 
 
-def test_encoder_halves_the_time_axis_twice():
+def _stride1d(conv):
+    """Normalise a Conv1d stride to a tuple (MLX stores the value verbatim)."""
+    value = conv.stride
+    return tuple(value) if isinstance(value, (tuple, list)) else (int(value),)
+
+
+def test_encoder_halves_the_time_axis_exactly_once():
+    """Canonical OpenAI Whisper: conv1 has no stride, only conv2 stride=2.
+
+    The SenseVoice vendored fork strides conv1 as well (2+2 = 4x reduction); that
+    is NOT what funasr/models/whisper/model.py runs.
+    """
     encoder = AudioEncoder(n_mels=N_MELS, n_ctx=20, n_state=N_STATE, n_head=N_HEAD, n_layer=2)
-    out = encoder(mx.zeros((1, 40, N_MELS), mx.float32))
-    assert out.shape == (1, (40 + 1) // 4, N_STATE)
+    out = encoder(mx.zeros((1, 2 * 20, N_MELS), mx.float32))
+    assert out.shape == (1, 20, N_STATE)
+    assert _stride1d(encoder.conv1) == (1,)
+    assert _stride1d(encoder.conv2) == (2,)
+
+
+@pytest.mark.parametrize("frames", [4, 39, 41, 60])
+def test_encoder_rejects_a_mis_sized_mel_input(frames):
+    """The canonical encoder asserts an exact length; it must not slice to fit.
+
+    Slicing the positional table to whatever length the conv stack produced is
+    what previously hid the conv1 stride bug from this whole suite.
+    """
+    encoder = AudioEncoder(n_mels=N_MELS, n_ctx=20, n_state=N_STATE, n_head=N_HEAD, n_layer=2)
+    with pytest.raises(ValueError, match="incorrect audio shape"):
+        encoder(mx.zeros((1, frames, N_MELS), mx.float32))
+
+
+def test_residual_block_applies_cross_attention_before_the_mlp():
+    """Canonical order is attn -> cross_attn -> mlp, with no attn_pct gates.
+
+    The vendored SenseVoice fork gates the branches by attn_pct, where
+    attn_pct == 0.0 for cross-attention blocks -- that discards self-attention
+    in the decoder entirely.
+    """
+    block = ResidualAttentionBlock(
+        N_STATE, N_HEAD, cross_attention=True, n_text_ctx=12, prefix="blocks.0"
+    )
+    assert not hasattr(block, "_attn_pct")
+    assert not hasattr(block, "_resid_pct")
+
+    x = mx.arange(1 * 3 * N_STATE, dtype=mx.float32).reshape(1, 3, N_STATE)
+    audio = mx.arange(1 * 5 * N_STATE, dtype=mx.float32).reshape(1, 5, N_STATE)
+    out = block(x, xa=audio)
+    assert out.shape == (1, 3, N_STATE)
+
+    # The MLP is last: its residual must dominate once it is the only branch fed.
+    only_mlp = x + block.mlp(block.mlp_ln(x))
+    assert not mx.allclose(out, only_mlp, atol=1e-6).item()
 
 
 def test_attention_cache_prefix_names_are_namespaced():

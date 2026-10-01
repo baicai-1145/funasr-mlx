@@ -1,11 +1,29 @@
-"""Native MLX inference port of OpenAI Whisper as vendored by FunASR.
+"""Native MLX inference port of **canonical OpenAI Whisper** as used by FunASR.
 
-Reference (read-only, ``/Users/baicai1145/repos/funasr``):
+Authoritative source
+--------------------
+``funasr/models/whisper/model.py`` (FunASR wrapper) does ``import whisper``
+(line 11) and builds ``whisper.model.Whisper`` (line 60), i.e. the **external
+``openai-whisper`` package**, not the vendored SenseVoice copy.  The encoder,
+decoder, attention, residual block and cache semantics here are therefore ported
+from the canonical ``whisper/model.py`` (OpenAI release v20250625, pinned at
+``/Users/baicai1145/repos/funasr-mlx/.tmp/openai-whisper-model.py``).
 
-* ``funasr/models/sense_voice/whisper_lib/model.py``  (encoder/decoder core)
-* ``funasr/models/sense_voice/whisper_lib/audio.py``   (log-mel front-end)
-* ``funasr/models/sense_voice/whisper_lib/decoding.py`` (greedy decoding filters)
-* ``funasr/models/whisper/model.py``                   (FunASR wrapper)
+The vendored ``funasr/models/sense_voice/whisper_lib/`` tree is a **different
+encoder** and must not be used as the reference for the Whisper path.  The two
+differ in ways that silently corrupt a canonical checkpoint:
+
+* ``whisper_lib``'s ``conv1`` has ``stride=2``; canonical's has **no stride**.
+  Canonical halves the time axis exactly once, so the input contract is
+  ``2 * n_audio_ctx`` mel frames.
+* ``whisper_lib``'s ``ResidualAttentionBlock`` scales the branches by
+  ``attn_pct`` / ``1 - attn_pct`` with ``attn_pct = 0.0`` on cross-attention
+  blocks, discarding self-attention in the decoder.  Canonical has no gates and
+  orders the branches ``attn -> cross_attn -> mlp``.
+
+``funasr/models/sense_voice/whisper_lib/audio.py`` remains the reference for the
+log-mel front-end arithmetic only, since it is numerically the same STFT/Slaney
+computation the canonical package performs.
 
 There is **no** dependency on ``mlx_whisper`` / ``openai-whisper`` / any torch
 package, and nothing is ever downloaded: the model is a pure
@@ -456,8 +474,10 @@ class MultiHeadAttention(mxnn.Module):
                     "full-length or one-token-at-a-time decoding"
                 )
             qk = qk + mask[:n_ctx, :n_ctx]
-        # float32 softmax, then back to the query dtype (reference behaviour).
-        attn = mx.softmax(qk.astype(mx.float32), axis=-1).astype(q.dtype)
+        # The reference computes the scores in fp32, takes the softmax there and
+        # casts the weights back to the query dtype.
+        qk = qk.astype(mx.float32)
+        attn = mx.softmax(qk, axis=-1).astype(q.dtype)
         out = mx.matmul(attn, v)
         b, _, t, _ = out.shape
         out = mx.reshape(mx.transpose(out, (0, 2, 1, 3)), (b, t, self._n_state))
@@ -506,10 +526,19 @@ class MultiHeadAttention(mxnn.Module):
 
 
 class ResidualAttentionBlock(mxnn.Module):
-    """``whisper.model.ResidualAttentionBlock``.
+    """``whisper.model.ResidualAttentionBlock`` (canonical OpenAI, v20250625).
 
-    Both attention branches read ``self.attn_pct``/``self.resid_pct`` computed
-    in ``__init__``; the exact float arithmetic (``1 - pct``) is preserved.
+    Plain pre-norm residuals with **no** weighting: ``attn``, then
+    ``cross_attn``, then ``mlp``, each added at full strength.
+
+    The SenseVoice vendored fork (``funasr/models/sense_voice/whisper_lib``)
+    scales these branches by ``attn_pct`` / ``1 - attn_pct``, where
+    ``attn_pct`` is ``0.0`` for cross-attention blocks -- i.e. it *discards
+    self-attention entirely* in the decoder.  That fork is **not** what
+    ``funasr/models/whisper/model.py`` runs: that module does ``import whisper``
+    (line 11) and builds ``whisper.model.Whisper`` (line 60).  The gates are
+    therefore removed, and the cross-attention branch is applied **before** the
+    MLP as in the canonical source.
     """
 
     def __init__(
@@ -533,9 +562,6 @@ class ResidualAttentionBlock(mxnn.Module):
         )
         self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
 
-        attn_pct = 0.0 if cross_attention else 0.5
-        self._attn_pct = attn_pct
-        self._resid_pct = 1.0 - attn_pct
         self._n_ctx = n_text_ctx
 
     def __call__(
@@ -545,10 +571,10 @@ class ResidualAttentionBlock(mxnn.Module):
         mask: mx.array | None = None,
         kv_cache: dict[str, mx.array] | None = None,
     ) -> mx.array:
-        x = x + self._attn_pct * self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
-        x = x + self._resid_pct * self.mlp(self.mlp_ln(x))
+        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)
         if self.cross_attn is not None:
-            x = x + self.cross_attn(self.cross_attn_ln(x), kv_cache=kv_cache, xa=xa)
+            x = x + self.cross_attn(self.cross_attn_ln(x), xa=xa, kv_cache=kv_cache)
+        x = x + self.mlp(self.mlp_ln(x))
         return x
 
 
@@ -658,7 +684,7 @@ class AudioEncoder(mxnn.Module):
 
     def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int) -> None:
         super().__init__()
-        self.conv1 = mxnn.Conv1d(n_mels, n_state, kernel_size=3, stride=2, padding=1)
+        self.conv1 = mxnn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = mxnn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
         self.positional_embedding = sinusoids(n_ctx, n_state)
         self.blocks = ModuleStack(
@@ -672,10 +698,28 @@ class AudioEncoder(mxnn.Module):
         self._n_ctx = n_ctx
 
     def __call__(self, x: mx.array) -> mx.array:
-        """``x`` is ``(B, T', n_mels)`` -> ``(B, T''/2, n_state)``."""
+        """``x`` is ``(B, T', n_mels)`` -> ``(B, T'/2, n_state)``.
+
+        ``conv1`` has **no** stride and only ``conv2`` halves the time axis, so
+        the contract is exactly ``2 * n_ctx`` mel frames in and ``n_ctx`` frames
+        out.
+        """
         x = _GELU(self.conv1(x))
         x = _GELU(self.conv2(x))
-        x = x + self.positional_embedding[None, : x.shape[1], :]
+
+        # The canonical encoder *asserts* an exact length rather than adapting to
+        # whatever it produced: ``positional_embedding`` has ``n_ctx`` rows.  The
+        # previous version sliced the table down to whatever length it got, which
+        # silently returned a short encoder output and is precisely what hid the
+        # ``conv1`` stride bug from the test suite.
+        if x.shape[1] != self.positional_embedding.shape[0]:
+            raise ValueError(
+                "incorrect audio shape: the encoder produced "
+                f"{x.shape[1]} frames but positional_embedding expects "
+                f"{self.positional_embedding.shape[0]} "
+                "(pass exactly 2 * n_audio_ctx mel frames)"
+            )
+        x = (x + self.positional_embedding).astype(x.dtype)
         for block in self.blocks:
             x = block(x)
         return self.ln_post(x)
@@ -750,7 +794,9 @@ class TextDecoder(mxnn.Module):
         for block in self.blocks:
             emb = block(emb, xa=xa, mask=mask, kv_cache=kv_cache)
         emb = self.ln(emb)
-        weight = mx.swapaxes(self.token_embedding.weight, -1, -2)
+        # Tied projection (reference: x @ token_embedding.weight.T), with the weight
+        # cast to the activation dtype first.  The logits are always float32.
+        weight = mx.swapaxes(self.token_embedding.weight.astype(emb.dtype), -1, -2)
         return mx.matmul(emb, weight).astype(mx.float32)
 
 
