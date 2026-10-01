@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "funasr-mlx"
+version = "0.1.0"
+description = "Memory-bounded native MLX speech inference on Apple Silicon"
+requires-python = ">=3.11"
+dependencies = ["mlx>=0.32.0", "numpy>=1.26", "safetensors>=0.4", "soundfile>=0.12", "PyYAML>=6.0"]
+
+[project.optional-dependencies]
+convert = ["torch>=2.2", "huggingface-hub>=0.24"]
+test = ["pytest>=8", "psutil>=5.9"]
+whisper = ["mlx-whisper>=0.4"]
+
+[project.scripts]
+funasr-mlx = "funasr_mlx.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/funasr_mlx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
