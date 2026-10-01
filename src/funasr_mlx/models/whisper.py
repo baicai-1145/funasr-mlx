@@ -42,8 +42,9 @@ Layout conventions (documented, not accidental)
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Sequence
 
 import mlx.core as mx
 from mlx import nn as mxnn
@@ -148,7 +149,24 @@ class ModuleStack(mxnn.Module):
 
 
 def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_LAYOUT):
-    """Convert one PyTorch checkpoint tensor into the MLX layout."""
+    """Convert one PyTorch checkpoint tensor into the MLX layout.
+
+    Parameters
+    ----------
+    name:
+        Parameter name, used only for diagnostics and error messages.
+    array:
+        The tensor to convert.
+    rule:
+        **Explicit** rule name, normally taken from
+        :func:`flatten_state_dict_with_rules`, which derives it from the owning
+        module type.  There is deliberately **no name-based inference**: here the
+        same attribute name (``conv1``/``conv2``/``linear``) can belong to an
+        ``nn.Linear`` or to a ``nn.Conv1d``, so guessing from the name could
+        silently apply the wrong transpose.  The default is identity, and a wrong
+        choice surfaces as a clear shape mismatch at load time rather than as a
+        silently mis-converted weight.
+    """
     if rule == CONV1D_LAYOUT:
         # torch (out, in, k) -> MLX (out, k, in)
         return mx.transpose(array, (0, 2, 1))
@@ -186,14 +204,41 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
 
 
 @dataclass
-class LayoutReport:
-    """Flat parameter tensors plus the layout rule that applies to each key."""
+class LayoutReport(Mapping):
+    """Flat parameter tensors plus the layout rule that applies to each key.
+
+    Behaves like a read-only ``Mapping`` of ``{parameter_name: mlx_array}``, so it
+    can be iterated, indexed, ``len()``-ed and fed to ``dict(...)`` exactly like a
+    plain state dict, while also carrying the per-key rule used for the
+    torch -> MLX layout conversion.
+    """
 
     tensors: dict[str, mx.array]
     rules: dict[str, str]
 
-    def __contains__(self, name: str) -> bool:
+    def __getitem__(self, name: str) -> mx.array:
+        return self.tensors[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.tensors)
+
+    def __len__(self) -> int:
+        return len(self.tensors)
+
+    def __contains__(self, name: object) -> bool:
         return name in self.tensors
+
+    def keys(self):
+        return self.tensors.keys()
+
+    def values(self):
+        return self.tensors.values()
+
+    def items(self):
+        return self.tensors.items()
+
+    def get(self, name: str, default: Any = None) -> Any:
+        return self.tensors.get(name, default)
 
 
 def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> LayoutReport:
@@ -385,6 +430,12 @@ class MultiHeadAttention(mxnn.Module):
     ) -> tuple[mx.array, mx.array]:
         """Port of ``MultiHeadAttention.qkv_attention`` (the non-SDPA path).
 
+        Layouts follow the reference exactly: ``q`` is ``(B, H, T, d)`` and
+        ``k`` is **transposed** to ``(B, H, d, T)``.  That ``.permute(0, 2, 3, 1)``
+        in the reference is what makes ``q @ k`` contract the head dimension and
+        produce the ``(B, H, T, T)`` score matrix; leaving ``k`` as
+        ``(B, H, T, d)`` would contract ``T`` with ``T`` instead.
+
         Whisper applies ``(n_state // n_head) ** -0.25`` to *both* ``q`` and
         ``k``, which is exactly a ``d_k ** -0.5`` factor on the scores.
         """
@@ -392,9 +443,9 @@ class MultiHeadAttention(mxnn.Module):
         scale = (self._n_state // self._n_head) ** -0.25
         q = q * scale
         k = k * scale
-        qk = mx.matmul(q, k)
+        qk = mx.matmul(q, k)  # (B, H, T, T)
         if mask is not None:
-            key_len = k.shape[3]
+            key_len = k.shape[-1]
             # The reference slices the same ``n_ctx`` from both axes; that only
             # broadcasts for a full-length pass (n_ctx == key_len) or for the
             # single-token incremental steps this decoder performs.
@@ -445,7 +496,12 @@ class MultiHeadAttention(mxnn.Module):
             k = kv_cache[key_name]
             v = kv_cache[value_name]
 
-        attn_out, _ = self.qkv_attention(q, self._split(k), self._split(v), mask)
+        attn_out, _ = self.qkv_attention(
+            self._split(q),
+            mx.swapaxes(self._split(k), -1, -2),
+            self._split(v),
+            mask,
+        )
         return attn_out
 
 
@@ -771,15 +827,18 @@ class Whisper(mxnn.Module):
 def reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
     """``torch.nn.functional.pad(..., mode="reflect")`` along the last axis.
 
-    Reflection excludes the edge element, i.e. ``x[..., -1]`` is not repeated.
+    The edge value is **not** repeated.  With ``x = [1, 2, 3, 4]`` and ``pad=2``
+    on both sides the result is ``[3, 2, 1, 2, 3, 4, 3, 2]``: the left filler
+    reads left-to-right as ``x[pad] ... x[1]`` and the right filler as
+    ``x[n-2] ... x[n-1-pad]`` -- both *descending* index runs.
     """
     if pad <= 0:
         return x
     length = x.shape[-1]
     if length < pad + 1:
         raise ValueError(f"reflect padding of {pad} needs an axis longer than {pad}, got {length}")
-    left = mx.take(x, mx.arange(1, pad + 1, dtype=mx.int32), axis=-1)
-    right = mx.take(x, mx.arange(length - pad - 1, length - 1, dtype=mx.int32), axis=-1)
+    left = mx.take(x, mx.arange(pad, 0, -1, dtype=mx.int32), axis=-1)
+    right = mx.take(x, mx.arange(length - 2, length - pad - 2, -1, dtype=mx.int32), axis=-1)
     return mx.concatenate([left, x, right], axis=-1)
 
 
@@ -905,8 +964,12 @@ def log_mel_spectrogram(
     magnitudes = mx.abs(spectrum) ** 2
     if filters is None:
         filters = mel_filterbank(n_mels=n_mels, n_fft=n_fft)
-    # (B, frames-1, freq) @ (freq, n_mels) -> (B, frames-1, n_mels)
-    log_spec = mx.matmul(magnitudes, filters.astype(magnitudes.dtype))
+    # MLX's matmul does not accept a 2-D right-hand side against a 3-D left-hand
+    # side (it treats the pair as batched and then requires the feature axis to
+    # match), so the transposed filterbank gets an explicit leading batch axis.
+    filters_t = mx.expand_dims(mx.swapaxes(filters.astype(magnitudes.dtype), -1, -2), 0)
+    # (B, frames-1, freq) @ (1, freq, n_mels) -> (B, frames-1, n_mels)
+    log_spec = mx.matmul(magnitudes, filters_t)
     log_spec = mx.log10(mx.maximum(log_spec, 1e-10))
     log_spec = mx.maximum(log_spec, mx.max(log_spec) - 8.0)
     return (log_spec + 4.0) / 4.0

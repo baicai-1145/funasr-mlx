@@ -31,8 +31,9 @@ Layout rules that matter
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Sequence
 
 import mlx.core as mx
 from mlx import nn as mxnn
@@ -211,8 +212,22 @@ CONV2D_LAYOUT = "conv2d_torch_out_inkij_to_mlx_out_kij"
 def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_LAYOUT):
     """Convert one PyTorch checkpoint tensor into the MLX layout.
 
-    ``rule`` is the module-derived rule from :func:`flatten_state_dict`; the name
-    is kept for diagnostics and error messages only.
+    Parameters
+    ----------
+    name:
+        Parameter name, used only for diagnostics and error messages.
+    array:
+        The tensor to convert.
+    rule:
+        **Explicit** rule name, normally taken from
+        :func:`flatten_state_dict`, which derives it from the owning module type.
+        There is deliberately **no name-based inference**: in this architecture the
+        same attribute name (``linear``) belongs to an ``nn.Linear`` in
+        ``DenseLayer``/``TransitLayer``'s sibling and to a ``nn.Conv1d`` in
+        ``TDNNLayer``, so guessing from the name could silently apply the wrong
+        transpose.  The default is identity, and a wrong choice surfaces as a
+        clear shape mismatch at load time rather than as a silently mis-converted
+        weight.
     """
     if rule == CONV1D_LAYOUT:
         # torch (out, in/groups, k)  ->  MLX (out, k, in/groups)
@@ -257,14 +272,41 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
 
 
 @dataclass
-class LayoutReport:
-    """Flat parameter tensors plus the layout rule that applies to each key."""
+class LayoutReport(Mapping):
+    """Flat parameter tensors plus the layout rule that applies to each key.
+
+    Behaves like a read-only ``Mapping`` of ``{parameter_name: mlx_array}``, so it
+    can be iterated, indexed, ``len()``-ed and fed to ``dict(...)`` exactly like a
+    plain state dict, while also carrying the per-key rule used for the
+    torch -> MLX layout conversion.
+    """
 
     tensors: dict[str, mx.array]
     rules: dict[str, str]
 
-    def __contains__(self, name: str) -> bool:
+    def __getitem__(self, name: str) -> mx.array:
+        return self.tensors[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.tensors)
+
+    def __len__(self) -> int:
+        return len(self.tensors)
+
+    def __contains__(self, name: object) -> bool:
         return name in self.tensors
+
+    def keys(self):
+        return self.tensors.keys()
+
+    def values(self):
+        return self.tensors.values()
+
+    def items(self):
+        return self.tensors.items()
+
+    def get(self, name: str, default: Any = None) -> Any:
+        return self.tensors.get(name, default)
 
 
 def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> LayoutReport:
@@ -1107,34 +1149,35 @@ class CAMPPlus(mxnn.Module):
     def embed(self, speech: mx.array, speech_lengths: mx.array | None = None) -> mx.array:
         """Length-aware embedding extraction for a padded batch.
 
-        The reference zero-pads a batch and pools over **all** frames, so padded
-        frames contaminate the segment statistics.  This method restricts the
-        mean/std pooling to each utterance's true length, which is identical to
-        :meth:`forward` for a single unpadded utterance and is the behaviour you
-        want for a real batch.
+        Each utterance is cropped to its true length and forwarded
+        **individually**.  A padded batch is deliberately *not* forwarded as-is:
+        CAM++'s convolutional trunk sees the whole time axis, including
+        ``CAMLayer.seg_pooling``, which averages over **all** frames.  Masking
+        only the final statistics pooling therefore cannot undo the leak, and
+        the reference has exactly the same property -- it pools ``hidden`` with no
+        mask at all (``CAMPPlus.forward``).  Cropping per utterance is what makes
+        this equivalent to the reference's real usage, where
+        ``funasr/models/campplus/utils.py::extract_feature`` produces
+        per-utterance features and batching is only a convenience.
+
+        Cost: one forward per utterance instead of one per batch.  For
+        ``output_level="frame"`` the rows have different lengths, so the padded
+        batch is returned unchanged (and callers must mask themselves).
         """
-        if self.output_level == "frame":
-            return self.frame_features(speech)
-        if speech_lengths is None:
+        if speech_lengths is None or self.output_level == "frame":
             return self.forward(speech)
 
-        features = self.frame_features(speech)
         lengths = mx.asarray(speech_lengths).reshape(-1)
-        batch, frames, _ = features.shape
+        batch, frames, _ = speech.shape
         if lengths.shape[0] != batch:
             raise ValueError(
                 f"speech_lengths has {lengths.shape[0]} entries for a batch of {batch}"
             )
-        keep = (mx.arange(frames)[None, :] < lengths[:, None]).astype(features.dtype)
-        mask = mx.expand_dims(keep, -1)  # (B, T, 1)
-        count = mx.expand_dims(mx.sum(mask, axis=1), -1)  # (B, 1, 1)
-        safe_count = mx.maximum(count, 1.0)
-        mean = mx.sum(features * mask, axis=1, keepdims=True) / safe_count
-        centred = (features - mean) * mask
-        denom = mx.maximum(count - 1.0, 1.0)
-        std = mx.sqrt(mx.sum(centred * centred, axis=1, keepdims=True) / denom)
-        pooled = mx.concatenate([mean, std], axis=-1)  # (B, 1, 2C)
-        return mx.squeeze(self.xvector["dense"](pooled), 1)
+        values = [int(lengths[b].item()) for b in range(batch)]
+        if not 0 < min(values) <= frames:
+            raise ValueError(f"speech_lengths {values} out of range for {frames} input frames")
+        rows = [self.forward(speech[b : b + 1, : values[b], :]) for b in range(batch)]
+        return mx.concatenate(rows, axis=0)
 
     def speaker_embedding(
         self, speech: mx.array, speech_lengths: mx.array | None = None

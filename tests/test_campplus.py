@@ -17,6 +17,9 @@ mx = pytest.importorskip("mlx.core", reason="mlx is required for the model ports
 from mlx import nn as mxnn  # noqa: E402
 
 from funasr_mlx.models.campplus import (  # noqa: E402
+    CONV1D_LAYOUT,
+    CONV2D_LAYOUT,
+    IDENTITY_LAYOUT,
     CAMPlusConfig,
     CAMPPlus,
     BatchNorm1d,
@@ -26,6 +29,7 @@ from funasr_mlx.models.campplus import (  # noqa: E402
     NamedModuleDict,
     convert_checkpoint_tensor,
     flatten_state_dict,
+    flatten_state_dict_with_rules,
     load_strict,
     statistics_pooling,
 )
@@ -97,13 +101,33 @@ def test_state_dict_keys_carry_the_xvector_prefix():
     assert not any(key.startswith("_") for key in keys)
 
 
-def test_convert_checkpoint_tensor_transposes_only_conv_kernels():
+def test_convert_checkpoint_tensor_requires_an_explicit_rule():
+    """No name-based inference: ``linear`` can be an nn.Linear or an nn.Conv1d.
+
+    The correct rule always comes from :func:`flatten_state_dict_with_rules`,
+    which derives it from the owning module type.
+    """
     conv1d = mx.zeros((4, 1, 5))  # torch (out, in/groups, k)
-    assert convert_checkpoint_tensor("x.tdnn.linear.weight", conv1d).shape == (4, 5, 1)
+    assert convert_checkpoint_tensor("anything.weight", conv1d, CONV1D_LAYOUT).shape == (4, 5, 1)
     conv2d = mx.zeros((4, 1, 3, 3))  # torch (out, in, kh, kw)
-    assert convert_checkpoint_tensor("head.conv1.weight", conv2d).shape == (4, 3, 3, 1)
+    assert convert_checkpoint_tensor("anything.weight", conv2d, CONV2D_LAYOUT).shape == (
+        4,
+        3,
+        3,
+        1,
+    )
+    # The default is identity, so a missing rule never silently transposes.
     linear = mx.zeros((6, 9))
-    assert convert_checkpoint_tensor("xvector.dense.linear.weight", linear).shape == (6, 9)
+    assert convert_checkpoint_tensor("x.dense.linear.weight", linear).shape == (6, 9)
+    with pytest.raises(ValueError):
+        convert_checkpoint_tensor("x.weight", linear, "not-a-rule")
+
+    # The module-derived path picks the right rule for every conv owner.
+    _, rules = flatten_state_dict_with_rules(_campplus())
+    assert rules["head.conv1.weight"] == CONV2D_LAYOUT
+    assert rules["xvector.tdnn.linear.weight"] == CONV1D_LAYOUT
+    assert rules["xvector.dense.linear.weight"] == CONV1D_LAYOUT
+    assert rules["xvector.out_nonlinear.0.weight"] == IDENTITY_LAYOUT
 
 
 def test_load_strict_round_trips_and_reports_torch_only_buffers():
@@ -185,17 +209,37 @@ def test_embed_matches_forward_for_a_single_utterance():
 
 
 def test_embed_is_invariant_to_the_padded_tail():
-    """Each row's padded frames must not leak into its segment statistics."""
+    """Each row's padded frames must not leak into its embedding.
+
+    ``embed()`` crops each utterance to its true length *before* the conv trunk,
+    because ``CAMLayer.seg_pooling`` averages over the whole time axis and would
+    otherwise leak padding into the valid frames -- something masking only the
+    final statistics pooling cannot undo.
+    """
     model = _campplus()
     model.eval()
     fbank = mx.arange(2 * 8 * 8, dtype=mx.float32).reshape(2, 8, 8) / 31.0
     lengths = mx.array([8, 5])
     clean = model.embed(fbank, lengths)
+    assert clean.shape == (2, 6)
 
     padded = mx.logical_not(mx.arange(8)[None, :] < lengths[:, None])
     corrupted = mx.where(mx.expand_dims(padded, -1), fbank + 1000.0, fbank)
     dirty = model.embed(corrupted, lengths)
     assert mx.allclose(clean, dirty, atol=1e-4).item()
+    # Sanity: the corruption really did reach the padded region.
+    assert not mx.allclose(mx.sum(corrupted, axis=-1), mx.sum(fbank, axis=-1)).item()
+
+
+def test_embed_equals_a_single_utterance_forward():
+    """Cropping per utterance must reproduce the unpadded single-call path."""
+    model = _campplus()
+    model.eval()
+    fbank = mx.arange(2 * 8 * 8, dtype=mx.float32).reshape(2, 8, 8) / 29.0
+    batched = model.embed(fbank, mx.array([8, 5]))
+    for b, length in enumerate((8, 5)):
+        alone = model(fbank[b : b + 1, :length, :])
+        assert mx.allclose(batched[b : b + 1], alone, atol=1e-5).item()
 
 
 # --------------------------------------------------------------------------- #
@@ -226,16 +270,17 @@ def test_non_affine_batchnorm_exposes_only_running_buffers():
 
 
 def test_statistics_pooling_reduces_time_and_concatenates():
+    """torch.std defaults to the *unbiased* (correction=1) sample std."""
     x = mx.array([[[1.0, 2.0], [3.0, 4.0], [5.0, 7.0]]])  # (1, 3, 2)
     pooled = statistics_pooling(x)
     assert pooled.shape == (1, 1, 4)
-    mean = [1.0 + 3.0 + 5.0, 2.0 + 4.0 + 7.0]
-    mean = [m / 3.0 for m in mean]
-    var = [
-        sum((v - m) ** 2 for v, m in zip(col, mean)) / 2.0
-        for col in ([1.0, 3.0, 5.0], [2.0, 4.0, 7.0])
-    ]
-    expected = mean + [math.sqrt(v) for v in var]
+    columns = ([1.0, 3.0, 5.0], [2.0, 4.0, 7.0])
+    mean = [sum(col) / 3.0 for col in columns]
+    # ddof=1: divide by (n - 1), matching torch.std's default correction=1.
+    std = [math.sqrt(sum((v - m) ** 2 for v in col) / 2.0) for col, m in zip(columns, mean)]
+    expected = mean + std
+    assert [round(v, 5) for v in mean] == [3.0, 4.33333]
+    assert [round(v, 5) for v in std] == [2.0, 2.51661]
     assert [round(v, 5) for v in pooled[0, 0].tolist()] == [round(v, 5) for v in expected]
 
 
