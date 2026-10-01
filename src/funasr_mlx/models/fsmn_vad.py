@@ -78,6 +78,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 __all__ = [
+    "AffineTransform",
     "AudioChangeState",
     "BasicBlock",
     "FSMN",
@@ -86,6 +87,7 @@ __all__ = [
     "FsmnVadModel",
     "FrameProb",
     "FrameState",
+    "LinearTransform",
     "ModuleLayerList",
     "SpeechSegment",
     "VadDetectMode",

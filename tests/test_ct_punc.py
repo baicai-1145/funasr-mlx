@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from funasr_mlx.models.ct_punc import (
@@ -74,6 +75,16 @@ def tiny_vocab(vocab_size: int = 16) -> CharVocab:
     return CharVocab(tokens)
 
 
+def assert_allclose(actual, expected, *, atol: float = 1e-5, rtol: float = 0.0) -> None:
+    """``pytest.approx`` rejects nested Python lists; go through numpy instead."""
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float64),
+        np.asarray(expected, dtype=np.float64),
+        rtol=rtol,
+        atol=atol,
+    )
+
+
 def cjk_text(count: int) -> str:
     return "".join(chr(0x4E00 + i) for i in range(count))
 
@@ -82,7 +93,7 @@ def test_tiny_vocab_is_the_cjk_fixture():
     """The CJK fixture maps the first ``vocab_size - 1`` CJK chars to ids 1..n."""
     vocab = tiny_vocab()
     assert len(vocab) == 16
-    assert vocab.encode([cjk_text(3)]) == [1, 2, 3]
+    assert vocab.encode(list(cjk_text(3))) == [1, 2, 3]
     assert vocab.encode(["definitely-not-in-vocab"]) == [0]
 
 
@@ -255,7 +266,7 @@ def test_sanm_fsmn_padding_split_is_one_frame_each_side():
     )
     mx.eval(memory, expected)
     assert memory.shape == (1, length, channels)
-    assert memory.tolist() == pytest.approx(expected.tolist(), abs=1e-5)
+    assert_allclose(memory, expected)
 
 
 def test_sanm_fsmn_uses_one_frame_of_left_context():
@@ -270,7 +281,7 @@ def test_sanm_fsmn_uses_one_frame_of_left_context():
     memory = attn.forward_fsmn(base, None)
     expected = base + mx.pad(base[:, :-1, :], [(0, 0), (0, 1), (0, 0)])
     mx.eval(memory, expected)
-    assert memory.tolist() == pytest.approx(expected.tolist(), abs=1e-5)
+    assert_allclose(memory, expected)
 
 
 def test_sanm_fsmn_mask_zeroes_padding():
@@ -370,9 +381,9 @@ def test_padded_batch_rows_match_zero_padded_single_runs():
     full = model.punc_forward(mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32), [5])
     short = model.punc_forward(mx.array([[6, 7, 8, 9, 10]], dtype=mx.int32), [2])
     mx.eval(batched, full, short)
-    assert batched[0].tolist() == pytest.approx(full[0].tolist(), abs=1e-5)
+    assert_allclose(batched[0], full[0])
     # The short row was padded with zeros by the mask before the convolution.
-    assert batched[1, :2].tolist() == pytest.approx(short[0, :2].tolist(), abs=1e-5)
+    assert_allclose(batched[1, :2], short[0, :2])
 
 
 # --------------------------------------------------------------------------- #
@@ -383,7 +394,7 @@ def _fake_pytorch_state(model: CtPuncModel) -> dict[str, mx.array]:
     state: dict[str, mx.array] = {}
     for name, value in flat_parameter_names(model).items():
         if name.endswith(".self_attn.fsmn_block.weight"):
-            value = mx.transpose(value, 0, 2, 1)  # (C, K, 1) -> (C, 1, K)
+            value = mx.transpose(value, (0, 2, 1))  # (C, K, 1) -> (C, 1, K)
         state[name] = value
     return state
 
@@ -397,19 +408,15 @@ def test_load_state_dict_strict_roundtrip_and_conv_transpose():
     target_params = flat_parameter_names(target)
     conv_key = "encoder.encoders0.0.self_attn.fsmn_block.weight"
     assert target_params[conv_key].shape == (8, 3, 1)
-    assert target_params[conv_key].tolist() == pytest.approx(
-        source_params[conv_key].tolist(), abs=1e-6
-    )
+    assert_allclose(target_params[conv_key], source_params[conv_key], atol=1e-6)
     lin_key = "encoder.encoders0.0.feed_forward.w_1.weight"
-    assert target_params[lin_key].tolist() == pytest.approx(
-        source_params[lin_key].tolist(), abs=1e-6
-    )
+    assert_allclose(target_params[lin_key], source_params[lin_key], atol=1e-6)
 
     ids = mx.array([[1, 2, 3]], dtype=mx.int32)
     a = source.punc_forward(ids, [3])
     b = target.punc_forward(ids, [3])
     mx.eval(a, b)
-    assert a[0].tolist() == pytest.approx(b[0].tolist(), abs=1e-5)
+    assert_allclose(a[0], b[0])
 
 
 def test_load_state_dict_strict_rejects_missing_and_extra_keys():
@@ -451,12 +458,16 @@ ASCII_WORDS = ["hello", "world", "ok"]
 
 
 def stub_vocab(vocab_size: int = 16) -> CharVocab:
-    """Vocabulary that actually contains every token the stub tests feed in.
+    """Vocabulary that contains every token the stub tests feed in.
 
-    CJK characters occupy ids 1..15 and the ASCII words 16..18, so a test that
-    scripts ids 1, 2, 3 is really scripting CJK characters.
+    It must be exactly ``vocab_size`` long because
+    :class:`CtPuncPunctuator` rejects a mismatched vocabulary.  CJK characters
+    occupy ids 1..12 and the ASCII words 13..15.
     """
-    return CharVocab(["<unk>"] + [chr(0x4E00 + i) for i in range(15)] + list(ASCII_WORDS))
+    cjk_count = vocab_size - 1 - len(ASCII_WORDS)
+    tokens = ["<unk>"] + [chr(0x4E00 + i) for i in range(cjk_count)] + list(ASCII_WORDS)
+    assert len(tokens) == vocab_size
+    return CharVocab(tokens)
 
 
 class StubPunctuator(CtPuncPunctuator):
@@ -476,7 +487,7 @@ class StubPunctuator(CtPuncPunctuator):
         self._script: dict[tuple[int, ...], list[int]] = {}
         self.seen_lengths: list[int] = []
         self.model = CtPuncModel(config)
-        self.vocab = stub_vocab()
+        self.vocab = stub_vocab(config.vocab_size)
         self.config = config
 
     def key(self, tokens) -> tuple[int, ...]:
@@ -516,14 +527,20 @@ def test_single_chunk_emits_tokens_and_punc_array():
     assert result.punc_array == [PUNC_COMMA, PUNC_PERIOD, PUNC_QUESTION, PUNC_QUESTION]
 
 
-def test_ascii_tokens_get_spaces_and_ascii_marks():
+def test_ascii_tokens_get_spaces_capitalisation_and_ascii_marks():
     punctuator = StubPunctuator().script(
         [(ASCII_WORDS, [PUNC_COMMA, PUNC_PERIOD, PUNC_NONE])]
     )
     result = punctuator.punctuate(" ".join(ASCII_WORDS))
-    # First ASCII token gets a leading space; "。" becomes "." next to ASCII; the
-    # trailing ASCII character forces a final "." and rewrites the last punc id.
-    assert result.text == " Hello world, ok."
+    # CTTransformer.inference, per token i:
+    #   capitalise when (i == 0 or the *previous* mark is a sentence end) and the
+    #   first char is 1 byte; prefix " " when i == 0 and 1 byte, or when i > 0 and
+    #   both token i-1 and token i start with a 1-byte char; then append the mark,
+    #   mapped to ASCII when the token starts with a 1-byte char.
+    # -> " Hello" + "," + " world" + "." + " Ok"; "ok" is capitalised because the
+    # previous mark is "。"; the trailing "k" is 1 byte and is not "." or "?", so a
+    # final "." is appended and the last punc id is rewritten to sentence_end_id.
+    assert result.text == " Hello, world. Ok."
     assert result.punc_array == [PUNC_COMMA, PUNC_PERIOD, PUNC_QUESTION]
 
 
@@ -540,7 +557,9 @@ def test_chunk_without_terminator_is_carried_forward():
     result = punctuator.punctuate("".join(chars))
     assert punctuator.seen_lengths == [4, 8]
     assert result.punc_array == [PUNC_NONE] * 7 + [PUNC_QUESTION]
-    assert result.text == "".join(chars[0:7]) + "？" + chars[7] + "。"
+    # The mark follows its own token, so "？" lands *after* the last character; and
+    # because "？" is already a sentence end the trailing-fixup branch adds nothing.
+    assert result.text == "".join(chars) + "？"
 
 
 def test_over_long_chunk_is_cut_at_the_last_comma():
@@ -551,23 +570,37 @@ def test_over_long_chunk_is_cut_at_the_last_comma():
     punctuator = StubPunctuator().script(
         [
             (chars[0:4], [PUNC_NONE] * 4),
-            (chars[0:8], [PUNC_NONE, PUNC_NONE, PUNC_COMMA, PUNC_NONE, PUNC_NONE, PUNC_NONE,
-                          PUNC_NONE, PUNC_NONE]),
+            (chars[0:8], [PUNC_NONE, PUNC_NONE, PUNC_COMMA] + [PUNC_NONE] * 5),
             (chars[3:12], [PUNC_PERIOD] + [PUNC_NONE] * 8),
         ]
     )
     result = punctuator.punctuate("".join(chars))
     assert punctuator.seen_lengths == [4, 8, 9]
+    # Emitted chunk 1 is chars[0:3] (up to and including the promoted comma) and
+    # chunk 2 is the 5 carried tokens plus the 4 new ones.
     assert result.punc_array == [
         PUNC_NONE, PUNC_NONE, PUNC_QUESTION,
         PUNC_PERIOD, PUNC_NONE, PUNC_NONE, PUNC_NONE, PUNC_NONE, PUNC_NONE, PUNC_NONE,
         PUNC_NONE, PUNC_QUESTION,
     ]
+    # sentence_end_id is 3 -> punc_list[3] == "？", so the promoted mark renders as
+    # a question mark, not a period; only chunk 2's own "。" is a period.
     assert result.text == (
-        chars[0] + chars[1] + "。"
-        + chars[3] + "。"
-        + "".join(chars[4:12]) + "。"
+        "".join(chars[0:3]) + "？" + chars[3] + "。" + "".join(chars[4:12]) + "。"
     )
+
+
+def test_sentence_end_id_must_map_to_a_terminator():
+    """``sentence_end_id`` 3 -> "？" is consistent with ``sentence_end_puncs``.
+
+    Promoted commas are rewritten to ``sentence_end_id``, so if that id were not a
+    sentence end the promoted chunk would still never close a sentence.
+    """
+    config = CtPuncConfig()
+    assert config.punc_list[config.sentence_end_id] in config.sentence_end_puncs
+    # "。" is index 2, "？" is index 3; sentence_end_id must be the latter.
+    assert config.punc_list.index("。") == PUNC_PERIOD
+    assert config.punc_list.index("？") == config.sentence_end_id
 
 
 def test_punctuator_rejects_oversized_mini_sentence():

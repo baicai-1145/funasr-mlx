@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from funasr_mlx.models.fsmn_vad import (
@@ -20,6 +21,7 @@ from funasr_mlx.models.fsmn_vad import (
     FrameState,
     FsmnEncoderConfig,
     FsmnVadModel,
+    LinearTransform,
     SpeechSegment,
     VadDetectMode,
     VadOptions,
@@ -110,6 +112,16 @@ def fake_waveform(num_frames: int, options: VadOptions | None = None, seed: int 
     return mx.reshape(signal, (1, total))
 
 
+def assert_allclose(actual, expected, *, atol: float = 1e-5, rtol: float = 0.0) -> None:
+    """``pytest.approx`` rejects nested Python lists; go through numpy instead."""
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float64),
+        np.asarray(expected, dtype=np.float64),
+        rtol=rtol,
+        atol=atol,
+    )
+
+
 def fake_feats(num_frames: int, dim: int, seed: int = 0) -> mx.array:
     values = mx.arange(num_frames * dim, dtype=mx.float32) * 0.01 + seed
     return mx.reshape(values, (1, num_frames, dim))
@@ -198,10 +210,14 @@ def test_linear_transform_is_the_nn_linear_itself():
     and ``BasicBlock`` registers it under ``linear``, so the checkpoint path is
     ``fsmn.<i>.linear.weight`` -- not ``fsmn.<i>.linear.linear.weight``.
     """
-    block = FSMNBlock(dim=2, lorder=3, rorder=0, lstride=1, rstride=0)
-    params = flat_parameter_names(block)
+    params = flat_parameter_names(LinearTransform(6, 4))
     assert set(params) == {"weight"}
-    assert params["weight"].shape == (2, 3, 1)
+    assert params["weight"].shape == (4, 6)
+
+
+def test_fsmn_block_only_owns_its_depthwise_conv():
+    block = FSMNBlock(dim=2, lorder=3, rorder=0, lstride=1, rstride=0)
+    assert set(flat_parameter_names(block)) == {"conv_left.weight"}
 
 
 def test_parameter_names_match_funasr_checkpoint_layout():
@@ -271,13 +287,21 @@ def test_block_left_cache_matches_zero_padding():
         streamed, stream_cache = block(frame, stream_cache)
     assert stream_cache.shape == (1, 2, 3)  # (lorder - 1) * lstride
     mx.eval(offline, streamed)
-    assert streamed.tolist() == pytest.approx(offline.tolist(), abs=1e-5)
+    assert_allclose(streamed, offline)
 
 
 def test_cache_length_is_stable():
+    """Streaming keeps exactly ``(lorder - 1) * lstride`` frames of left context.
+
+    ``FSMNBlock`` returns ``cache=None`` when it is called with ``cache=None`` --
+    that is the reference behaviour (``fsmn_vad_streaming/encoder.py`` only assigns
+    ``cache`` inside the ``cache is not None`` branch).  A streaming caller must
+    therefore start from an explicit zero buffer, which is what
+    ``BasicBlock.forward`` does when it seeds ``cache_layer_<i>``.
+    """
     block = FSMNBlock(dim=3, lorder=5, rorder=0, lstride=2, rstride=0)
     x = fake_feats(6, 3)
-    cache = None
+    cache = mx.zeros((1, 3, block.keep))
     for step in range(6):
         _, cache = block(x[:, step : step + 1, :], cache)
     assert cache.shape == (1, 3, (5 - 1) * 2)
@@ -297,7 +321,7 @@ def test_streaming_chunks_equal_single_pass():
         chunks.append(chunk)
     streamed = mx.concatenate(chunks, axis=1)
     mx.eval(offline, streamed)
-    assert streamed.tolist() == pytest.approx(offline.tolist(), abs=1e-5)
+    assert_allclose(streamed, offline)
 
 
 def test_rorder_creates_a_right_kernel_and_keeps_the_time_axis():
@@ -317,7 +341,7 @@ def test_rorder_right_context_uses_future_frames_only():
     x = mx.arange(4, dtype=mx.float32).reshape(1, 4, 1)
     out, _ = block(x, None)
     mx.eval(out)
-    assert out.reshape(-1).tolist() == pytest.approx([1.0, 3.0, 5.0, 3.0], abs=1e-5)
+    assert_allclose(out.reshape(-1), [1.0, 3.0, 5.0, 3.0])
 
 
 def test_encoder_rejects_bad_cache_shape():
@@ -334,7 +358,7 @@ def _fake_pytorch_state(model: FsmnVadModel) -> dict[str, mx.array]:
     for name, value in flat_parameter_names(model).items():
         if name.endswith(".fsmn_block.conv_left.weight"):
             d, k, _ = value.shape  # (D, K, 1) -> (D, 1, K, 1)
-            value = mx.transpose(value, 0, 2, 1).reshape(d, 1, k, 1)
+            value = mx.transpose(value, (0, 2, 1)).reshape(d, 1, k, 1)
         state[name] = value
     return state
 
@@ -348,7 +372,9 @@ def test_checkpoint_conv_layout_conversion():
     converted = convert_checkpoint_tensors(state)
     key = "encoder.fsmn.0.fsmn_block.conv_left.weight"
     assert converted[key].shape == (2, 3, 1)
-    assert converted[key].tolist() == state[key].reshape(2, 3, 1).tolist()
+    np.testing.assert_array_equal(
+        np.asarray(converted[key]), np.asarray(state[key].reshape(2, 3, 1))
+    )
 
 
 def test_load_state_dict_strict_roundtrip():
@@ -360,7 +386,7 @@ def test_load_state_dict_strict_roundtrip():
     a = source.encoder(feats, cache={})
     b = target.encoder(feats, cache={})
     mx.eval(a, b)
-    assert a.tolist() == pytest.approx(b.tolist(), abs=1e-5)
+    assert_allclose(a, b)
 
 
 def test_load_state_dict_strict_rejects_mismatch():
