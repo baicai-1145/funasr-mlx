@@ -67,6 +67,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten, tree_unflatten
 
 __all__ = [
     "INFERENCE_ONLY_PREFIXES",
@@ -406,10 +407,12 @@ class ConvFeatureExtraction(nn.Module):
 class SamePad(nn.Module):
     """``fairseq.modules.SamePad`` (non-causal).
 
-    ``remove = 1 if k is even else 0``; left-pad by ``remove`` then right-pad by
-    one when the length became even.  For the odd ``k = 19`` used by
-    ``emotion2vec_plus_large`` the only effect is a **+1 frame right pad whenever
-    the incoming length is odd**, which the port reproduces exactly.
+    ``remove = 1 if k is even else 0`` and the only thing it ever does is left-pad
+    by ``remove``; there is no length-parity padding.  So for the odd
+    ``k = 19`` of ``emotion2vec_plus_large`` it is the **identity**, and an even
+    ``k`` left-pads by one.  The conv's own ``padding = k // 2`` already makes the
+    sequence length legal, so adding anything else would silently break
+    downstream alignment.
     """
 
     def __init__(self, kernel_size: int) -> None:
@@ -420,8 +423,6 @@ class SamePad(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         if self.remove > 0:
             x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(self.remove, 0)])
-        if x.shape[-1] % 2 == 0:
-            x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, 1)])
         return x
 
 
@@ -456,8 +457,13 @@ class PositionalEncoder(nn.Module):
     """``Sequential(TransposeLast, 5 x PositionalBlock, TransposeLast)``.
 
     With ``conv_pos_pre_ln=false`` (the large config) the conv's
-    ``padding = k // 2 = 9`` and ``SamePad(19)`` are *both* applied, so the
-    output length is ``L`` for even ``L`` and ``L + 1`` for odd ``L``.
+    ``padding = k // 2 = 9`` preserves ``T`` and ``SamePad(19)`` is the identity
+    on top of it, so the output length is always exactly ``T``.
+
+    Time axis contract: each block receives ``NTC`` (MLX channels-last) and
+    transposes to ``NCT`` for the conv and back, because ``mx.nn.Conv1d`` is
+    channels-last while the reference works in ``NCT``.  ``SamePad`` therefore
+    pads the *last* axis of the ``NCT`` view, i.e. time.
     """
 
     def __init__(self, dim: int, depth: int, kernel_size: int, groups: int,
@@ -951,17 +957,20 @@ def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
     """``{dotted.name: array}`` for every parameter leaf.
 
     Uses ``mlx.utils.tree_flatten`` on the module itself -- **not**
-    ``vars(module)`` and **not** ``module.parameters()``:
+    ``vars(module)``, because ``nn.Module`` is a ``dict`` subclass and
+    ``__setattr__`` stores arrays and submodules in the dict part, so ``vars()``
+    reports zero tensors.
 
-    * ``nn.Module`` is a ``dict`` subclass and ``__setattr__`` stores arrays and
-      submodules in the dict part, so ``vars()`` reports zero tensors;
-    * ``parameters()`` applies ``valid_parameter_filter``, which drops biases,
-      LayerNorm weights, ``extra_tokens`` and ``alibi_scale`` -- all of which
-      are real tensors in this checkpoint.
+    ``module.parameters()`` would also work here: its ``valid_parameter_filter``
+    (``mlx/nn/layers/base.py:235``) is
+    ``isinstance(value, (dict, list, mx.array)) and not key.startswith("_")``,
+    so biases, LayerNorm weights, ``extra_tokens`` and ``alibi_scale`` are all
+    retained.  ``tree_flatten`` is used directly because it needs no filter
+    argument and keeps the full key space.
 
     Non-array leaves (ints, strings, tuples) are filtered out.
     """
-    flat = mx.utils.tree_flatten(module)
+    flat = tree_flatten(module)
     return {
         key: value for key, value in flat.items() if isinstance(value, mx.array)
     }
@@ -1053,5 +1062,5 @@ def load_state_dict_strict(
     nested: dict[str, Any] = {}
     for name, array in converted.items():
         _assign(nested, name, array)
-    module.update(mx.utils.tree_unflatten(nested))
+    module.update(tree_unflatten(nested))
     return discarded, ()

@@ -286,12 +286,16 @@ def test_block_left_cache_matches_zero_padding():
     # it creates ``cache_layer_<i>``.  With that seed the streaming buffer is
     # bit-identical to the left zero-padding used by the offline call.
     stream_cache = mx.zeros((1, block.dim, block.keep))
-    streamed = None
+    chunks = []
     for step in range(3):
         frame = x[:, step : step + 1, :]
-        streamed, stream_cache = block(frame, stream_cache)
+        out, stream_cache = block(frame, stream_cache)
+        chunks.append(out)
     assert stream_cache.shape == (1, 2, 3)  # (lorder - 1) * lstride
+    # every chunk is one frame wide; concatenate on the time axis before comparing
+    streamed = mx.concatenate(chunks, axis=1)
     mx.eval(offline, streamed)
+    assert streamed.shape == offline.shape == (1, 3, 2)
     assert_allclose(streamed, offline)
 
 

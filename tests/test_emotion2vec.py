@@ -22,6 +22,7 @@ from funasr_mlx.models.emotion2vec import (
     Emotion2VecConfig,
     Emotion2VecModel,
     OrderedModules,
+    PositionalEncoder,
     SamePad,
     SequentialStack,
     TransposeLast,
@@ -160,23 +161,35 @@ def test_alibi_is_zero_on_the_diagonal_and_linear_in_distance():
 # --------------------------------------------------------------------------- #
 # SamePad
 # --------------------------------------------------------------------------- #
-def test_same_pad_for_the_large_kernel_is_length_preserving_on_even_lengths():
-    # k = 19 is odd -> remove = 0; SamePad only right-pads by 1 on odd lengths.
+def test_same_pad_for_the_large_kernel_is_the_identity():
+    # k = 19 is odd -> remove = 0 and fairseq SamePad has no length-parity pad,
+    # so it is the identity for every length (odd *and* even).
     pad = SamePad(19)
     assert pad.remove == 0
-    even = mx.zeros((1, 4, 8))
-    odd = mx.zeros((1, 4, 7))
-    mx.eval(pad(even), pad(odd))
-    assert pad(even).shape[-1] == 8
-    assert pad(odd).shape[-1] == 8
+    for length in (4, 7, 8, 9):
+        out = pad(mx.zeros((1, 4, length)))
+        mx.eval(out)
+        assert out.shape[-1] == length
 
 
-def test_same_pad_for_even_kernels_removes_one():
+def test_same_pad_for_even_kernels_left_pads_by_one():
     pad = SamePad(4)
     assert pad.remove == 1
-    out = pad(mx.zeros((1, 4, 8)))
+    out = pad(mx.arange(16, dtype=mx.float32).reshape(1, 4, 8))
     mx.eval(out)
     assert out.shape[-1] == 9
+    # the pad is on the LEFT: a zero, then the input
+    assert_allclose(np.asarray(out)[0, 0, 1:], np.arange(8, dtype=np.float64))
+    assert float(out[0, 0, 0]) == 0.0
+
+
+def test_positional_encoder_preserves_the_time_axis():
+    """conv padding=9 with k=19 plus an identity SamePad must return ``L``."""
+    module = PositionalEncoder(8, depth=2, kernel_size=5, groups=4, eps=1e-5)
+    for length in (5, 6, 7, 9):
+        out = module(mx.zeros((1, length, 8)))
+        mx.eval(out)
+        assert out.shape == (1, length, 8), length
 
 
 # --------------------------------------------------------------------------- #
