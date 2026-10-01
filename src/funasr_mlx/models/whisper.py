@@ -47,6 +47,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 import mlx.core as mx
 from mlx import nn as mxnn
+from mlx.nn import log_softmax
 
 __all__ = [
     "AudioEncoder",
@@ -113,22 +114,37 @@ class ModuleStack(mxnn.Module):
         self._length = len(blocks)
 
     def __len__(self) -> int:
-        return self._length
+        # Keep dict semantics: MLX may call len() on this object.
+        return dict.__len__(self)
 
     def __iter__(self) -> Iterator[mxnn.Module]:
-        for index in range(self._length):
-            yield getattr(self, str(index))
+        for index in range(dict.__len__(self)):
+            yield dict.__getitem__(self, str(index))
 
-    def __getitem__(self, index: int) -> mxnn.Module:
-        if index < 0:
-            index += self._length
-        return getattr(self, str(index))
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, int):
+            if key < 0:
+                key += dict.__len__(self)
+            key = str(key)
+        return dict.__getitem__(self, key)
+
+    def names(self) -> list[str]:
+        return [str(index) for index in range(dict.__len__(self))]
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        result: Any = args
+        """Chain blocks with canonical ``nn.Sequential`` semantics.
+
+        The leading argument is threaded through the chain while the remaining
+        positional arguments and keywords stay fixed.  Feeding a block's return
+        value back as ``*args`` would unpack an ``mx.array`` along axis 0 and hand
+        the next block ``B`` separate arguments, which only works at batch size 1.
+        """
+        if not args:
+            raise TypeError(f"{type(self).__name__}.__call__() requires at least one argument")
+        head, *rest = args
         for block in self:
-            result = block(*result, **kwargs)
-        return result
+            head = block(head, *rest, **kwargs)
+        return head
 
 
 def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_LAYOUT):
@@ -147,9 +163,20 @@ def _rule_for(module: mxnn.Module) -> str:
 
 
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
-    for key, value in vars(module).items():
-        if key.startswith("_"):
-            continue
+    """Collect tensors from a module tree.
+
+    ``mlx.nn.Module`` **subclasses ``dict``** (``class Module(dict)`` in
+    ``mlx/nn/layers/base.py``).  Its ``__setattr__`` routes arrays, dicts, lists,
+    tuples and *sub-modules* (a ``Module`` is itself a ``dict``, so
+    ``isinstance(v, dict)`` holds) into the **mapping** storage via
+    ``self[key] = val``; everything else -- ints, strings, dataclasses and the
+    ``_``-prefixed configuration attached here -- goes to ``__dict__``.
+
+    Consequently ``vars(module)`` contains **no tensors at all** (only
+    ``_no_grad``/``_training``), and flattening through it silently yields an
+    empty dict.  The mapping storage is walked instead.
+    """
+    for key, value in dict.items(module):
         name = f"{prefix}.{key}" if prefix else key
         if isinstance(value, mxnn.Module):
             _flatten_into(value, name, tensors, rules)
@@ -243,10 +270,17 @@ def load_strict(
     return LoadReport(loaded=loaded)
 
 
+def _resolve_child(module: mxnn.Module, key: str) -> Any:
+    """Fetch a child by mapping key, falling back to a plain attribute."""
+    if key in dict.keys(module):
+        return dict.__getitem__(module, key)
+    return getattr(module, key)
+
+
 def _assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
     node: Any = module
     for part in parts[:-1]:
-        node = getattr(node, part)
+        node = _resolve_child(node, part)
     setattr(node, parts[-1], array)
 
 
@@ -911,13 +945,22 @@ class GreedyDecodeResult:
 
 
 def _suppress(logits: mx.array, ids: Sequence[int]) -> mx.array:
-    """Set the given vocabulary columns to ``-inf`` (a port of the logit filters)."""
+    """Set the given vocabulary columns to ``-inf`` (a port of the logit filters).
+
+    ``vocab`` (V,) is broadcast **against** the banned ids (N,) rather than the
+    other way round, and the membership test is reduced over the N axis.  Building
+    a ``(1, V)`` and a ``(1, N)`` array and comparing them would only broadcast
+    when ``N == 1`` or ``N == V``; with two or more suppressed tokens and a
+    vocabulary of a different size it raises instead of masking.
+    """
     banned = [int(t) for t in ids]
     if not banned:
         return logits
-    vocab = mx.arange(logits.shape[-1], dtype=mx.int32)[None, :]
-    mask = vocab == mx.array(banned, dtype=mx.int32)[None, :]
-    return mx.where(mask, mx.array(-float("inf"), logits.dtype), logits)
+    vocab_size = logits.shape[-1]
+    vocab = mx.arange(vocab_size, dtype=mx.int32)[:, None]  # (V, 1)
+    banned_arr = mx.array(banned, dtype=mx.int32)[None, :]  # (1, N)
+    blocked = mx.any(vocab == banned_arr, axis=-1)  # (V,)
+    return mx.where(mx.expand_dims(blocked, 0), mx.array(-float("inf"), logits.dtype), logits)
 
 
 def greedy_decode(
@@ -965,7 +1008,7 @@ def greedy_decode(
         if cfg.suppress_blank_at_first_step and step == 0:
             last = _suppress(last, [t for t in (cfg.space_token_id, eot) if t is not None])
         last = _suppress(last, cfg.suppress_tokens)
-        logprobs = mx.logsoftmax(last.astype(mx.float32), axis=-1)
+        logprobs = log_softmax(last.astype(mx.float32), axis=-1)
         next_tokens = mx.argmax(logprobs, axis=-1)
         rows = next_tokens.tolist()
         lps = logprobs.tolist()
@@ -1030,7 +1073,7 @@ def detect_language(
         raise ValueError("prompt_tokens must be non-empty")
     tokens = mx.array([prompt], dtype=mx.int32)
     logits = model.logits(tokens, audio_features)
-    logprobs = mx.logsoftmax(logits[:, -1, :].astype(mx.float32), axis=-1)
+    logprobs = log_softmax(logits[:, -1, :].astype(mx.float32), axis=-1)
     values = logprobs[0].tolist()
     scored = [(ids[i], float(values[tok])) for i, tok in enumerate(ids)]
     scored.sort(key=lambda item: item[1], reverse=True)

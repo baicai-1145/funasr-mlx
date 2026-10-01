@@ -1,0 +1,272 @@
+"""Tiny, offline, network-free tests for the native MLX Whisper port.
+
+Deliberately tiny (4 mel bins, 8 channels, 2 layers) so the file stays far below
+the project memory ceiling.  These are structural / algebraic checks -- parameter
+naming, mask geometry, KV-cache equivalence, log-mel frame arithmetic -- **not**
+real-checkpoint acceptance, and there is no tokenizer and no transcription here.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+
+mx = pytest.importorskip("mlx.core", reason="mlx is required for the model ports")
+
+from mlx import nn as mxnn  # noqa: E402
+
+from funasr_mlx.models.whisper import (  # noqa: E402
+    CONV1D_LAYOUT,
+    AudioEncoder,
+    CheckpointKeyError,
+    GreedyDecodeConfig,
+    ModelDimensions,
+    MultiHeadAttention,
+    TextDecoder,
+    Whisper,
+    convert_checkpoint_tensor,
+    detect_language,
+    flatten_state_dict,
+    greedy_decode,
+    load_strict,
+    log_mel_spectrogram,
+    mel_filterbank,
+    pad_or_trim,
+    reflect_pad_1d,
+    sinusoids,
+)
+
+N_MELS = 4
+N_FFT = 8
+HOP = 2
+N_STATE = 8
+N_HEAD = 2
+
+
+def _dims(**overrides) -> ModelDimensions:
+    base = dict(
+        n_mels=N_MELS,
+        n_audio_ctx=20,
+        n_audio_state=N_STATE,
+        n_audio_head=N_HEAD,
+        n_audio_layer=2,
+        n_vocab=16,
+        n_text_ctx=12,
+        n_text_state=N_STATE,
+        n_text_head=N_HEAD,
+        n_text_layer=2,
+    )
+    base.update(overrides)
+    return ModelDimensions.from_dict(base)
+
+
+def _whisper(**overrides) -> Whisper:
+    return Whisper(_dims(**overrides))
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint plumbing
+# --------------------------------------------------------------------------- #
+def test_flatten_state_dict_reads_the_mapping_storage_not_dunder_dict():
+    """Regression: ``mlx.nn.Module`` subclasses ``dict``; ``vars()`` finds no
+    tensors, so a ``vars()``-based traversal silently yields an empty dict."""
+    leaf = mxnn.Linear(3, 2)
+    assert not any(isinstance(v, mx.array) for v in vars(leaf).values())
+    assert set(flatten_state_dict(leaf)) == {"weight", "bias"}
+
+    state = flatten_state_dict(_whisper())
+    assert state, "the model must expose parameters"
+    for key in (
+        "encoder.conv1.weight",
+        "encoder.conv2.weight",
+        "encoder.blocks.0.attn.query.weight",
+        "encoder.blocks.0.mlp.0.weight",
+        "encoder.blocks.0.mlp.2.weight",
+        "encoder.ln_post.weight",
+        "decoder.token_embedding.weight",
+        "decoder.positional_embedding",
+        "decoder.blocks.0.cross_attn.query.weight",
+        "decoder.ln.weight",
+    ):
+        assert key in state, key
+
+
+def test_conv1d_weights_use_the_mlx_layout_and_convert_back():
+    model = _whisper()
+    weight = flatten_state_dict(model)["encoder.conv1.weight"]
+    assert weight.shape == (N_STATE, 3, N_MELS)  # MLX (out, k, in)
+    torch_weight = mx.zeros((N_STATE, N_MELS, 3))
+    converted = convert_checkpoint_tensor("encoder.conv1.weight", torch_weight, CONV1D_LAYOUT)
+    assert converted.shape == (N_STATE, 3, N_MELS)
+    assert convert_checkpoint_tensor("decoder.token_embedding.weight", mx.zeros((4, 4))).shape == (
+        4,
+        4,
+    )
+
+
+def test_decoder_causal_mask_is_lower_triangular_neg_inf():
+    decoder = TextDecoder(n_vocab=16, n_ctx=12, n_state=N_STATE, n_head=N_HEAD, n_layer=2)
+    mask = decoder.mask
+    assert mask.shape == (12, 12)
+    for i in range(12):
+        for j in range(12):
+            value = mask[i, j].item()
+            assert math.isinf(value) and value < 0 if j > i else value == 0.0
+    # The mask is NOT a checkpoint parameter: torch registers it persistent=False.
+    assert "decoder.mask" not in flatten_state_dict(decoder)
+    assert "decoder._mask" not in flatten_state_dict(decoder)
+
+
+def test_load_strict_round_trips_and_rejects_mismatch():
+    model = _whisper()
+    state = flatten_state_dict(model)
+    clone = _whisper()
+    assert load_strict(clone, state) == sorted(state)
+    with pytest.raises(CheckpointKeyError):
+        load_strict(_whisper(), {k: v for k, v in state.items() if k != "decoder.ln.bias"})
+
+
+# --------------------------------------------------------------------------- #
+# positional encoding
+# --------------------------------------------------------------------------- #
+def test_sinusoids_is_zero_based_and_negatively_incremented():
+    table = sinusoids(4, N_STATE)
+    assert table.shape == (4, N_STATE)
+    # sin(0) = 0 in the first half, cos(0) = 1 in the second -> concatenated.
+    assert [round(v, 6) for v in table[0].tolist()] == [0.0] * 4 + [1.0] * 4
+    # inv_timescales = exp(-log(10000) / (channels // 2 - 1) * arange(channels // 2))
+    increment = math.log(10000.0) / (N_STATE // 2 - 1)
+    expected = [math.sin(1.0 * math.exp(-increment * i)) for i in range(N_STATE // 2)] + [
+        math.cos(1.0 * math.exp(-increment * i)) for i in range(N_STATE // 2)
+    ]
+    assert [round(v, 5) for v in table[1].tolist()] == [round(v, 5) for v in expected]
+
+
+# --------------------------------------------------------------------------- #
+# front-end
+# --------------------------------------------------------------------------- #
+def test_mel_filterbank_shape_and_slaney_normalisation():
+    filters = mel_filterbank(n_mels=4, n_fft=N_FFT, sample_rate=16000)
+    assert filters.shape == (4, N_FFT // 2 + 1)
+    assert bool((filters >= 0).all().item())
+    # Slaney norm makes each filter integrate to ~1 (area under the triangle).
+    for row in filters.tolist():
+        assert 0.0 < sum(row) < 10.0
+
+
+def test_log_mel_spectrogram_frame_count_and_layout():
+    audio = mx.arange(160, dtype=mx.float32).reshape(1, 160) / 1000.0
+    mel = log_mel_spectrogram(audio, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP)
+    # centre=True pads by n_fft // 2 -> 1 + (160 + 8 - 8) // 2 = 81 frames, minus the
+    # final frame torch drops with [..., :-1] -> 80.
+    assert mel.shape == (1, 160 // HOP, N_MELS)
+    assert bool(mx.isfinite(mel).all().item())
+
+
+def test_log_mel_spectrogram_enforces_the_frame_guard():
+    audio = mx.zeros((1, 4000), mx.float32)
+    with pytest.raises(ValueError, match="max_frames"):
+        log_mel_spectrogram(audio, n_mels=N_MELS, n_fft=N_FFT, hop_length=HOP, max_frames=10)
+
+
+def test_reflect_pad_excludes_the_edge_sample():
+    x = mx.array([[1.0, 2.0, 3.0, 4.0]])
+    padded = reflect_pad_1d(x, 2)
+    assert padded.shape == (1, 8)
+    # torch's reflect mode repeats x[1], not x[0].
+    assert padded[0].tolist() == [2.0, 3.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0]
+
+
+def test_pad_or_trim_pads_and_truncates():
+    x = mx.arange(5, dtype=mx.float32)
+    assert pad_or_trim(x, 8).shape == (8,)
+    assert pad_or_trim(x, 8)[5:].tolist() == [0.0, 0.0, 0.0]
+    assert pad_or_trim(x, 3).tolist() == [0.0, 1.0, 2.0]
+
+
+# --------------------------------------------------------------------------- #
+# attention / KV cache
+# --------------------------------------------------------------------------- #
+def test_kv_cache_matches_a_single_full_forward():
+    """The cached incremental decode must equal one full forward pass."""
+    model = _whisper().eval()
+    mel = mx.arange(1 * 40 * N_MELS, dtype=mx.float32).reshape(1, 40, N_MELS) / 97.0
+    audio_features = model.embed_audio(mel)
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    full_tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+
+    reference = model.logits(full_tokens, audio_features)
+
+    cache: dict[str, mx.array] = {}
+    model.logits(prompt, audio_features, cache)
+    assert cache, "the cache must be populated after the prompt pass"
+    assert cache["blocks.0.attn.key"].shape[1] == 4  # self-attention covers the prompt
+    assert cache["blocks.0.cross_attn.key"].shape[1] == audio_features.shape[1]
+
+    step = model.logits(mx.array([[5]], dtype=mx.int32), audio_features, cache)
+    assert cache["blocks.0.attn.key"].shape[1] == 5  # appended, not replaced
+    assert mx.allclose(step[0, -1, :], reference[0, -1, :], atol=1e-4).item()
+
+
+def test_suppress_masks_several_token_ids():
+    """Regression: comparing (1, V) against (1, N) only broadcasts when N is 1
+    or N == V, so two or more suppressed ids used to raise."""
+    model = _whisper().eval()
+    mel = mx.zeros((1, 40, N_MELS), mx.float32)
+    audio_features = model.embed_audio(mel)
+    prompt = mx.array([[1, 2]], dtype=mx.int32)
+
+    plain = greedy_decode(model, audio_features, prompt, GreedyDecodeConfig(max_tokens=4))
+    banned = greedy_decode(
+        model,
+        audio_features,
+        prompt,
+        GreedyDecodeConfig(max_tokens=4, suppress_tokens=(3, 7, 11, 13), eot_token_id=15),
+    )
+    assert all(tok not in (3, 7, 11, 13) for row in banned.tokens for tok in row)
+    assert plain.tokens is not None and banned.tokens is not None
+
+
+def test_greedy_decode_stops_at_eot_and_returns_ids_only():
+    model = _whisper().eval()
+    mel = mx.zeros((2, 40, N_MELS), mx.float32)
+    audio_features = model.embed_audio(mel)
+    prompt = mx.array([[1, 2], [3, 4]], dtype=mx.int32)
+    result = greedy_decode(
+        model,
+        audio_features,
+        prompt,
+        GreedyDecodeConfig(max_tokens=5, eot_token_id=15, space_token_id=0),
+    )
+    assert len(result.tokens) == 2
+    assert len(result.tokens_including_prompt[0]) == 2 + len(result.tokens[0])
+    assert all(isinstance(tok, int) for row in result.tokens for tok in row)
+    # suppress_blank forbids eot at the very first generated position.
+    assert 15 not in result.tokens[0] or not result.tokens[0]
+    assert all(tok != 0 for row in result.tokens for tok in row)
+
+
+def test_detect_language_returns_sorted_logprobs():
+    model = _whisper().eval()
+    mel = mx.zeros((1, 40, N_MELS), mx.float32)
+    audio_features = model.embed_audio(mel)
+    scored = detect_language(model, audio_features, [5, 6, 7], [1, 9])
+    assert len(scored) == 3
+    assert {tok for tok, _ in scored} == {5, 6, 7}
+    assert all(math.isfinite(lp) for _, lp in scored)
+    logprobs = [lp for _, lp in scored]
+    assert logprobs == sorted(logprobs, reverse=True)
+
+
+def test_encoder_halves_the_time_axis_twice():
+    encoder = AudioEncoder(n_mels=N_MELS, n_ctx=20, n_state=N_STATE, n_head=N_HEAD, n_layer=2)
+    out = encoder(mx.zeros((1, 40, N_MELS), mx.float32))
+    assert out.shape == (1, (40 + 1) // 4, N_STATE)
+
+
+def test_attention_cache_prefix_names_are_namespaced():
+    attn = MultiHeadAttention(N_STATE, N_HEAD, prefix="blocks.3.cross_attn")
+    assert attn.cache_prefix == "blocks.3.cross_attn"
+    out = attn(mx.zeros((1, 5, N_STATE)), xa=mx.zeros((1, 9, N_STATE)))
+    assert out.shape == (1, 5, N_STATE)

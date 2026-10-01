@@ -90,22 +90,37 @@ class ModuleStack(mxnn.Module):
         self._length = len(blocks)
 
     def __len__(self) -> int:
-        return self._length
+        # Keep dict semantics: MLX may call len() on this object.
+        return dict.__len__(self)
 
     def __iter__(self) -> Iterator[mxnn.Module]:
-        for index in range(self._length):
-            yield getattr(self, str(index))
+        for index in range(dict.__len__(self)):
+            yield dict.__getitem__(self, str(index))
 
-    def __getitem__(self, index: int) -> mxnn.Module:
-        if index < 0:
-            index += self._length
-        return getattr(self, str(index))
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, int):
+            if key < 0:
+                key += dict.__len__(self)
+            key = str(key)
+        return dict.__getitem__(self, key)
+
+    def names(self) -> list[str]:
+        return [str(index) for index in range(dict.__len__(self))]
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        result: Any = args
+        """Chain blocks with canonical ``nn.Sequential`` semantics.
+
+        The leading argument is threaded through the chain while the remaining
+        positional arguments and keywords stay fixed.  Feeding a block's return
+        value back as ``*args`` would unpack an ``mx.array`` along axis 0 and hand
+        the next block ``B`` separate arguments, which only works at batch size 1.
+        """
+        if not args:
+            raise TypeError(f"{type(self).__name__}.__call__() requires at least one argument")
+        head, *rest = args
         for block in self:
-            result = block(*result, **kwargs)
-        return result
+            head = block(head, *rest, **kwargs)
+        return head
 
 
 class NamedModuleDict(mxnn.Module):
@@ -127,6 +142,10 @@ class NamedModuleDict(mxnn.Module):
     def __len__(self) -> int:
         return len(self._names)
 
+    def names(self) -> list[str]:
+        """Registered names in insertion order."""
+        return list(self._names)
+
     def __iter__(self) -> Iterator[mxnn.Module]:
         for name in self._names:
             yield getattr(self, name)
@@ -136,10 +155,12 @@ class NamedModuleDict(mxnn.Module):
         return getattr(self, name)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        result: Any = args
+        if not args:
+            raise TypeError(f"{type(self).__name__}.__call__() requires at least one argument")
+        head, *rest = args
         for module in self:
-            result = module(*result, **kwargs)
-        return result
+            head = module(head, *rest, **kwargs)
+        return head
 
 
 class NamedLayerList(mxnn.Module):
@@ -160,6 +181,10 @@ class NamedLayerList(mxnn.Module):
 
     def __len__(self) -> int:
         return len(self._names)
+
+    def names(self) -> list[str]:
+        """Registered names in insertion order (``tdnnd1``, ``tdnnd2``, ...)."""
+        return list(self._names)
 
     def __iter__(self) -> Iterator[mxnn.Module]:
         for name in self._names:
@@ -209,9 +234,20 @@ def _conv_rule(module: mxnn.Module) -> str:
 
 
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
-    for key, value in vars(module).items():
-        if key.startswith("_"):
-            continue
+    """Collect tensors from a module tree.
+
+    ``mlx.nn.Module`` **subclasses ``dict``** (``class Module(dict)`` in
+    ``mlx/nn/layers/base.py``).  Its ``__setattr__`` routes arrays, dicts, lists,
+    tuples and *sub-modules* (a ``Module`` is itself a ``dict``, so
+    ``isinstance(v, dict)`` holds) into the **mapping** storage via
+    ``self[key] = val``; everything else -- ints, strings, dataclasses and the
+    ``_``-prefixed configuration attached here -- goes to ``__dict__``.
+
+    Consequently ``vars(module)`` contains **no tensors at all** (only
+    ``_no_grad``/``_training``), and flattening through it silently yields an
+    empty dict.  The mapping storage is walked instead.
+    """
+    for key, value in dict.items(module):
         name = f"{prefix}.{key}" if prefix else key
         if isinstance(value, mxnn.Module):
             _flatten_into(value, name, tensors, rules)
@@ -342,10 +378,17 @@ def load_strict(
     return LoadReport(loaded=loaded, dropped=dropped)
 
 
+def _resolve_child(module: mxnn.Module, key: str) -> Any:
+    """Fetch a child by mapping key, falling back to a plain attribute."""
+    if key in dict.keys(module):
+        return dict.__getitem__(module, key)
+    return getattr(module, key)
+
+
 def _assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
     node: Any = module
     for part in parts[:-1]:
-        node = getattr(node, part)
+        node = _resolve_child(node, part)
     setattr(node, parts[-1], array)
 
 
@@ -597,8 +640,12 @@ class FCM(mxnn.Module):
                 in_planes = planes * block.expansion
             return ModuleStack(layers)
 
+        # Reference quirk preserved: components.py:72-73 passes ``num_blocks[0]``
+        # to BOTH ``_make_layer`` calls, so ``num_blocks[1]`` is never consulted.
+        # Irrelevant for the default (2, 2), but kept faithful rather than
+        # "corrected", so a checkpoint built with the reference cannot diverge.
         self.layer1 = _make_layer(m_channels, num_blocks[0], 2)
-        self.layer2 = _make_layer(m_channels, num_blocks[1], 2)
+        self.layer2 = _make_layer(m_channels, num_blocks[0], 2)
 
         self.conv2 = mxnn.Conv2d(
             m_channels, m_channels, kernel_size=3, stride=(2, 1), padding=1, bias=False
@@ -982,15 +1029,19 @@ class CAMPPlus(mxnn.Module):
                     memory_efficient=cfg.memory_efficient,
                 ),
             )
-            self._block_names.append(block_name)
             channels = channels + num_layers * cfg.growth_rate
             transit_name = f"transit{i + 1}"
             self.xvector.add(
                 transit_name,
                 TransitLayer(channels, channels // 2, bias=False, config_str=cfg.config_str),
             )
-            self._transit_names.append(transit_name)
             channels //= 2
+        # Introspection only.  These two lists must NEVER be used for execution
+        # order: the reference interleaves block_i / transit_i, so
+        # ``xvector.names()`` is the single source of truth (see
+        # ``CAMPPlus.frame_features``).
+        self._block_names = [n for n in self.xvector.names() if n.startswith("block")]
+        self._transit_names = [n for n in self.xvector.names() if n.startswith("transit")]
 
         self.xvector.add("out_nonlinear", get_nonlinear(cfg.config_str, channels))
         self._frame_channels = channels
@@ -1018,13 +1069,21 @@ class CAMPPlus(mxnn.Module):
 
     # -- forward ------------------------------------------------------------ #
     def frame_features(self, x: mx.array) -> mx.array:
-        """Run everything up to (but excluding) pooling; returns ``(B, T, C)``."""
+        """Run everything up to (but excluding) pooling; returns ``(B, T, C)``.
+
+        The stage order is taken from the ``xvector`` container's own insertion
+        order, which mirrors the reference's ``nn.Sequential``: ``tdnn``, then
+        ``block1, transit1, block2, transit2, ...``, then ``out_nonlinear``.
+        Iterating separate block/transit name lists instead would apply **all**
+        blocks before **any** transit, which both misorders the network and
+        desynchronises the channel arithmetic (each transit halves the channel
+        count feeding the next block).
+        """
         x = mx.transpose(x, (0, 2, 1))  # (B, T, F) -> (B, F, T)
         x = self.head(x)  # (B, T', C*F/8)
-        x = self.xvector["tdnn"](x)
-        for name in self._block_names:
-            x = self.xvector[name](x)
-        for name in self._transit_names:
+        for name in self.xvector.names():
+            if name == "out_nonlinear":
+                break
             x = self.xvector[name](x)
         return self.xvector["out_nonlinear"](x)
 
