@@ -25,7 +25,9 @@ Architecture for ``emotion2vec_plus_large`` (from the pinned ``config.yaml``):
 [(512, 2, 2)]'``, ``extractor_mode=layer_norm``, ``conv_bias=false``,
 ``normalize=true``, ``conv_pos_depth=5`` / ``conv_pos_width=95`` /
 ``conv_pos_groups=16`` / ``conv_pos_pre_ln=false`` (so ``k = max(3, 95 // 5) =
-19`` and ``SamePad(19)`` runs *in addition to* the conv's ``padding = 9``),
+19``; the conv's ``padding = 9`` already preserves the time axis and
+``SamePad(19)`` is the identity on top of it -- for an even ``k`` fairseq's
+``SamePad`` crops the final time slot instead),
 ``prenet_depth=4``, ``num_extra_tokens=10``, ``learned_alibi=false``,
 ``learned_alibi_scale=true`` with ``per_head=true`` / ``per_layer=false``,
 ``use_alibi_encoder=true``, ``num_alibi_heads=16``, ``alibi_scale=1.0``.
@@ -62,6 +64,7 @@ from __future__ import annotations
 
 import ast
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -86,6 +89,8 @@ __all__ = [
     "TransposeLast",
     "CheckpointKeyError",
     "conv_feature_output_length",
+    "convert_checkpoint_tensors",
+    "is_conv_weight",
     "convert_checkpoint_tensors",
     "flat_parameter_names",
     "get_alibi",
@@ -338,11 +343,7 @@ class ConvFeatureBlock(nn.Module):
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int,
                  eps: float, conv_bias: bool) -> None:
-        super().__init__()
-        # The children are registered *only* through the OrderedModules so that the
-        # keys are ``conv_layers.N.0.weight`` / ``conv_layers.N.2.1.weight``; keeping
-        # an extra alias attribute would duplicate every leaf in the key space.
-        self.block = OrderedModules(
+        super().__init__(
             {
                 "0": nn.Conv1d(
                     in_channels,
@@ -368,9 +369,15 @@ class ConvFeatureBlock(nn.Module):
         self.out_channels = int(out_channels)
 
     def __call__(self, x: mx.array) -> mx.array:
-        """``x`` is ``NCT`` (PyTorch layout); returns ``NCT``."""
+        """``x`` is ``NCT`` (PyTorch layout); returns ``NCT``.
+
+        The children are registered **directly** under their Sequential indices,
+        so the checkpoint keys are exactly ``conv_layers.<i>.0.weight`` and
+        ``conv_layers.<i>.2.1.weight`` / ``.bias``.  An intermediate attribute
+        would insert a spurious ``.block`` namespace level.
+        """
         y = mx.swapaxes(x, 1, 2)  # NCT -> NTC
-        y = self.block(y)  # NTC -> NTC
+        y = super().__call__(y)  # NTC -> NTC
         return mx.swapaxes(y, 1, 2)  # NTC -> NCT
 
 
@@ -404,35 +411,40 @@ class ConvFeatureExtraction(nn.Module):
 # --------------------------------------------------------------------------- #
 # relative positional encoder (audio.py:83-106)
 # --------------------------------------------------------------------------- #
-class SamePad(nn.Module):
-    """``fairseq.modules.SamePad`` (non-causal).
+class SamePad(OrderedModules):
+    """``fairseq.modules.SamePad`` (non-causal), ``same_pad.py:18-22``.
 
-    ``remove = 1 if k is even else 0`` and the only thing it ever does is left-pad
-    by ``remove``; there is no length-parity padding.  So for the odd
-    ``k = 19`` of ``emotion2vec_plus_large`` it is the **identity**, and an even
-    ``k`` left-pads by one.  The conv's own ``padding = k // 2`` already makes the
-    sequence length legal, so adding anything else would silently break
-    downstream alignment.
+    ``remove = 1 if k is even else 0`` and the module **crops**, it never pads::
+
+        if self.remove > 0:
+            x = x[:, :, : -self.remove]
+
+    So ``k = 19`` (the large config) is the identity for every length, and an even
+    ``k`` drops the **last** time element.  Combined with the conv's
+    ``padding = k // 2`` the time axis is preserved exactly.
+
+    The reference slice indexes the last axis, which in the ``NCT`` view used
+    inside :class:`PositionalBlock` is time; that is why the contract here is
+    documented as NTC-in / NCT-conv / NTC-out.
     """
 
     def __init__(self, kernel_size: int) -> None:
-        super().__init__()
+        super().__init__({})
         self.kernel_size = int(kernel_size)
         self.remove = 1 if kernel_size % 2 == 0 else 0
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.remove > 0:
-            x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(self.remove, 0)])
+            # reference: x[:, :, : -remove] -- the final slot on the last axis
+            x = x[..., : -self.remove]
         return x
 
 
-class PositionalBlock(nn.Module):
+class PositionalBlock(OrderedModules):
     """One of the ``conv_pos_depth`` blocks (``audio.py:88-100``)."""
 
     def __init__(self, dim: int, kernel_size: int, groups: int, eps: float) -> None:
-        super().__init__()
-        # Registered only through ``block`` to keep the key ``....N.0.weight``.
-        self.block = OrderedModules(
+        super().__init__(
             {
                 "0": nn.Conv1d(
                     dim, dim, kernel_size, stride=1, padding=kernel_size // 2,
@@ -447,9 +459,14 @@ class PositionalBlock(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        """``x`` is ``NTC`` (channels-last); returns ``NTC``."""
-        y = mx.swapaxes(x, 1, 2)  # NTC -> NCT
-        y = self.block(y)  # keeps NCT inside the Sequential
+        """``x`` is ``NTC`` (channels-last); returns ``NTC``.
+
+        Children are registered **directly** under their Sequential indices, so
+        the checkpoint keys are ``relative_positional_encoder.<i>.0.weight`` and
+        ``.bias`` with no extra namespace level.
+        """
+        y = mx.swapaxes(x, 1, 2)  # NTC -> NCT (time is now the last axis)
+        y = super().__call__(y)  # keeps NCT inside the Sequential
         return mx.swapaxes(y, 1, 2)  # NCT -> NTC
 
 
@@ -578,11 +595,24 @@ class BlockEncoder(nn.Module):
         self.norm = norm
         self.layer_norm_first = bool(layer_norm_first)
 
-    def __call__(self, x: mx.array, alibi_bias: mx.array | None) -> mx.array:
+    def __call__(self, x: mx.array, alibi_bias: mx.array | None,
+                 alibi_scale: mx.array | None = None) -> mx.array:
+        """``modules.py:72-93``.
+
+        ``learned_alibi_scale_per_layer`` is honoured here: block ``i`` uses
+        ``alibi_scale[i]`` when the leading dimension is greater than 1, otherwise
+        the single shared row is folded in once by the caller.
+        """
         if self.norm is not None and not self.layer_norm_first:
             x = self.norm(x)
-        for block in self.blocks:
-            x, _ = block(x, alibi_bias)
+        for index, block in enumerate(self.blocks):
+            bias = alibi_bias
+            if bias is not None and alibi_scale is not None:
+                scale = (
+                    alibi_scale[index] if alibi_scale.shape[0] > 1 else alibi_scale.squeeze(0)
+                )
+                bias = bias * scale.astype(bias.dtype)
+            x, _ = block(x, bias)
         return x
 
 
@@ -783,21 +813,35 @@ class AudioEncoder(nn.Module):
         base = get_alibi(time_steps, self.config.num_alibi_heads)  # (H, T, T)
         return mx.broadcast_to(base[None], (batch_size, *base.shape))
 
-    def contextualized_features(self, samples: mx.array) -> tuple[mx.array, mx.array]:
+    def contextualized_features(
+        self, samples: mx.array
+    ) -> tuple[mx.array, mx.array, mx.array | None]:
         """``contextualized_features(..., mask=False, remove_masked=False)``.
 
-        Returns ``(x, alibi_bias_after_prenet_scaling)``.
+        Returns ``(x, alibi_bias, alibi_scale_for_model_blocks)``.  When the
+        learned scale has a single row it is folded into ``alibi_bias`` here and
+        the third element is ``None``; with one row **per layer** the rows stay
+        live and the tail (``alibi_scale[prenet_depth:]``) is handed back so the
+        shared blocks pick their own row, exactly like the reference.
         """
+        if samples.ndim != 2:
+            raise ValueError(f"expected (B, samples), got shape {samples.shape}")
+        # Bound the O(T^2) attention here too, not only via Emotion2VecModel.
+        self.config.frames_for(int(samples.shape[-1]))
+
         x = self.local_features(samples)
         x = x + self.relative_positional_encoder(x)
 
         alibi_bias = self.alibi_bias(x.shape[0], x.shape[1])
         alibi_scale = self.alibi_scale
+        remaining: mx.array | None = None
         if alibi_scale is not None:
             alibi_scale = mx.maximum(alibi_scale, 0)
             if alibi_scale.shape[0] == 1:
                 alibi_bias = alibi_bias * alibi_scale.squeeze(0).astype(alibi_bias.dtype)
                 alibi_scale = None
+            else:
+                remaining = alibi_scale[self.config.prenet_depth:]
 
         num = self.extra_tokens.shape[1]
         if num:
@@ -807,10 +851,12 @@ class AudioEncoder(nn.Module):
             if alibi_bias is not None:
                 alibi_bias = mx.pad(alibi_bias, [(0, 0), (0, 0), (num, 0), (num, 0)])
 
-        x = self.context_encoder(x, alibi_bias)
-        return x, alibi_bias
+        x = self.context_encoder(x, alibi_bias, alibi_scale)
+        return x, alibi_bias, remaining
 
-    def __call__(self, samples: mx.array) -> tuple[mx.array, mx.array]:
+    def __call__(
+        self, samples: mx.array
+    ) -> tuple[mx.array, mx.array, mx.array | None]:
         return self.contextualized_features(samples)
 
 
@@ -893,15 +939,24 @@ class Emotion2VecModel(nn.Module):
         """Waveform ``(B, samples)`` -> frame features ``(B, T', embed_dim)``.
 
         ``remove_extra_tokens=True`` strips the ``num_extra_tokens`` cls tokens,
-        which is what FunASR does before the utterance-level pooling.
+        which is what FunASR does before the utterance-level pooling.  The encoder
+        is evaluated exactly **once**.
         """
-        encoder = self.modality_encoders["AUDIO"]
-        # Attention is O(T^2) * num_heads, so the bound is enforced on the forward
-        # path, not only by callers that pre-flight with config.frames_for.
+        if samples.ndim != 2:
+            raise ValueError(f"expected (B, samples), got shape {samples.shape}")
+        # Attention is O(T^2) * num_heads, so the bound is enforced here rather
+        # than only by callers who pre-flight with config.frames_for.
         self.config.frames_for(int(samples.shape[-1]))
-        x, alibi_bias = encoder.contextualized_features(samples)
-        for block in self.blocks:
-            x, _ = block(x, alibi_bias)
+        encoder = self.modality_encoders["AUDIO"]
+        x, alibi_bias, alibi_scale = encoder.contextualized_features(samples)
+        for index, block in enumerate(self.blocks):
+            bias = alibi_bias
+            if bias is not None and alibi_scale is not None:
+                scale = (
+                    alibi_scale[index] if alibi_scale.shape[0] > 1 else alibi_scale.squeeze(0)
+                )
+                bias = bias * scale.astype(bias.dtype)
+            x, _ = block(x, bias)
         if self.norm is not None:
             x = self.norm(x)
         if remove_extra_tokens:
@@ -910,12 +965,14 @@ class Emotion2VecModel(nn.Module):
                 x = x[:, num:, :]
         return x
 
-    def classify(self, samples: mx.array) -> tuple[mx.array, mx.array]:
-        """Return ``(features (B, embed_dim), logits (B, vocab_size))``.
+    def classify(self, samples: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        """Return ``(features (B, embed_dim), logits (B, vocab_size), frames)``.
 
         The head is ``nn.Linear(embed_dim, vocab_size)`` applied to the mean over
         time **after** the extra tokens have been removed
-        (``Emotion2vec.inference``: ``x = x.mean(dim=1); x = self.proj(x)``).
+        (``Emotion2vec.inference``: ``x = x.mean(dim=1); x = self.proj(x)``).  The
+        frame features are returned so a caller that also wants them does not have
+        to run the whole encoder a second time.
         """
         if self.proj is None:
             raise RuntimeError(
@@ -924,13 +981,25 @@ class Emotion2VecModel(nn.Module):
             )
         frames = self.extract_features(samples, remove_extra_tokens=True)
         pooled = mx.mean(frames, axis=1)  # (B, D)
-        return pooled, self.proj(pooled)
+        return pooled, self.proj(pooled), frames
 
     def emotion_scores(self, samples: mx.array) -> EmotionResult:
-        """Full FunASR-equivalent result: labels + softmax scores + features."""
+        """Full FunASR-equivalent result: labels + softmax scores + features.
+
+        Runs the encoder exactly once; ``feats`` is the utterance-level pooled
+        embedding the classifier consumed, which is the same
+        ``x.mean(dim=1)`` the reference uses, so no second pass is needed.
+        """
         if self.proj is None:
             raise RuntimeError("emotion_scores requires a classifier head (vocab_size > 0)")
-        _features, logits = self.classify(samples)
+        if samples.ndim != 2:
+            raise ValueError(f"expected (B, samples), got shape {samples.shape}")
+        if samples.shape[0] != 1:
+            raise ValueError(
+                f"emotion_scores returns a single EmotionResult, got batch "
+                f"{samples.shape[0]}; use classify() for batched output"
+            )
+        pooled, logits, _frames = self.classify(samples)
         labels = self.config.labels
         for index, label in enumerate(labels):
             if label.startswith("unuse"):
@@ -946,7 +1015,7 @@ class Emotion2VecModel(nn.Module):
             key="",
             labels=tuple(lab for lab, _ in selected),
             scores=tuple(float(score) for _, score in selected),
-            feats=mx.mean(self.extract_features(samples, remove_extra_tokens=True), axis=1),
+            feats=pooled,
         )
 
 
@@ -961,6 +1030,13 @@ def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
     ``__setattr__`` stores arrays and submodules in the dict part, so ``vars()``
     reports zero tensors.
 
+    ``mlx.utils.tree_flatten`` returns a **list of ``(key, value)`` tuples by
+    default**; passing ``destination={}`` is what makes it return the dict form,
+    so calling ``.items()`` on the default return raises.  ``vars(module)`` is
+    not used either, because ``nn.Module`` is a ``dict`` subclass and
+    ``__setattr__`` stores arrays and submodules in the dict part, so ``vars()``
+    reports zero tensors.
+
     ``module.parameters()`` would also work here: its ``valid_parameter_filter``
     (``mlx/nn/layers/base.py:235``) is
     ``isinstance(value, (dict, list, mx.array)) and not key.startswith("_")``,
@@ -970,20 +1046,32 @@ def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
 
     Non-array leaves (ints, strings, tuples) are filtered out.
     """
-    flat = tree_flatten(module)
+    flat = tree_flatten(module, destination={})
     return {
         key: value for key, value in flat.items() if isinstance(value, mx.array)
     }
 
 
-def _is_conv_weight(name: str) -> bool:
-    """True for ``*.conv_layers.<i>.0.weight`` and ``*.relative_positional_encoder.<j>.0.weight``."""  # noqa: E501
-    if not name.endswith(".weight"):
-        return False
-    parts = name.split(".")
-    if parts[-2] != "0":
-        return False
-    return parts[-3] in ("conv_layers",) or "relative_positional_encoder" in parts
+#: Exact checkpoint keys whose layout differs between PyTorch and MLX.  These
+#: are written out in full rather than derived from a positional guess, because
+#: the sequence index sits at ``parts[-3]`` and a ``parts[-3] == "conv_layers"``
+#: check silently stops matching.
+#:
+#: * ``conv_layers.<i>.0.weight`` -- ``nn.Conv1d`` weight ``(out, in//g, K)``
+#: * ``relative_positional_encoder.<i>.0.weight`` -- same ``nn.Conv1d``
+CONV_WEIGHT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^modality_encoders\.AUDIO\.local_encoder\.conv_layers\.\d+\.0\.weight$"
+    ),
+    re.compile(
+        r"^modality_encoders\.AUDIO\.relative_positional_encoder\.\d+\.0\.weight$"
+    ),
+)
+
+
+def is_conv_weight(name: str) -> bool:
+    """True for the depthwise ``Conv1d`` weights listed in :data:`CONV_WEIGHT_PATTERNS`."""
+    return any(pattern.match(name) for pattern in CONV_WEIGHT_PATTERNS)
 
 
 def convert_checkpoint_tensors(
@@ -991,9 +1079,8 @@ def convert_checkpoint_tensors(
 ) -> tuple[dict[str, mx.array], tuple[str, ...]]:
     """Convert a published ``state_dict`` and report what was discarded.
 
-    Only ``Conv1d``/``Conv2d`` weights change layout:
-    ``(out, in//g, K) -> (out, K, in//g)``.  Linears, LayerNorms, ``extra_tokens``
-    and ``alibi_scale`` already match MLX.
+    Only ``Conv1d`` weights change layout: ``(out, in//g, K) -> (out, K, in//g)``.
+    Linears, LayerNorms, ``extra_tokens`` and ``alibi_scale`` already match MLX.
     """
     converted: dict[str, mx.array] = {}
     discarded: list[str] = []
@@ -1003,13 +1090,13 @@ def convert_checkpoint_tensors(
             continue
         if not isinstance(value, mx.array):
             value = mx.array(value)
-        if _is_conv_weight(name):
-            if value.ndim == 3:  # Conv1d: (out, in//g, K)
-                value = mx.transpose(value, (0, 2, 1))
-            elif value.ndim == 4:  # Conv2d: (out, in//g, KH, KW)
-                value = mx.transpose(value, (0, 2, 3, 1))
-            else:
-                raise ValueError(f"{name}: expected a 3-D or 4-D conv weight, got {value.shape}")
+        if is_conv_weight(name):
+            if value.ndim != 3:
+                raise ValueError(
+                    f"{name}: expected a 3-D Conv1d weight (out, in//g, K), "
+                    f"got shape {value.shape}"
+                )
+            value = mx.transpose(value, (0, 2, 1))
         converted[name] = value
     return converted, tuple(sorted(discarded))
 

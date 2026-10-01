@@ -31,6 +31,7 @@ from funasr_mlx.models.emotion2vec import (
     flat_parameter_names,
     get_alibi,
     get_slopes,
+    is_conv_weight,
     load_state_dict_strict,
     parse_feature_encoder_spec,
     preprocess_waveform,
@@ -161,9 +162,19 @@ def test_alibi_is_zero_on_the_diagonal_and_linear_in_distance():
 # --------------------------------------------------------------------------- #
 # SamePad
 # --------------------------------------------------------------------------- #
+def test_same_pad_for_even_kernels_crops_the_last_time_slot():
+    """fairseq SamePad *crops*: ``x[:, :, :-remove]`` -- it never pads."""
+    pad = SamePad(6)
+    assert pad.remove == 1
+    out = pad(mx.arange(16, dtype=mx.float32).reshape(1, 4, 8))
+    mx.eval(out)
+    assert out.shape == (1, 4, 7)  # the final time slot is dropped
+    # the values that survive are the FIRST seven, not a shifted or padded copy
+    assert_allclose(np.asarray(out)[0, 0], np.arange(7, dtype=np.float64))
+
+
 def test_same_pad_for_the_large_kernel_is_the_identity():
-    # k = 19 is odd -> remove = 0 and fairseq SamePad has no length-parity pad,
-    # so it is the identity for every length (odd *and* even).
+    # k = 19 is odd -> remove = 0, so SamePad is the identity for every length.
     pad = SamePad(19)
     assert pad.remove == 0
     for length in (4, 7, 8, 9):
@@ -172,24 +183,14 @@ def test_same_pad_for_the_large_kernel_is_the_identity():
         assert out.shape[-1] == length
 
 
-def test_same_pad_for_even_kernels_left_pads_by_one():
-    pad = SamePad(4)
-    assert pad.remove == 1
-    out = pad(mx.arange(16, dtype=mx.float32).reshape(1, 4, 8))
-    mx.eval(out)
-    assert out.shape[-1] == 9
-    # the pad is on the LEFT: a zero, then the input
-    assert_allclose(np.asarray(out)[0, 0, 1:], np.arange(8, dtype=np.float64))
-    assert float(out[0, 0, 0]) == 0.0
-
-
 def test_positional_encoder_preserves_the_time_axis():
-    """conv padding=9 with k=19 plus an identity SamePad must return ``L``."""
-    module = PositionalEncoder(8, depth=2, kernel_size=5, groups=4, eps=1e-5)
-    for length in (5, 6, 7, 9):
-        out = module(mx.zeros((1, length, 8)))
-        mx.eval(out)
-        assert out.shape == (1, length, 8), length
+    """conv padding=k//2 plus SamePad's crop/identity must return ``L`` exactly."""
+    for kernel_size in (4, 5, 6, 19):
+        module = PositionalEncoder(8, depth=2, kernel_size=kernel_size, groups=4, eps=1e-5)
+        for length in (5, 7, 8):
+            out = module(mx.zeros((1, length, 8)))
+            mx.eval(out)
+            assert out.shape == (1, length, 8), (kernel_size, length)
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +354,81 @@ def test_no_head_means_no_projection():
         model.classify(mx.zeros((1, 400)))
 
 
+def test_audio_encoder_enforces_the_input_bounds_directly():
+    encoder = AudioEncoder(tiny_config(max_samples=600, max_frames=64))
+    with pytest.raises(ValueError, match=r"\(B, samples\)"):
+        encoder.contextualized_features(mx.zeros((2, 2, 600)))
+    with pytest.raises(ValueError, match="max_samples"):
+        encoder.contextualized_features(mx.zeros((1, 601)))
+
+
+def test_learned_alibi_scale_per_layer_is_applied_per_block():
+    """H1: the prenet must honour one scale row per layer, not ignore the flag."""
+    config = tiny_config(learned_alibi_scale_per_layer=True)
+    encoder = AudioEncoder(config)
+    assert encoder.alibi_scale.shape[0] == config.prenet_depth + config.depth
+    x, alibi_bias, remaining = encoder.contextualized_features(mx.zeros((1, 400)))
+    mx.eval(x, alibi_bias, remaining)
+    # the tail handed to the shared blocks has exactly `depth` rows left
+    assert remaining.shape[0] == config.depth
+    assert remaining.shape == (config.depth, 1, config.num_alibi_heads, 1, 1)
+
+
+def test_single_row_alibi_scale_is_folded_and_returns_none():
+    config = tiny_config(learned_alibi_scale_per_layer=False)
+    encoder = AudioEncoder(config)
+    assert encoder.alibi_scale.shape[0] == 1
+    _x, _bias, remaining = encoder.contextualized_features(mx.zeros((1, 400)))
+    assert remaining is None
+
+
+def test_emotion_scores_runs_the_encoder_exactly_once(monkeypatch):
+    """H2: the previous implementation re-encoded to build ``feats``."""
+    model = Emotion2VecModel(tiny_config(vocab_size=3, labels=("a", "b", "c")))
+    calls = {"n": 0}
+    original = model.extract_features
+
+    def counted(samples, *, remove_extra_tokens=True):
+        calls["n"] += 1
+        return original(samples, remove_extra_tokens=remove_extra_tokens)
+
+    monkeypatch.setattr(model, "extract_features", counted)
+    result = model.emotion_scores(mx.zeros((1, 400)))
+    mx.eval(result.feats)
+    assert calls["n"] == 1
+    assert result.labels == ("a", "b", "c")
+    assert result.feats.shape == (1, 16)
+
+
+def test_emotion_scores_requires_batch_one_and_a_head():
+    headless = Emotion2VecModel(tiny_config(vocab_size=-1))
+    with pytest.raises(RuntimeError, match="vocab_size"):
+        headless.emotion_scores(mx.zeros((1, 400)))
+    model = Emotion2VecModel(tiny_config(vocab_size=3, labels=("a", "b", "c")))
+    with pytest.raises(ValueError, match="single EmotionResult"):
+        model.emotion_scores(mx.zeros((2, 400)))
+
+
+def test_unuse_labels_are_suppressed():
+    model = Emotion2VecModel(
+        tiny_config(vocab_size=4, labels=("a", "unuse_1", "b", "unuse_2"))
+    )
+    result = model.emotion_scores(mx.zeros((1, 400)))
+    assert result.labels == ("a", "b")
+    assert len(result.scores) == 2
+    assert abs(sum(result.scores) - 1.0) < 1e-4
+
+
+def test_classify_returns_frames_so_callers_do_not_re_encode():
+    model = Emotion2VecModel(tiny_config(vocab_size=3, labels=("a", "b", "c")))
+    pooled, logits, frames = model.classify(mx.zeros((1, 400)))
+    mx.eval(pooled, logits, frames)
+    expected = tiny_config().frames_for(400)
+    assert frames.shape == (1, expected, 16)
+    assert pooled.shape == (1, 16)
+    assert logits.shape == (1, 3)
+
+
 # --------------------------------------------------------------------------- #
 # ordered containers
 # --------------------------------------------------------------------------- #
@@ -404,18 +480,59 @@ def test_alt_block_rejects_a_mismatched_alibi_bias():
 # checkpoint conversion / strict loading
 # --------------------------------------------------------------------------- #
 def _fake_pytorch_state(model: Emotion2VecModel) -> dict[str, mx.array]:
-    """A PyTorch-shaped state dict for the same key set."""
+    """A PyTorch-shaped state dict for the same key set.
+
+    The predicate here is deliberately **independent** of the production
+    ``is_conv_weight``: it is a rank check (``(out, in//g, K)`` has a trailing
+    extent equal to an odd kernel and is not square in the naive sense) so the
+    round-trip test cannot confirm a wrong namespace by construction.
+    """
     state: dict[str, mx.array] = {}
     for name, value in flat_parameter_names(model).items():
-        parts = name.split(".")
-        if name.endswith(".weight") and parts[-2] == "0" and (
-            parts[-3] == "conv_layers" or "relative_positional_encoder" in parts
-        ):
-            # MLX (out, K, in//g) -> PyTorch (out, in//g, K)
-            state[name] = mx.transpose(value, (0, 2, 1))
+        if name.endswith(".0.weight") and value.ndim == 3 and "conv" in name:
+            state[name] = mx.transpose(value, (0, 2, 1))  # MLX -> PyTorch
         else:
             state[name] = value
     return state
+
+
+def test_no_extra_block_namespace_in_the_checkpoint_keys():
+    """C3: children must be registered directly, not under an alias attribute."""
+    config = tiny_config(vocab_size=5, labels=("a", "b", "c", "d", "e"))
+    names = flat_parameter_names(Emotion2VecModel(config))
+    assert not any(".block." in name for name in names)
+    assert not any(".layers." in name for name in names)
+    assert any(name.startswith("modality_encoders.AUDIO.local_encoder.conv_layers.0.0.")
+               for name in names)
+    assert any(name.startswith("modality_encoders.AUDIO.relative_positional_encoder.1.0.")
+               for name in names)
+
+
+def test_conv_weight_predicate_matches_the_exact_source_keys():
+    """C2: exact documented keys, not a positional ``parts[-3]`` guess."""
+    assert is_conv_weight("modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight")
+    assert is_conv_weight("modality_encoders.AUDIO.local_encoder.conv_layers.6.0.weight")
+    assert is_conv_weight("modality_encoders.AUDIO.relative_positional_encoder.4.0.weight")
+    # negatives: Linear weights, LayerNorms and the indexing that fooled the old check
+    for name in (
+        "modality_encoders.AUDIO.project_features.2.weight",
+        "modality_encoders.AUDIO.local_encoder.conv_layers.0.2.1.weight",
+        "modality_encoders.AUDIO.local_encoder.conv_layers.0.2.1.bias",
+        "modality_encoders.AUDIO.relative_positional_encoder.1.3.weight",
+        "blocks.0.norm1.weight",
+        "proj.weight",
+    ):
+        assert not is_conv_weight(name), name
+
+
+def test_tree_flatten_returns_a_dict_only_with_an_explicit_destination():
+    """C1: the default return is a list of tuples, so ``.items()`` would raise."""
+    from mlx.utils import tree_flatten
+
+    assert isinstance(tree_flatten({"a": {"b": mx.zeros((1,))}}), list)
+    assert isinstance(tree_flatten({"a": {"b": mx.zeros((1,))}}, destination={}), dict)
+    names = flat_parameter_names(Emotion2VecModel(tiny_config()))
+    assert names  # would raise AttributeError if the dict form were not requested
 
 
 def test_conv_weights_are_transposed_back_from_the_pytorch_layout():
@@ -426,6 +543,17 @@ def test_conv_weights_are_transposed_back_from_the_pytorch_layout():
     key = "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight"
     assert converted[key].shape == (8, 1, 5)  # (out, in//g, K)
     assert flat_parameter_names(model)[key].shape == (8, 5, 1)  # (out, K, in//g)
+    pos = "modality_encoders.AUDIO.relative_positional_encoder.1.0.weight"
+    assert converted[pos].shape == (16, 4, 5)
+    assert flat_parameter_names(model)[pos].shape == (16, 5, 4)
+
+
+def test_conv_weight_conversion_rejects_a_wrong_rank():
+    model = Emotion2VecModel(tiny_config(vocab_size=5, labels=("a", "b", "c", "d", "e")))
+    state = _fake_pytorch_state(model)
+    state["modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight"] = mx.zeros((2, 2))
+    with pytest.raises(ValueError, match="3-D Conv1d weight"):
+        convert_checkpoint_tensors(state)
 
 
 def test_decoder_keys_are_discarded_and_reported_not_dropped_silently():
