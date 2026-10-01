@@ -33,12 +33,14 @@ from funasr_mlx.models.paraformer import (  # noqa: E402
 from funasr_mlx.models.sanm import (  # noqa: E402
     CONV1D_LAYOUT,
     CONV2D_LAYOUT,
+    IDENTITY_LAYOUT,
     CheckpointKeyError,
     ModuleStack,
     check_short_utt,
     constant_pad_1d,
     convert_checkpoint_tensor,
     flatten_state_dict,
+    flatten_state_dict_with_rules,
     load_strict,
     make_pad_mask,
     sequence_mask,
@@ -161,7 +163,8 @@ def test_sequence_mask_and_make_pad_mask_are_inverses():
     keep = sequence_mask(lengths, maxlen=6)
     pad = make_pad_mask(lengths, maxlen=6)
     assert keep.shape == (3, 6)
-    assert [row.tolist() for row in keep.tolist()] == [
+    # mx arrays already flatten to nested Python lists, so no per-row .tolist().
+    assert keep.tolist() == [
         [1, 1, 1, 1, 1, 0],
         [1, 1, 1, 0, 0, 0],
         [1, 0, 0, 0, 0, 0],
@@ -194,6 +197,65 @@ def test_module_stack_has_no_layers_level_in_state_dict():
     assert not any(k.startswith("layers") for k in keys)
     assert len(stack) == 12
     assert stack[0] is stack[0]
+
+
+def test_flatten_state_dict_reads_the_mapping_storage_not_dunder_dict():
+    """Regression: ``mlx.nn.Module`` subclasses ``dict``.
+
+    Arrays and sub-modules are stored via ``module[key] = value`` (the mapping),
+    never in ``__dict__``, so a ``vars()``-based traversal silently returns an
+    empty dict.  This pins the traversal for a bare leaf module, a nested module
+    and a container.
+    """
+    leaf = mxnn.Linear(3, 2)
+    assert set(flatten_state_dict(leaf)) == {"weight", "bias"}
+    # __dict__ really is empty of tensors -- this is the trap being guarded.
+    assert not any(isinstance(v, mx.array) for v in vars(leaf).values())
+    # Both storage paths must agree.
+    assert set(dict.keys(leaf)) == {"weight", "bias"}
+
+    nested = ModuleStack([mxnn.Linear(3, 2), mxnn.Linear(3, 2)])
+    assert set(flatten_state_dict(nested)) == {
+        "0.weight",
+        "0.bias",
+        "1.weight",
+        "1.bias",
+    }
+
+
+def test_flatten_state_dict_skips_private_and_non_array_config_attributes():
+    """``_``-prefixed config and plain scalars must never become weights."""
+    encoder = SANMEncoder(input_size=8, config=_sanm_encoder_config())
+    keys = flatten_state_dict(encoder)
+    assert keys, "encoder must expose parameters"
+    assert not any(k.startswith("_") for k in keys)
+    assert not any(part.startswith("_") for k in keys for part in k.split("."))
+    # out_channels / output_level / config are configuration, not tensors.
+    assert not {"out_channels", "output_level", "config"} & set(keys)
+
+
+def test_layout_rules_are_derived_from_module_type_not_name():
+    """A renamed conv parameter must still get the conv1d transpose."""
+    tensors, rules = flatten_state_dict_with_rules(_paraformer())
+    conv_key = "encoder.encoders.0.self_attn.fsmn_block.weight"
+    assert rules[conv_key] == CONV1D_LAYOUT
+    assert rules["encoder.after_norm.bias"] == IDENTITY_LAYOUT
+    torch_shape = (8, 1, 3)
+    converted = convert_checkpoint_tensor(
+        "some.renamed.weight", mx.zeros(torch_shape), CONV1D_LAYOUT
+    )
+    assert converted.shape == (8, 3, 1)
+    assert set(tensors) == set(flatten_state_dict(_paraformer()))
+
+
+def test_module_stack_preserves_dict_semantics():
+    """MLX calls ``dst[key]`` / ``key in dst`` internally; those must still work."""
+    stack = ModuleStack([mxnn.Linear(3, 2), mxnn.Linear(3, 2)])
+    assert "0" in dict.keys(stack)
+    assert isinstance(dict.__getitem__(stack, "0"), mxnn.Linear)
+    assert stack["0"] is dict.__getitem__(stack, "0")
+    assert stack[-1] is dict.__getitem__(stack, "1")
+    assert len(dict.items(stack)) == 2
 
 
 def test_conv1d_weight_layout_is_mlx_native():
@@ -306,6 +368,23 @@ def test_cif_predictor_state_dict_keys_and_shapes():
     assert state["cif_output.weight"].shape == (1, 8)
 
 
+def test_cif_reorder_gather_preserves_the_feature_axis():
+    """Regression: ``mx.take`` flattens its input when ``axis`` is omitted.
+
+    ``cif_v1`` gathers whole time slices, so it must pass ``axis=0``; without it
+    the feature dimension is dropped and the following reshape blows up.
+    """
+    hidden = mx.arange(3 * 4, dtype=mx.float32).reshape(3, 4)
+    flat = mx.array([2, 0], dtype=mx.int32)
+    # Without axis the gather is over a flattened view -> 2 scalars, not 2 rows.
+    flattened = mx.take(hidden, flat)
+    assert flattened.shape == (2,)
+    with_axis = mx.take(hidden, flat, axis=0)
+    assert with_axis.shape == (2, 4)
+    assert with_axis[0].tolist() == hidden[2].tolist()
+    assert with_axis[1].tolist() == hidden[0].tolist()
+
+
 def test_cif_v1_matches_reference_prefix_sum_formula():
     """Hand-computed parity case for ``cif_v1`` (float32-exact values).
 
@@ -342,18 +421,39 @@ def test_cif_predictor_forward_shapes():
     assert peak.shape == (2, 10)
 
 
-def test_cif_tail_is_zero_for_unpadded_utterance():
-    """Parity quirk: the reference's shift trick yields a zero tail here."""
+def test_cif_tail_lands_on_the_first_padded_frame_or_the_appended_slot():
+    """Regression pin for the exact reference shift trick in ``tail_process_fn``.
+
+    ``mask_2 - mask_1`` is 1.0 at index ``i`` when ``mask[i-1] != mask[i]`` and at
+    the appended slot when ``mask[T-1] == 1``; the tail threshold is placed
+    there.  So a *full* mask puts it on the appended column, and a *padded* mask
+    puts it on the first padded frame (never on the appended column).
+    """
     predictor = CifPredictorV2(idim=4, tail_threshold=0.45)
     hidden = mx.zeros((1, 6, 4))
-    full_mask = mx.ones((1, 1, 6))
-    alphas, mask_2d = predictor._alphas(hidden, full_mask)
-    _, alphas_tailed, token_num = predictor.tail_process_fn(hidden, alphas, mask_2d)
-    assert alphas_tailed.shape == (1, 7)
-    # alphas were exactly zero (sigmoid(0)=0.5 -> relu(0.5) is not zero, so only
-    # the *added* tail column is compared here).
-    assert alphas_tailed[0, 6].item() == 0.0
-    assert token_num.shape == (1,)
+    alphas = mx.zeros((1, 6))
+
+    _, tailed_full, num_full = predictor.tail_process_fn(hidden, alphas, mx.ones((1, 6)))
+    assert tailed_full.shape == (1, 7)
+    assert [round(v, 6) for v in tailed_full[0].tolist()] == [0, 0, 0, 0, 0, 0, 0.45]
+    assert num_full.tolist() == [0.0]
+
+    padded = mx.array([[1.0, 1.0, 1.0, 0.0, 0.0, 0.0]])  # ilen == 3
+    _, tailed_pad, num_pad = predictor.tail_process_fn(hidden, alphas, padded)
+    assert tailed_pad.shape == (1, 7)
+    assert [round(v, 6) for v in tailed_pad[0].tolist()] == [0, 0, 0, 0.45, 0, 0, 0]
+    assert num_pad.tolist() == [0.0]
+
+
+def test_cif_tail_without_mask_appends_the_threshold():
+    predictor = CifPredictorV2(idim=4, tail_threshold=0.45)
+    hidden = mx.zeros((2, 5, 4))
+    alphas = mx.zeros((2, 5))
+    _, tailed, token_num = predictor.tail_process_fn(hidden, alphas, None)
+    assert tailed.shape == (2, 6)
+    assert [round(v, 6) for v in tailed[0].tolist()] == [0, 0, 0, 0, 0, 0.45]
+    assert [round(v, 6) for v in tailed[1].tolist()] == [0, 0, 0, 0, 0, 0.45]
+    assert token_num.tolist() == [0.0, 0.0]
 
 
 def test_cif_predictor_config_defaults_follow_paraformer():

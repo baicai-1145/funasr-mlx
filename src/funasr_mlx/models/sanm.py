@@ -80,6 +80,7 @@ __all__ = [
     "convert_checkpoint_tensor",
     "decimate_mask",
     "flatten_state_dict",
+    "flatten_state_dict_with_rules",
     "load_strict",
     "make_pad_mask",
     "repeat",
@@ -180,51 +181,106 @@ class CheckpointKeyError(KeyError):
     """
 
 
-def convert_checkpoint_tensor(name: str, array: mx.array) -> mx.array:
+def _module_layout_rule(module: mxnn.Module) -> str:
+    """Layout rule derived from the *owning module type*, not from its name."""
+    if isinstance(module, mxnn.Conv1d):
+        return CONV1D_LAYOUT
+    if isinstance(module, mxnn.Conv2d):
+        return CONV2D_LAYOUT
+    return IDENTITY_LAYOUT
+
+
+def convert_checkpoint_tensor(name: str, array: mx.array, rule: str | None = None) -> mx.array:
     """Convert one PyTorch checkpoint tensor into the MLX layout.
 
     ``Linear``/``LayerNorm``/``Embedding`` weights already match.  Only
-    ``Conv1d``/``Conv2d`` kernels need a transpose, and only the outermost
-    ``weight`` key of such a module.
+    ``Conv1d``/``Conv2d`` kernels need a transpose.
+
+    Parameters
+    ----------
+    name:
+        Parameter name, used only when ``rule`` is not supplied.
+    array:
+        The tensor to convert.
+    rule:
+        Explicit rule name (from :func:`flatten_state_dict_with_rules`).  Preferred
+        over name matching because it cannot mis-convert a renamed submodule.
     """
+    if rule is None:
+        rule = _rule_for_name(name)
+    if rule == CONV1D_LAYOUT:
+        # torch: (out, in/groups, k) -> mlx: (out, k, in/groups)
+        return mx.transpose(array, (0, 2, 1))
+    if rule == CONV2D_LAYOUT:
+        # torch: (out, in, kh, kw) -> mlx: (out, kh, kw, in)
+        return mx.transpose(array, (0, 2, 3, 1))
+    if rule not in (IDENTITY_LAYOUT, None):
+        raise ValueError(f"unknown layout rule {rule!r} for parameter {name!r}")
+    return array
+
+
+def _rule_for_name(name: str) -> str:
+    """Name-based fallback for :func:`convert_checkpoint_tensor`."""
     for pattern, rule in _LAYOUT_RULES:
         if pattern.search(name):
-            if rule == CONV1D_LAYOUT:
-                # torch: (out, in/groups, k) -> mlx: (out, k, in/groups)
-                return mx.transpose(array, (0, 2, 1))
-            if rule == CONV2D_LAYOUT:
-                # torch: (out, in, kh, kw) -> mlx: (out, kh, kw, in)
-                return mx.transpose(array, (0, 2, 3, 1))
-    return array
+            return rule
+    return IDENTITY_LAYOUT
 
 
 def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> dict[str, mx.array]:
     """Flatten a module tree into FunASR/PyTorch-compatible parameter names.
 
-    Attributes whose name starts with ``_`` are configuration, never weights,
-    and are skipped.  This mirrors what ``torch.nn.Module.state_dict()``
-    produces for the corresponding PyTorch modules.
+    Names are built from the Module's **mapping storage** (see
+    :func:`_flatten_into`), which is the only place MLX can hold a tensor.  The
+    result matches what ``torch.nn.Module.state_dict()`` produces for the
+    corresponding PyTorch modules.
     """
-    out: dict[str, mx.array] = {}
-    _flatten_into(module, prefix, out)
-    return out
+    return _flatten(module, prefix)[0]
 
 
-def _flatten_into(module: Any, prefix: str, out: dict[str, mx.array]) -> None:
-    for key, value in vars(module).items():
-        if key.startswith("_"):
-            continue
+def flatten_state_dict_with_rules(
+    module: mxnn.Module, prefix: str = ""
+) -> tuple[dict[str, mx.array], dict[str, str]]:
+    """Like :func:`flatten_state_dict`, but also returns the per-key layout rule."""
+    return _flatten(module, prefix)
+
+
+def _flatten(module: mxnn.Module, prefix: str = "") -> tuple[dict[str, mx.array], dict[str, str]]:
+    tensors: dict[str, mx.array] = {}
+    rules: dict[str, str] = {}
+    _flatten_into(module, prefix, tensors, rules)
+    return tensors, rules
+
+
+def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
+    """Collect tensors from a module tree.
+
+    ``mlx.nn.Module`` **subclasses ``dict``** (``class Module(dict)`` in
+    ``mlx/nn/layers/base.py``).  Its ``__setattr__`` routes arrays, dicts, lists,
+    tuples and *sub-modules* (a ``Module`` is itself a ``dict``, so
+    ``isinstance(v, dict)`` holds) into the **mapping** storage via
+    ``self[key] = val``; everything else -- ints, strings, dataclasses and the
+    ``_``-prefixed configuration attached here -- goes to ``__dict__``.
+
+    Consequently ``vars(module)`` contains **no tensors at all** (only
+    ``_no_grad``/``_training``), and flattening through it silently yields an
+    empty dict.  The mapping storage is walked instead.
+    """
+    for key, value in dict.items(module):
         name = f"{prefix}.{key}" if prefix else key
         if isinstance(value, mxnn.Module):
-            _flatten_into(value, name, out)
+            _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
-            out[name] = value
+            tensors[name] = value
+            rules[name] = _module_layout_rule(module)
         elif isinstance(value, Mapping):
+            # A plain dict of tensors stored directly on a Module.
             for sub_key, sub_value in value.items():
                 if isinstance(sub_value, mx.array):
-                    out[f"{name}.{sub_key}"] = sub_value
+                    tensors[f"{name}.{sub_key}"] = sub_value
+                    rules[f"{name}.{sub_key}"] = _module_layout_rule(module)
                 elif isinstance(sub_value, mxnn.Module):
-                    _flatten_into(sub_value, f"{name}.{sub_key}", out)
+                    _flatten_into(sub_value, f"{name}.{sub_key}", tensors, rules)
 
 
 def checkpoint_state_dict(module: mxnn.Module) -> dict[str, mx.array]:
@@ -236,10 +292,23 @@ def checkpoint_state_dict(module: mxnn.Module) -> dict[str, mx.array]:
     return flatten_state_dict(module)
 
 
+def _resolve_child(module: mxnn.Module, key: str) -> Any:
+    """Fetch a child by mapping key, falling back to a plain attribute.
+
+    Numeric keys (``"0"``, ``"1"``, ...) live in the mapping storage and are
+    reachable through ``Module.__getattr__``, but going through the mapping
+    explicitly keeps this independent of MLX's attribute fallbacks.
+    """
+    if key in dict.keys(module):
+        return dict.__getitem__(module, key)
+    return getattr(module, key)
+
+
 def _assign(module: mxnn.Module, key_parts: Sequence[str], array: mx.array) -> None:
     node: Any = module
     for part in key_parts[:-1]:
-        node = getattr(node, part)
+        node = _resolve_child(node, part)
+    # ``mx.array`` values go into the mapping storage via MLX's ``__setattr__``.
     setattr(node, key_parts[-1], array)
 
 
@@ -280,7 +349,7 @@ def load_strict(
         If any expected parameter is missing or any checkpoint tensor is
         unexpected.  Shape mismatches raise ``ValueError``.
     """
-    expected = flatten_state_dict(module)
+    expected, rules = flatten_state_dict_with_rules(module)
     expected_names = {f"{prefix}{k}" for k in expected}
     incoming = dict(tensors)
 
@@ -288,25 +357,28 @@ def load_strict(
     unexpected = sorted(set(incoming) - expected_names)
     if missing or unexpected:
         raise CheckpointKeyError(
-            "checkpoint/model key mismatch: "
+            "checkpoint/module key mismatch: "
             f"{len(missing)} missing, {len(unexpected)} unexpected. "
             f"missing={missing[:8]} unexpected={unexpected[:8]}"
         )
 
     loaded: list[str] = []
     for name in sorted(incoming):
+        short = name[len(prefix) :]
         array = mx.asarray(incoming[name])
         if convert:
-            array = convert_checkpoint_tensor(name[len(prefix) :], array)
+            # The rule comes from the owning module type, so a renamed
+            # parameter still gets the right layout conversion.
+            array = convert_checkpoint_tensor(short, array, rules.get(short))
         if dtype is not None:
             array = array.astype(dtype)
-        target = expected[name[len(prefix) :]]
+        target = expected[short]
         if tuple(array.shape) != tuple(target.shape):
             raise ValueError(
                 f"shape mismatch for {name!r}: checkpoint {tuple(array.shape)} "
                 f"vs model {tuple(target.shape)}"
             )
-        _assign(module, name[len(prefix) :].split("."), array)
+        _assign(module, short.split("."), array)
         loaded.append(name)
     return loaded
 
@@ -321,6 +393,12 @@ class ModuleStack(mxnn.Module):
     the SenseVoice encoder uses ``nn.ModuleList`` (``encoders.0.<leaf>``).
     MLX's own containers would nest everything under ``layers``, so children
     are registered directly under their numeric index.
+
+    ``mlx.nn.Module`` subclasses ``dict``, so those children live in the mapping
+    storage under the keys ``"0"``, ``"1"``, ... -- which is exactly the PyTorch
+    ``state_dict`` spelling.  The dunders below therefore forward to ``dict`` and
+    must not shadow it: MLX internally calls ``dst[key]``, ``key in dst`` and
+    ``dst.items()``, so ``__getitem__`` accepts string keys unchanged.
     """
 
     def __init__(self, blocks: Sequence[mxnn.Module]) -> None:
@@ -330,16 +408,19 @@ class ModuleStack(mxnn.Module):
         self._length = len(blocks)
 
     def __len__(self) -> int:
-        return self._length
+        # Keep dict semantics: MLX may call len() on this object.
+        return dict.__len__(self)
 
     def __iter__(self) -> Iterator[mxnn.Module]:
-        for index in range(self._length):
-            yield getattr(self, str(index))
+        for index in range(dict.__len__(self)):
+            yield dict.__getitem__(self, str(index))
 
-    def __getitem__(self, index: int) -> mxnn.Module:
-        if index < 0:
-            index += self._length
-        return getattr(self, str(index))
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, int):
+            if key < 0:
+                key += dict.__len__(self)
+            key = str(key)
+        return dict.__getitem__(self, key)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         result: Any = args

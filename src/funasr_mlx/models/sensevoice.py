@@ -411,7 +411,11 @@ class SenseVoiceSmall(mxnn.Module):
         tn = TEXTNORM_DICT.get(text_norm, TEXTNORM_DICT["woitn"])
 
         ids = mx.array([[lid, EVENT_ID, EMO_ID, tn]], dtype=mx.int32)
-        return self.embed(mx.broadcast_to(ids, (batch_size, 4, ids.shape[-1])))
+        # One row of ``NUM_PREFIX_FRAMES`` token ids, tiled across the batch.
+        # Note the broadcast target is ``(B, NUM_PREFIX_FRAMES)``: ``ids`` is
+        # token *indices*, so its width is the number of prefix frames and has
+        # nothing to do with ``input_size``.
+        return self.embed(mx.broadcast_to(ids, (batch_size, NUM_PREFIX_FRAMES)))
 
     def encode(
         self,

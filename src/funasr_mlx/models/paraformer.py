@@ -490,12 +490,18 @@ def cif_v1(hidden: mx.array, alphas: mx.array, threshold: float = 1.0):
     # the map, giving ``time_of_rank[b, j]`` = time of the j-th fire of batch b.
     big = mx.array(t, mx.int32)
     time_of_rank = mx.argsort(mx.where(fire_idxs, rank, big), axis=1)  # (B, T)
-    flat_time = mx.reshape(time_of_rank, (b * t,))
+    flat_time = mx.reshape(time_of_rank, (b * t,)).astype(mx.int32)
 
     def _reorder(array: mx.array) -> mx.array:
-        """Gather rows of ``array`` along the time axis in fire order."""
+        """Gather rows of ``array`` along the time axis in fire order.
+
+        ``mx.take`` **flattens its input when ``axis`` is omitted** ("If the axis
+        is not specified the array is treated as a flattened 1-D array prior to
+        performing the take"), which would drop the feature dimension entirely.
+        ``axis=0`` is therefore mandatory here.
+        """
         return mx.reshape(
-            mx.take(mx.reshape(array, (-1,) + array.shape[2:]), flat_time),
+            mx.take(mx.reshape(array, (-1,) + array.shape[2:]), flat_time, axis=0),
             (b, t) + array.shape[2:],
         )
 
