@@ -240,46 +240,63 @@ def test_layer_norm_eps_is_funasr_value():
     assert model.encoder.encoders0[0].norm1.eps == pytest.approx(1e-12)
 
 
-def test_sanm_fsmn_padding_split_is_one_frame_each_side():
-    """kernel=3, sanm_shfit=0 -> ConstantPad1d((1, 1)), i.e. ``y_left = [0, x, 0]``.
+def _tap_weight(channels: int, kernel_size: int, tap: int) -> mx.array:
+    """Depthwise kernel whose only non-zero entry is at kernel index ``tap``."""
+    weight = mx.zeros((channels, kernel_size, 1))
+    return weight + mx.array(
+        [[[1.0 if k == tap else 0.0] for k in range(kernel_size)] for _ in range(channels)]
+    )
 
-    With a depthwise kernel whose tap 2 is the only non-zero entry,
-    ``out[t] = y_left[t - 2]``:
 
-    * ``left=1, right=1`` -> ``y_left = [0, x0, x1, ...]`` -> ``out = [0, 0, 0, x0, x1]``
-    * ``left=2, right=0`` -> ``y_left = [0, 0, x0, ...]`` -> ``out = [0, 0, 0, 0, x0]``
+def test_sanm_fsmn_padding_total_is_kernel_minus_one():
+    """``sanm_shfit=0`` -> ``ConstantPad1d((1, 1))``; the total must be ``K - 1``.
 
-    so the assertion below pins the split, not just the total padding.
+    The manual padding has to make up for the receptive field, otherwise the
+    convolution shortens the sequence and the residual add would fail.
     """
-    channels, length = 2, 5
+    channels, length = 2, 6
     attn = SanmAttention(n_head=1, in_feat=channels, n_feat=channels, kernel_size=3)
     assert (attn.left_pad, attn.right_pad) == (1, 1)
+    assert attn.left_pad + attn.right_pad == 3 - 1
+    out = attn.forward_fsmn(mx.zeros((1, length, channels)), None)
+    mx.eval(out)
+    assert out.shape == (1, length, channels)
 
-    tap = mx.zeros((channels, 3, 1))
-    tap = tap + mx.array([[[0.0], [0.0], [1.0]]])  # only kernel index 2
-    attn.fsmn_block.weight = tap
+
+def test_sanm_fsmn_tap_zero_reads_exactly_one_left_pad_frame():
+    """``mx.nn.Conv1d`` is a convolution, so tap ``k`` reads ``x[t - left_pad + k]``.
+
+    MLX: ``out[t] = sum_k w[k] * in[t * stride + k * dilation]`` on ``(N, L, C)``.
+    ``forward_fsmn`` feeds ``y = [0] * left_pad + x + [0] * right_pad``, i.e.
+    ``y[i] = x[i - left_pad]``, so tap 0 reads ``x[t - left_pad]``.
+
+    That pins the *left* split on its own: with ``left_pad == 1`` tap 0 sees one
+    frame of history, and ``left_pad == 2`` would give ``x[t - 2]`` instead.
+    """
+    channels, length = 2, 4
+    attn = SanmAttention(n_head=1, in_feat=channels, n_feat=channels, kernel_size=3)
+    attn.fsmn_block.weight = _tap_weight(channels, 3, 0)
 
     base = mx.arange(channels * length, dtype=mx.float32).reshape(1, length, channels)
     memory = attn.forward_fsmn(base, None)
-    expected = base + mx.concatenate(
-        [mx.zeros((1, 3, channels)), base[:, 0 : length - 3, :]], axis=1
-    )
+    expected = base + mx.pad(base[:, :-2, :], [(0, 0), (0, 2), (0, 0)])
     mx.eval(memory, expected)
-    assert memory.shape == (1, length, channels)
     assert_allclose(memory, expected)
 
 
-def test_sanm_fsmn_uses_one_frame_of_left_context():
-    """Tap 1 with ``left=1`` must read ``x[t - 1]`` and nothing older."""
-    channels, length = 2, 4
+def test_sanm_fsmn_tap_two_reads_exactly_one_right_pad_frame():
+    """tap 2 with ``left_pad == 1`` reads ``x[t + 1]``, zero past the last frame.
+
+    Same index formula as the tap-0 test (``x[t - left_pad + k]``), which pins the
+    forward side of the split: the frame past the end contributes 0 and not a wrap.
+    """
+    channels, length = 2, 5
     attn = SanmAttention(n_head=1, in_feat=channels, n_feat=channels, kernel_size=3)
-    tap = mx.zeros((channels, 3, 1))
-    tap = tap + mx.array([[[0.0], [1.0], [0.0]]])  # only kernel index 1
-    attn.fsmn_block.weight = tap
+    attn.fsmn_block.weight = _tap_weight(channels, 3, 2)
 
     base = mx.arange(channels * length, dtype=mx.float32).reshape(1, length, channels)
     memory = attn.forward_fsmn(base, None)
-    expected = base + mx.pad(base[:, :-1, :], [(0, 0), (0, 1), (0, 0)])
+    expected = base + mx.pad(base[:, 1:, :], [(0, 0), (0, 1), (0, 0)])
     mx.eval(memory, expected)
     assert_allclose(memory, expected)
 

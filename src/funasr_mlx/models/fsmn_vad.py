@@ -440,6 +440,11 @@ class FSMNBlock(nn.Module):
         The reference works in ``(B, D, T)``; the time axis is moved to the middle
         so the ``(lorder - 1) * lstride`` left padding (or cache concatenation) is
         expressed on the same axis FunASR pads, then moved back for the conv.
+
+        ``mx.core.conv1d`` is a convolution, ``out[t] = sum_k w[k] * y[t + k *
+        dilation]``, whereas ``torch`` cross-correlates, ``out[t] = sum_k w[k] *
+        y[t - k * dilation]``.  See :func:`convert_checkpoint_tensors` for the
+        open parity question this raises for checkpoint kernels.
         """
         if x.ndim != 3:
             raise ValueError(f"expected (B, T, D) input, got shape {x.shape}")
@@ -1363,6 +1368,24 @@ def convert_checkpoint_tensors(state: Mapping[str, mx.array | Any]) -> dict[str,
     Only the depthwise ``Conv2d`` memory kernels change:
     ``(D, 1, K, 1) -> (D, K, 1)``.  Every ``nn.Linear`` weight already uses
     MLX's ``(out, in)`` layout.
+
+    .. warning::
+       **Open parity question - kernel direction.**  ``torch.nn.Conv1d`` /
+       ``Conv2d`` is a *cross-correlation*::
+
+           torch:  out[t] = sum_k w[k] * in[t*stride - k*dilation]
+           mlx:    out[t] = sum_k w[k] * in[t*stride + k*dilation]
+
+       ``mx.core.conv1d`` is documented as a convolution and this MLX build
+       behaves that way.  After the manual left padding of ``keep =
+       (lorder - 1) * lstride`` frames the two read *mirror-image* windows
+       (MLX ``in[t - keep, t]``, torch ``in[t - keep - (K-1)*dilation, t - keep]``),
+       so feeding the checkpoint kernel through unchanged yields a time-reversed
+       memory branch - silent, and invisible to architecture tests.  Reproducing
+       torch exactly needs either another ``(K - 1) * lstride`` zeros on the left
+       plus a kernel reversed along ``K``, or evaluating the depthwise sum directly
+       as ``out[t] = sum_k w[k] * y[t - k * lstride]``.  Deliberately **not**
+       applied here pending an independent source-golden check.
     """
     converted: dict[str, mx.array] = {}
     for name, value in state.items():

@@ -280,7 +280,12 @@ def test_block_left_cache_matches_zero_padding():
     offline, cache = block(x, None)
     assert cache is None
 
-    stream_cache = None
+    # ``FSMNBlock`` returns ``cache=None`` for ``cache=None`` (the reference only
+    # assigns inside the ``cache is not None`` branch), so a streaming caller must
+    # seed the zero buffer itself -- exactly what ``BasicBlock.forward`` does when
+    # it creates ``cache_layer_<i>``.  With that seed the streaming buffer is
+    # bit-identical to the left zero-padding used by the offline call.
+    stream_cache = mx.zeros((1, block.dim, block.keep))
     streamed = None
     for step in range(3):
         frame = x[:, step : step + 1, :]
