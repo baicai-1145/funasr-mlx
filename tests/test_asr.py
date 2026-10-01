@@ -480,6 +480,92 @@ def test_cif_v1_boundary_form_matches_the_longhand_expression():
             assert got[row, j] == pytest.approx(float(expected), rel=1e-5, abs=1e-6)
 
 
+def _cold_probe_case(d: int = 3):
+    """hidden[t] = [(d*t + j) / 7 for j in range(d)]; the probe's alphas."""
+    hidden = mx.arange(6 * d, dtype=mx.float32).reshape(6, d) / 7.0
+    alphas = mx.broadcast_to(mx.array([[0.5, 0.25, 0.5, 0.25, 0.5, 0.125]], mx.float32), (2, 6))
+    return mx.broadcast_to(hidden[None], (2, 6, d)), alphas
+
+
+# Hand-derived from the source formula for d=3 (see the derivation below).
+# Fire times are t=2 and t=4 because the running sum is
+# [0.5, 0.75, 1.25, 1.5, 2.0, 2.125] and floor jumps at 2 and 4, with
+# rem[2] = 0.25 and rem[4] = 0.0.  Then boundary[j] = P[t_j] - rem[t_j]*h[t_j]:
+#   P[2] = [15/28, 5/7, 25/28], h[2] = [6/7, 1, 8/7]
+#     -> boundary[0] = [9/28, 13/28, 17/28]
+#   P[4] = [12/7, 2, 16/7], rem[4] = 0
+#     -> boundary[1] = [12/7, 2, 16/7]
+# and frames[j] = boundary[j] - boundary[j-1] with boundary[-1] = 0, so
+#   frames = [[9/28, 13/28, 17/28], [39/28, 43/28, 47/28]]
+_COLD_PROBE_EXPECTED_D3 = np.array([[9, 13, 17], [39, 43, 47]], np.float32) / 28.0
+
+
+def test_cif_v1_cold_probe_case_matches_hand_derived_values():
+    """Pin the probe's own input against literals derived from the source.
+
+    The previous repeat spec compared every call against the *first* call, which
+    cannot detect a cold output that is consistently wrong.  This one compares
+    against independently derived constants.
+    """
+    hidden, alphas = _cold_probe_case(3)
+    frames, fires = cif_v1(hidden, alphas, 1.0)
+    mx.eval(frames, fires)
+    np.testing.assert_allclose(np.asarray(frames), _COLD_PROBE_EXPECTED_D3, rtol=1e-6, atol=1e-6)
+    # fires is the cif_peak signal: marks the two boundaries.
+    np.testing.assert_allclose(
+        np.asarray(fires),
+        np.tile(np.array([0.5, 0.75, 1.25, 0.5, 1.0, 0.125], np.float32), (2, 1)),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("d", [3, 8])
+def test_cif_v1_cold_and_warm_calls_agree_with_the_reference_formula(d):
+    """Every call -- the cold first one included -- must match the formula.
+
+    Deliberately does NOT compare calls to each other: six identical wrong
+    answers would pass.  The expectation is recomputed in numpy from
+    ``cif_wo_hidden_v1``'s own formulas each time.
+    """
+    hidden, alphas = _cold_probe_case(d)
+    hidden_np = np.asarray(hidden, dtype=np.float64)
+    alphas_np = np.asarray(alphas, dtype=np.float64)
+
+    prefix = np.cumsum(alphas_np * hidden_np, axis=1)
+    alpha_prefix = np.cumsum(alphas_np, axis=1)
+    rolled = np.roll(alpha_prefix, 1, axis=1)
+    rolled[:, 0] = 0.0
+    fire_idxs = (np.floor(alpha_prefix) - np.floor(rolled)) > 0
+    fires = (np.where(fire_idxs, 1.0, 0.0) + alpha_prefix - np.floor(alpha_prefix)).astype(
+        np.float32
+    )
+    rem = fires - np.floor(fires)
+
+    for call in range(6):
+        frames, got_fires = cif_v1(hidden, alphas, 1.0)
+        mx.eval(frames, got_fires)
+        expected = np.zeros_like(np.asarray(frames, dtype=np.float64))
+        for row in range(2):
+            times = list(np.flatnonzero(fire_idxs[row]))
+            assert times, "fixture must fire"
+            previous = np.zeros(d, np.float64)  # boundary[-1] = 0
+            for j, t in enumerate(times):
+                boundary = prefix[row, t] - rem[row, t] * hidden_np[row, t]
+                expected[row, j] = boundary - previous
+                previous = boundary
+        np.testing.assert_allclose(
+            np.asarray(frames), expected, rtol=1e-5, atol=1e-6, err_msg=f"call {call}"
+        )
+        np.testing.assert_allclose(
+            np.asarray(got_fires),
+            fires,
+            rtol=1e-6,
+            atol=1e-6,
+            err_msg=f"call {call}",
+        )
+
+
 def test_cif_v1_is_bit_identical_across_repeated_calls():
     """A cold first call must not differ from later ones.
 

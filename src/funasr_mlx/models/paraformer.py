@@ -492,25 +492,28 @@ def cif_v1(hidden: mx.array, alphas: mx.array, threshold: float = 1.0):
     rank = mx.cumsum(fire_idxs.astype(mx.int32), axis=1) - 1
     filler = t + mx.arange(t, dtype=mx.int32)[None, :]
     time_of_rank = mx.argsort(mx.where(fire_idxs, rank, filler), axis=1)  # (B, T)
-    # The gather flattens the batch onto one axis, so each row needs its own
-    # ``b * T`` offset.  The reference does the same thing with
-    # ``batch_indexes = arange(B).unsqueeze(-1) * len_time`` added to
-    # ``frame_idxs`` before flattening; without it every row re-reads row 0.
-    offsets = (mx.arange(b, dtype=mx.int32) * t)[:, None]  # (B, 1)
-    flat_time = mx.reshape(time_of_rank.astype(mx.int32) + offsets, (b * t,))
 
+    # Gather along the **time** axis natively rather than flattening the batch.
+    # The reference's ``prefix_sum_hidden[fire_idxs]`` over a (B, T, D) tensor is a
+    # batched gather on axis 1; the flattened form instead reshapes (B, T, D) to
+    # (B*T, D), adds a per-row ``b * T`` offset and takes on axis 0, then reshapes
+    # back.  That round-trip through a flat view is the part worth falsifying on
+    # GPU, and it is also why a missing row offset was silent at B=1.
     def _gather(array: mx.array) -> mx.array:
-        """Gather rows of ``array`` along the time axis in fire order.
+        """Gather time steps of ``array`` in fire order, independently per row.
 
-        ``mx.take`` **flattens its input when ``axis`` is omitted** ("If the axis
-        is not specified the array is treated as a flattened 1-D array prior to
-        performing the take"), which would drop the feature dimension entirely.
-        ``axis=0`` is therefore mandatory here.
+        ``mx.take_along_axis`` indexes the time axis directly, so no flatten,
+        offset arithmetic or output reshape is involved.  Per the installed stub
+        (``mlx/core/__init__.pyi:1901-1909``) ``indices`` must be "broadcastable
+        with the input array excluding the ``axis`` dimension", so a trailing
+        singleton axis broadcasts one time index across every feature lane and
+        the result keeps ``(B, T, D)``.
         """
-        return mx.reshape(
-            mx.take(mx.reshape(array, (-1,) + array.shape[2:]), flat_time, axis=0),
-            (b, t) + array.shape[2:],
-        )
+        if array.ndim == 2:
+            # The fires signal carries no feature axis, so index it directly.
+            return mx.take_along_axis(array, time_of_rank, axis=1)
+        indices = mx.expand_dims(time_of_rank, -1)  # (B, T, 1) broadcasts over D
+        return mx.take_along_axis(array, indices, axis=1)
 
     prefix_sum_hidden = mx.cumsum(mx.expand_dims(alphas, -1) * hidden, axis=1)
 
