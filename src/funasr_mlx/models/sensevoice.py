@@ -263,7 +263,10 @@ class CTC(mxnn.Module):
         return self.ctc_lo(hs_pad)
 
     def log_softmax(self, hs_pad: mx.array) -> mx.array:
-        return mx.logsoftmax(self(hs_pad), axis=-1)
+        # ``mx.logsoftmax`` does not exist in MLX; the max-shifted functional
+        # ``mlx.nn.log_softmax`` is the API.  Qualified as ``mxnn.`` because this
+        # class also defines a *method* named ``log_softmax``.
+        return mxnn.log_softmax(self(hs_pad), axis=-1)
 
     def argmax(self, hs_pad: mx.array) -> mx.array:
         return mx.argmax(self(hs_pad), axis=-1)

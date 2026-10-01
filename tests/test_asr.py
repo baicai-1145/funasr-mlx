@@ -392,20 +392,65 @@ def test_cif_reorder_gather_preserves_the_feature_axis():
 
 
 def test_cif_v1_matches_reference_prefix_sum_formula():
-    """Hand-computed parity case for ``cif_v1`` (float32-exact values).
+    """Source-derived parity case (adjudicated against cif_predictor.py:818-905).
 
-    alphas   = [0.5, 0.25, 0.5, 0.25, 0.5, 0.125]
-    hidden[t] = [t + 1, t + 1]
-    fires at t = 2 and t = 4, emitted frames follow
-    ``P[t] - P[t-1] + rem[t-1] * h[t-1] - rem[t] * h[t]``.
+    alphas   = [0.5, 0.25, 0.5, 0.25, 0.5, 0.125]  (sum 2.125 -> max_label_len 2)
+    prefix_sum        = [0.5, 0.75, 1.25, 1.5, 2.0, 2.125]
+    prefix_sum_floor  = [0,   0,    1,    1,   2,   2   ]
+    rolled_floor      = [0,   0,    0,    1,   1,   2   ]  (roll, then [:,0]=0)
+    dislocation_diff  = [0,   0,    1,    0,   1,   0   ]  -> fires at t=2 and t=4
+    hidden[t]         = [t + 1, t + 1]
+    prefix_sum_hidden = [0.5, 1.0, 2.5, 3.5, 6.0, 6.75]
+
+    frames[j] = P[t_j] - P[t_{j-1}] + rem[t_{j-1}] * h[t_{j-1}] - rem[t_j] * h[t_j]
+    frame 0   = [2.5, 2.5] - 0           + 0            - 0.25*[3,3] = [1.75, 1.75]
+    frame 1   = [6.0, 6.0] - [2.5, 2.5]  + 0.25*[3,3] - 0.0*[5,5] = [4.25, 4.25]
     """
     alphas = mx.array([[0.5, 0.25, 0.5, 0.25, 0.5, 0.125]])
     hidden = mx.array([[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0], [5.0, 5.0], [6.0, 6.0]]])
     frames, fires = cif_v1(hidden, alphas, 1.0)
     assert frames.shape == (1, 2, 2)
-    assert [round(v, 6) for v in frames[0, 0].tolist()] == [2.25, 2.25]
-    assert [round(v, 6) for v in frames[0, 1].tolist()] == [4.5, 4.5]
+    assert [round(v, 6) for v in frames[0, 0].tolist()] == [1.75, 1.75]
+    assert [round(v, 6) for v in frames[0, 1].tolist()] == [4.25, 4.25]
     assert [round(v, 6) for v in fires[0].tolist()] == [0.5, 0.75, 1.25, 0.5, 1.0, 0.125]
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3])
+def test_cif_v1_is_row_independent_for_any_batch(batch):
+    """Regression: the flatten-and-gather needs a per-batch row offset.
+
+    The reference adds ``batch_indexes = arange(B).unsqueeze(-1) * len_time`` to
+    ``frame_idxs`` before flattening, because ``prefix_sum_hidden[fire_idxs]``
+    over a ``(B, T, D)`` tensor indexes row-major.  Without that offset every row
+    re-reads slice 0, which is invisible at B=1 and wrong for B>=2.
+    """
+    hidden = mx.arange(batch * 6 * 3, dtype=mx.float32).reshape(batch, 6, 3) / 7.0
+    alphas = mx.broadcast_to(mx.array([[0.5, 0.25, 0.5, 0.25, 0.5, 0.125]], mx.float32), (batch, 6))
+    frames, fires = cif_v1(hidden, alphas, 1.0)
+    assert frames.shape == (batch, 2, 3)
+
+    for b in range(batch):
+        one_frames, one_fires = cif_v1(
+            mx.expand_dims(hidden[b], 0), mx.expand_dims(alphas[b], 0), 1.0
+        )
+        assert mx.allclose(frames[b : b + 1], one_frames, atol=1e-6).item()
+        assert mx.allclose(fires[b : b + 1], one_fires, atol=1e-6).item()
+
+    if batch > 1:
+        assert not mx.allclose(frames[0], frames[1], atol=1e-6).item()
+
+
+def test_cif_v1_preserves_source_fire_ordering_in_a_batch():
+    """Fires must be emitted per row in increasing time order, not interleaved."""
+    alphas = mx.array([[0.5, 0.25, 0.5, 0.25, 0.5, 0.125], [0.25, 0.25, 0.5, 0.5, 0.25, 0.25]])
+    hidden = mx.arange(2 * 6 * 2, dtype=mx.float32).reshape(2, 6, 2) / 11.0
+    frames, fires = cif_v1(hidden, alphas, 1.0)
+
+    assert mx.allclose(fires[0], mx.array([0.5, 0.75, 1.25, 0.5, 1.0, 0.125]), atol=1e-6).item()
+    for b in range(2):
+        one, _ = cif_v1(mx.expand_dims(hidden[b], 0), mx.expand_dims(alphas[b], 0), 1.0)
+        kept = min(one.shape[1], frames.shape[1])
+        assert mx.allclose(frames[b, :kept], one[0, :kept], atol=1e-6).item()
 
 
 def test_cif_v1_handles_the_empty_fire_case():
@@ -612,29 +657,50 @@ def test_module_stack_threads_the_leading_argument_only():
 def test_decoder_output_is_invariant_to_the_padded_memory_tail():
     """Regression: a padded memory frame must not influence the logits.
 
-    Garbage is written into the padded region of the cross-attention memory; the
-    masked decoder output for the valid frames must be unchanged.
+    The offline Paraformer decoder consumes the **CIF acoustic embedding**, not
+    token ids: the reference ``ParaformerSANMDecoder.forward`` does ``x = tgt``
+    with ``tgt = ys_in_pad`` and never calls ``self.embed`` (only
+    ``forward_one_step`` does, at decoder.py:604).  So both ``hs_pad`` and
+    ``ys_in_pad`` must be ``(B, T, attention_dim)`` here.
     """
     decoder = ParaformerSANMDecoder(
         vocab_size=13, encoder_output_size=8, config=_paraformer_config().decoder_conf
     )
     decoder.eval()
-    tokens = mx.array([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=mx.int32)
-    lens = mx.array([3, 2])
+    tgt = mx.arange(2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 41.0
+    tgt_lens = mx.array([4, 2])
     memory = mx.arange(2 * 8 * 8, dtype=mx.float32).reshape(2, 8, 8) / 53.0
     hlens = mx.array([5, 3])
 
-    clean, _ = decoder(memory, hlens, tokens, lens)
+    clean, _ = decoder(memory, hlens, tgt, tgt_lens)
 
     # Ragged batch: hlens = [5, 3].  Corrupt *each row's own* padded frames only
     # (frames >= hlens[b]) and leave every valid frame untouched.  A correctly
-    # masked decoder must return bit-identical logits.
+    # masked decoder must return identical logits.
     padded = mx.logical_not(mx.arange(8)[None, :] < hlens[:, None])  # (2, 8)
     corrupted = mx.where(mx.expand_dims(padded, -1), memory + 1000.0, memory)
-    dirty, _ = decoder(corrupted, hlens, tokens, lens)
+    dirty, _ = decoder(corrupted, hlens, tgt, tgt_lens)
     assert mx.allclose(clean, dirty, atol=1e-4).item()
     # Sanity: the corruption really did reach the padded region.
     assert not mx.allclose(mx.sum(corrupted, axis=-1), mx.sum(memory, axis=-1)).item()
+
+
+def test_decoder_output_is_invariant_to_the_padded_target_tail():
+    """The same property for the self-attention (``tgt_mask``) side of the decoder."""
+    decoder = ParaformerSANMDecoder(
+        vocab_size=13, encoder_output_size=8, config=_paraformer_config().decoder_conf
+    )
+    decoder.eval()
+    tgt = mx.arange(2 * 4 * 8, dtype=mx.float32).reshape(2, 4, 8) / 41.0
+    tgt_lens = mx.array([4, 2])
+    memory = mx.arange(2 * 8 * 8, dtype=mx.float32).reshape(2, 8, 8) / 53.0
+    hlens = mx.array([5, 3])
+
+    clean, _ = decoder(memory, hlens, tgt, tgt_lens)
+    padded = mx.logical_not(mx.arange(4)[None, :] < tgt_lens[:, None])  # (2, 4)
+    corrupted = mx.where(mx.expand_dims(padded, -1), tgt + 1000.0, tgt)
+    dirty, _ = decoder(memory, hlens, corrupted, tgt_lens)
+    assert mx.allclose(clean, dirty, atol=1e-4).item()
 
 
 def test_cif_predictor_config_defaults_follow_paraformer():
@@ -861,20 +927,34 @@ def test_ctc_greedy_decode_respects_lengths():
     # Deterministic known logits, so the assertion has teeth: both rows have
     # *non-blank* argmax tokens inside their valid frames and deliberately
     # different spurious tokens in the padded tail.  Lengths must truncate them.
-    #   row 0 (ilen=3): argmax [1, 1, 1, 2]  -> tail's 2 must be dropped
-    #   row 1 (ilen=1): argmax [1, 2, 2, 1]  -> tail's 2, 2, 1 must be dropped
+    #   row 0 (ilen=3): argmax [1, 2, 1, 3]  -> tail's 3 dropped -> [1, 2, 1]
+    #   row 1 (ilen=1): argmax [2, 3, 3, 1]  -> tail dropped, and the repeated
+    #                                 3,3 collapses to one via unique_consecutive
     log_probs = mx.log(
         mx.array(
             [
-                [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+                [
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                [
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                ],
             ]
         )
     )
-    assert mx.argmax(log_probs, axis=-1).tolist() == [[1, 1, 1, 2], [1, 2, 2, 1]]
-    assert ctc_greedy_decode(log_probs, mx.array([3, 1]), blank_id=0) == [[1, 1, 1], [1]]
-    # Decoding the full padded batch instead would leak the tail tokens.
-    assert ctc_greedy_decode(log_probs, mx.array([4, 4]), blank_id=0) == [[1, 1, 1, 2], [1, 2, 1]]
+    assert mx.argmax(log_probs, axis=-1).tolist() == [[1, 2, 1, 3], [2, 3, 3, 1]]
+    assert ctc_greedy_decode(log_probs, mx.array([3, 1]), blank_id=0) == [[1, 2, 1], [2]]
+    # Decoding the full padded batch instead leaks the tails (and collapses 3,3).
+    assert ctc_greedy_decode(log_probs, mx.array([4, 4]), blank_id=0) == [
+        [1, 2, 1, 3],
+        [2, 3, 1],
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -919,6 +999,34 @@ def test_load_strict_converts_torch_conv_layout_on_load():
     clone = _paraformer()
     load_strict(clone, state, convert=True)
     assert clone.encoder.encoders[0].self_attn.fsmn_block.weight.shape == (8, 3, 1)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "encoder.encoders.0.self_attn.fsmn_block.weight",
+        "decoder.decoders.0.self_attn.fsmn_block.weight",
+        "encoder.embed.conv.0.weight",
+    ],
+)
+def test_load_strict_converts_every_conv_owner(key):
+    """Every conv owner must be converted by *module type*, not by name luck.
+
+    The encoder's and the decoder's depthwise FSMN convs are both plain
+    ``mxnn.Conv1d``, so the module-derived rule has to reach both.  This pins the
+    decoder key specifically, since a name-regex or single-site fix would leave
+    it unconverted and the shape check would fail with ``(8, 1, 3)`` vs
+    ``(8, 3, 1)``.
+    """
+    model = _paraformer()
+    state = dict(flatten_state_dict(model))
+    target = state[key]
+    ndim = target.ndim
+    torch_layout = mx.transpose(target, (0, 2, 1) if ndim == 3 else (0, 2, 3, 1))
+    state[key] = torch_layout
+    clone = _paraformer()
+    load_strict(clone, state, convert=True)
+    assert mx.array_equal(flatten_state_dict(clone)[key], target).item()
 
 
 def test_load_strict_does_not_convert_by_default():

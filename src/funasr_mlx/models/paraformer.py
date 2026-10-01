@@ -294,7 +294,7 @@ class CTC(mxnn.Module):
         return hs_pad if self.ctc_lo is None else self.ctc_lo(hs_pad)
 
     def log_softmax(self, hs_pad: mx.array) -> mx.array:
-        return mx.logsoftmax(self(hs_pad), axis=-1)
+        return mxnn.log_softmax(self(hs_pad), axis=-1)
 
     def argmax(self, hs_pad: mx.array) -> mx.array:
         return mx.argmax(self(hs_pad), axis=-1)
@@ -490,7 +490,12 @@ def cif_v1(hidden: mx.array, alphas: mx.array, threshold: float = 1.0):
     # the map, giving ``time_of_rank[b, j]`` = time of the j-th fire of batch b.
     big = mx.array(t, mx.int32)
     time_of_rank = mx.argsort(mx.where(fire_idxs, rank, big), axis=1)  # (B, T)
-    flat_time = mx.reshape(time_of_rank, (b * t,)).astype(mx.int32)
+    # The gather below flattens the batch into one axis, so each row needs its
+    # own ``b * T`` offset.  The reference does the same thing with
+    # ``batch_indexes = arange(B).unsqueeze(-1) * len_time`` added to
+    # ``frame_idxs`` before flattening; without it every row re-reads row 0.
+    offsets = (mx.arange(b, dtype=mx.int32) * t)[:, None]  # (B, 1)
+    flat_time = mx.reshape(time_of_rank.astype(mx.int32) + offsets, (b * t,))
 
     def _reorder(array: mx.array) -> mx.array:
         """Gather rows of ``array`` along the time axis in fire order.
@@ -752,7 +757,14 @@ class ParaformerSANMDecoder(mxnn.Module):
         ys_in_lens: mx.array,
         return_hidden: bool = False,
     ):
-        """``ys_in_pad`` is the CIF acoustic embedding ``(B, T2, D)``."""
+        """``hs_pad`` is the encoder/acoustic memory ``(B, T1, D)``.
+
+        Following the reference (``funasr/models/paraformer/decoder.py:397-450``)
+        the offline path does **not** run ``self.embed``: ``x = tgt`` with
+        ``tgt = ys_in_pad``.  Only ``forward_one_step`` (``:604``) embeds.  In
+        offline Paraformer the decoder input is therefore the CIF acoustic
+        embedding, already ``(B, T2, D)`` -- not token ids.
+        """
         tgt = ys_in_pad
         tgt_mask = mx.expand_dims(sequence_mask(ys_in_lens, tgt.shape[1]), 2)  # (B, T2, 1)
         memory = hs_pad
@@ -860,7 +872,7 @@ class Paraformer(mxnn.Module):
             logits, decoder_out_lens = self.decoder(
                 encoder_out, encoder_out_lens, acoustic_embeds, token_length
             )
-            decoder_out = mx.logsoftmax(logits, axis=-1)
+            decoder_out = mxnn.log_softmax(logits, axis=-1)
         return ParaformerOutputs(
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
