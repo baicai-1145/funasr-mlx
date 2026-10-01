@@ -63,6 +63,7 @@ __all__ = [
     "campplus_config_from_dict",
     "convert_checkpoint_tensor",
     "flatten_state_dict",
+    "flatten_state_dict_with_rules",
     "get_nonlinear",
     "kaiming_normal_",
     "load_strict",
@@ -320,6 +321,21 @@ def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> LayoutReport:
     rules: dict[str, str] = {}
     _flatten_into(module, prefix, tensors, rules)
     return LayoutReport(tensors=tensors, rules=rules)
+
+
+def flatten_state_dict_with_rules(
+    module: mxnn.Module, prefix: str = ""
+) -> tuple[dict[str, mx.array], dict[str, str]]:
+    """Like :func:`flatten_state_dict`, but also returns the per-key layout rule.
+
+    Returns ``(tensors, rules)`` with the same two dictionaries that the
+    :class:`LayoutReport` carries -- nothing is dropped.  This is the contract
+    :func:`funasr_mlx.models.sanm.flatten_state_dict_with_rules` exposes, so the
+    three model modules agree on one name for the same operation; callers that
+    want the richer object should use :func:`flatten_state_dict` instead.
+    """
+    report = flatten_state_dict(module, prefix)
+    return report.tensors, report.rules
 
 
 class CheckpointKeyError(KeyError):

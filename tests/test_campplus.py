@@ -86,6 +86,24 @@ def test_flatten_state_dict_reads_the_mapping_storage_not_dunder_dict():
     assert "xvector.dense.linear.weight" in state
 
 
+def test_flatten_state_dict_with_rules_matches_the_layout_report():
+    """Both public views must agree exactly; the tuple form drops nothing."""
+    model = _campplus()
+    report = flatten_state_dict(model)
+    tensors, rules = flatten_state_dict_with_rules(model)
+    assert tensors == report.tensors
+    assert rules == report.rules
+    assert rules, "the rules must not be empty"
+    # It is the same contract sanm exposes, and the rule is still usable.
+    assert convert_checkpoint_tensor(
+        "x", mx.zeros((4, 1, 5)), rules["xvector.tdnn.linear.weight"]
+    ).shape == (
+        4,
+        5,
+        1,
+    )
+
+
 def test_state_dict_keys_carry_the_xvector_prefix():
     """The reference wraps everything after ``head`` in ``self.xvector``."""
     keys = set(flatten_state_dict(_campplus()))
