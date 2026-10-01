@@ -30,7 +30,9 @@ from funasr_mlx.models.paraformer import (  # noqa: E402
     ParaformerSANMDecoder,
     SANMEncoder,
     SANMEncoderConfig,
+    CIF_DEVICE,
     cif_v1,
+    cif_wo_hidden_v1,
     paraformer_config_from_dict,
 )
 from funasr_mlx.models.sanm import (  # noqa: E402
@@ -498,6 +500,95 @@ def _cold_probe_case(d: int = 3):
 # and frames[j] = boundary[j] - boundary[j-1] with boundary[-1] = 0, so
 #   frames = [[9/28, 13/28, 17/28], [39/28, 43/28, 47/28]]
 _COLD_PROBE_EXPECTED_D3 = np.array([[9, 13, 17], [39, 43, 47]], np.float32) / 28.0
+
+
+def test_cif_predictor_defaults_to_the_deterministic_cpu_device():
+    """The default device is CPU, on both public entry points.
+
+    Metal has been observed to return float bit patterns in the index arrays
+    this code depends on, so the default is pinned to CPU rather than left to
+    whatever stream the caller happens to be on.
+    """
+    from funasr_mlx.models import paraformer as paraformer_module
+
+    assert CIF_DEVICE is mx.cpu
+    assert paraformer_module.CIF_DEVICE is mx.cpu
+    assert paraformer_module._cif_stream(None) is mx.cpu
+    for function in (paraformer_module.cif_v1, paraformer_module.cif_wo_hidden_v1):
+        assert function.__kwdefaults__["device"] is None
+
+
+def test_cif_v1_device_override_is_honoured():
+    """Passing the device explicitly must take the same path as the default."""
+    hidden, alphas = _cold_probe_case(3)
+    default_frames, default_fires = cif_v1(hidden, alphas, 1.0)
+    explicit_frames, explicit_fires = cif_v1(hidden, alphas, 1.0, device=mx.cpu)
+    mx.eval(default_frames, default_fires, explicit_frames, explicit_fires)
+    assert mx.array_equal(default_frames, explicit_frames).item()
+    assert mx.array_equal(default_fires, explicit_fires).item()
+
+
+@pytest.mark.parametrize("seed,b,d", [(1, 1, 2), (2, 2, 3), (3, 3, 8), (4, 2, 5)])
+def test_cif_v1_repeated_fresh_rows_match_the_reference_formula(seed, b, d):
+    """Fresh per-row inputs, each recomputed by the reference formula in numpy.
+
+    Every call is compared against the formula, never against a previous call,
+    so a consistently wrong result cannot pass.  Runs on the default (CPU)
+    path three times per case to cover the evaluation this pins.
+    """
+    rng = np.random.default_rng(seed)
+    hidden_np = rng.normal(0.0, 1.0, (b, 6, d)).astype(np.float32)
+    alphas_np = rng.uniform(0.15, 0.9, (b, 6)).astype(np.float32)
+
+    alpha_prefix = np.cumsum(alphas_np.astype(np.float64), axis=1)
+    rolled = np.roll(alpha_prefix, 1, axis=1)
+    rolled[:, 0] = 0.0
+    fire_idxs = (np.floor(alpha_prefix) - np.floor(rolled)) > 0
+    assert fire_idxs.any(), "fixture must fire at least once"
+    fires = (np.where(fire_idxs, 1.0, 0.0) + alpha_prefix - np.floor(alpha_prefix)).astype(
+        np.float32
+    )
+    rem = fires - np.floor(fires)
+    prefix = np.cumsum(alphas_np.astype(np.float64) * hidden_np.astype(np.float64), axis=1)
+
+    expected = None
+    for row in range(b):
+        times = list(np.flatnonzero(fire_idxs[row]))
+        row_frames = []
+        previous = np.zeros(d, np.float64)  # boundary[-1] = 0
+        for t in times:
+            boundary = prefix[row, t] - rem[row, t] * hidden_np[row, t]
+            row_frames.append(boundary - previous)
+            previous = boundary
+        expected = row_frames if expected is None else expected + row_frames
+    expected = np.stack(expected, axis=0) if b > 1 else np.array(expected)[None]
+
+    hidden = mx.array(hidden_np)
+    alphas = mx.array(alphas_np)
+    for call in range(3):
+        frames, got_fires = cif_v1(hidden, alphas, 1.0)
+        mx.eval(frames, got_fires)
+        np.testing.assert_allclose(
+            np.asarray(frames),
+            expected,
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg=f"seed={seed} b={b} d={d} call={call}",
+        )
+        np.testing.assert_allclose(
+            np.asarray(got_fires), fires, rtol=1e-6, atol=1e-6, err_msg=f"seed={seed} call={call}"
+        )
+
+
+def test_cif_wo_hidden_v1_default_device_matches_the_device_override():
+    alphas = mx.array([[0.5, 0.25, 0.5, 0.25, 0.5, 0.125]], mx.float32)
+    default_fires, default_idxs = cif_wo_hidden_v1(alphas, 1.0, return_fire_idxs=True)
+    explicit_fires, explicit_idxs = cif_wo_hidden_v1(
+        alphas, 1.0, return_fire_idxs=True, device=mx.cpu
+    )
+    mx.eval(default_fires, default_idxs, explicit_fires, explicit_idxs)
+    assert mx.array_equal(default_fires, explicit_fires).item()
+    assert mx.array_equal(default_idxs, explicit_idxs).item()
 
 
 def test_cif_v1_cold_probe_case_matches_hand_derived_values():

@@ -69,6 +69,7 @@ from .sanm import (
 
 __all__ = [
     "CTC",
+    "CIF_DEVICE",
     "CifPredictorConfig",
     "CifPredictorV2",
     "Paraformer",
@@ -432,16 +433,41 @@ class SANMEncoder(mxnn.Module):
 # --------------------------------------------------------------------------- #
 # CIF predictor
 # --------------------------------------------------------------------------- #
-def cif_wo_hidden_v1(alphas: mx.array, threshold: float = 1.0, return_fire_idxs: bool = False):
-    """Port of ``funasr.models.paraformer.cif_predictor.cif_wo_hidden_v1``.
+CIF_DEVICE = mx.cpu
+"""Device the CIF predictor evaluates on.
 
-    ``threshold`` is unused in the reference implementation (it only gates the
-    downstream comparison) but is kept for signature parity.
+Deterministic **CPU** by default.  On Metal the index arrays this code depends
+on (``time_of_rank``, and therefore ``cur_p`` / ``cur_h`` / ``cur_f``) have been
+observed to come back holding *float* bit patterns instead of indices once the
+whole graph is evaluated, so results vary between calls and between runs.  The
+failure is upstream of any algebraic detail: barriers and ``cache_limit=0`` do
+not suppress it, and the same input arrives unchanged.  Evaluation is
+deterministic on CPU, so the predictor is pinned there.
 
-    Precision note: FunASR accumulates the prefix sum in ``float64`` before
-    casting back to ``float32`` ("cumsum precision degradation cause wrong
-    result in extreme").  MLX has no float64 path on Metal, so the accumulation
-    stays in ``float32``; see the report for the resulting parity caveat.
+This is not a warmup and not a retry: a warmup would still execute on the
+corrupting device, and there is no warmup that makes the graph itself correct.
+It is also **not** "all CPU" -- the caller passes arrays on whatever stream it
+is already using, only this subtree evaluates on CPU, and the returned arrays
+are ordinary MLX arrays that move back freely.  The surrounding encoder, decoder
+and the rest of the Paraformer are untouched and stay on the GPU.
+
+Passing ``device=mx.gpu`` explicitly re-enables the GPU path.  It is retained
+for future verification only and must not be treated as correct until the
+upstream corruption is resolved.
+"""
+
+
+def _cif_stream(device: mx.array | None):
+    """Resolve the evaluation device; ``None`` means the deterministic default."""
+    return CIF_DEVICE if device is None else device
+
+
+def _cif_wo_hidden_v1_impl(alphas: mx.array) -> tuple[mx.array, mx.array]:
+    """The math of ``cif_wo_hidden_v1`` with no device context of its own.
+
+    Private so the public wrapper can hold one CPU stream around the *whole*
+    computation; a nested or partially applied context would let an
+    intermediate land on the default device.
     """
     prefix_sum = mx.cumsum(alphas.astype(mx.float32), axis=1)
     prefix_sum_floor = mx.floor(prefix_sum)
@@ -457,19 +483,42 @@ def cif_wo_hidden_v1(alphas: mx.array, threshold: float = 1.0, return_fire_idxs:
     one = mx.array(1.0, alphas.dtype)
     zero = mx.array(0.0, alphas.dtype)
     fires = mx.where(fire_idxs, one, zero) + prefix_sum - prefix_sum_floor
+    return fires, fire_idxs
+
+
+def cif_wo_hidden_v1(
+    alphas: mx.array,
+    threshold: float = 1.0,
+    return_fire_idxs: bool = False,
+    *,
+    device: mx.array | None = None,
+):
+    """Port of ``funasr.models.paraformer.cif_predictor.cif_wo_hidden_v1``.
+
+    ``threshold`` is unused in the reference implementation (it only gates the
+    downstream comparison) but is kept for signature parity.
+
+    Evaluated on :data:`CIF_DEVICE` unless ``device`` overrides it; the whole
+    subtree is forced inside that stream so no intermediate escapes.
+
+    Precision note: FunASR accumulates the prefix sum in ``float64`` before
+    casting back to ``float32`` ("cumsum precision degradation cause wrong
+    result in extreme").  This port accumulates in ``float32``; see the module
+    notes for why the float64 path is not adopted here.
+    """
+    with mx.stream(_cif_stream(device)):
+        fires, fire_idxs = _cif_wo_hidden_v1_impl(alphas)
+        mx.eval(fires, fire_idxs)
     if return_fire_idxs:
         return fires, fire_idxs
     return fires
 
 
-def cif_v1(hidden: mx.array, alphas: mx.array, threshold: float = 1.0):
-    """Port of ``funasr.models.paraformer.cif_predictor.cif_v1``.
-
-    Returns ``(frame_fires, fires)`` where ``frame_fires`` has shape
-    ``(B, max_label_len, D)``.  ``fires`` is the ``cif_peak`` signal used for
-    timestamps (values ``>= 1.0`` mark an integration boundary).
-    """
-    fires, fire_idxs = cif_wo_hidden_v1(alphas, threshold, return_fire_idxs=True)
+def _cif_v1_impl(
+    hidden: mx.array, alphas: mx.array, threshold: float = 1.0
+) -> tuple[mx.array, mx.array]:
+    """The math of :func:`cif_v1` with no device context of its own."""
+    fires, fire_idxs = _cif_wo_hidden_v1_impl(alphas)
     b, t, d = hidden.shape
 
     total_fires = int(mx.sum(mx.sum(fire_idxs.astype(mx.int32), axis=-1)).item())
@@ -540,6 +589,35 @@ def cif_v1(hidden: mx.array, alphas: mx.array, threshold: float = 1.0):
 
     valid = mx.arange(max_label_len, dtype=mx.int32)[None, :] < batch_len[:, None]
     frames = mx.where(mx.expand_dims(valid, -1), frames, mx.array(0.0, frames.dtype))
+    return frames, fires
+
+
+def cif_v1(
+    hidden: mx.array,
+    alphas: mx.array,
+    threshold: float = 1.0,
+    *,
+    device: mx.array | None = None,
+):
+    """Port of ``funasr.models.paraformer.cif_predictor.cif_v1``.
+
+    Returns ``(frame_fires, fires)`` where ``frame_fires`` has shape
+    ``(B, max_label_len, D)``.  ``fires`` is the ``cif_peak`` signal used for
+    timestamps (values ``>= 1.0`` mark an integration boundary).
+
+    The fire ordering, the boundary algebra and the lengths mask are the
+    reference's; only the *device* differs, and it is pinned to
+    :data:`CIF_DEVICE` because the Metal backend has been observed to corrupt
+    the index arrays this depends on.  See :data:`CIF_DEVICE` for the evidence
+    and for why this is not a warmup.  ``device=mx.gpu`` opts back into the GPU
+    path for future verification; it is not known to be correct.
+
+    ``mx.eval`` returns ``None`` here (unlike ``torch``), so the values are
+    read back from the already-materialised arrays rather than its return value.
+    """
+    with mx.stream(_cif_stream(device)):
+        frames, fires = _cif_v1_impl(hidden, alphas, threshold)
+        mx.eval(frames, fires)
     return frames, fires
 
 
