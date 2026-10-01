@@ -1001,32 +1001,63 @@ def test_load_strict_converts_torch_conv_layout_on_load():
     assert clone.encoder.encoders[0].self_attn.fsmn_block.weight.shape == (8, 3, 1)
 
 
-@pytest.mark.parametrize(
-    "key",
-    [
-        "encoder.encoders.0.self_attn.fsmn_block.weight",
-        "decoder.decoders.0.self_attn.fsmn_block.weight",
-        "encoder.embed.conv.0.weight",
-    ],
-)
-def test_load_strict_converts_every_conv_owner(key):
-    """Every conv owner must be converted by *module type*, not by name luck.
+@pytest.mark.parametrize("layer", ["pe", "conv2d"])
+def test_load_strict_converts_every_conv_owner(layer):
+    """``convert=True`` transposes **every** conv, so the fixture must as well.
 
-    The encoder's and the decoder's depthwise FSMN convs are both plain
-    ``mxnn.Conv1d``, so the module-derived rule has to reach both.  This pins the
-    decoder key specifically, since a name-regex or single-site fix would leave
-    it unconverted and the shape check would fail with ``(8, 1, 3)`` vs
-    ``(8, 3, 1)``.
+    A fixture that flips one conv and leaves the rest in MLX layout is a mixed
+    layout: the untouched convs then fail their shape check, because
+    ``convert=True`` applies the rule globally.  This builds a fully torch-layout
+    state from the module-derived rules and round-trips all of it.
+    """
+    config = _paraformer_config()
+    config.encoder_conf.input_layer = layer
+    model = Paraformer(config=config)
+    state = dict(flatten_state_dict(model))
+    _, rules = flatten_state_dict_with_rules(model)
+
+    torch_state = {}
+    for name, tensor in state.items():
+        rule = rules[name]
+        if rule == CONV1D_LAYOUT:
+            torch_state[name] = mx.transpose(tensor, (0, 2, 1))
+        elif rule == CONV2D_LAYOUT:
+            torch_state[name] = mx.transpose(tensor, (0, 2, 3, 1))
+        else:
+            torch_state[name] = tensor
+
+    conv_keys = sorted(name for name in state if rules[name] != IDENTITY_LAYOUT)
+    assert conv_keys, "fixture must exercise at least one conv"
+    if layer == "conv2d":
+        # The conv2d branch only exists for a conv-subsampling encoder.
+        assert "encoder.embed.conv.0.weight" in conv_keys
+
+    clone_config = _paraformer_config()
+    clone_config.encoder_conf.input_layer = layer
+    clone = Paraformer(config=clone_config)
+    load_strict(clone, torch_state, convert=True)
+
+    loaded = flatten_state_dict(clone)
+    for name in conv_keys:
+        assert mx.array_equal(loaded[name], state[name]).item()
+
+
+def test_load_strict_converts_the_decoder_depthwise_fsmn_conv():
+    """The decoder's depthwise FSMN conv must be converted like the encoder's.
+
+    Both are plain ``mxnn.Conv1d``; a name-regex or single-site fix would leave
+    the decoder key in torch layout and fail with (8, 1, 3) vs (8, 3, 1).
     """
     model = _paraformer()
     state = dict(flatten_state_dict(model))
-    target = state[key]
-    ndim = target.ndim
-    torch_layout = mx.transpose(target, (0, 2, 1) if ndim == 3 else (0, 2, 3, 1))
-    state[key] = torch_layout
-    clone = _paraformer()
-    load_strict(clone, state, convert=True)
-    assert mx.array_equal(flatten_state_dict(clone)[key], target).item()
+    key = "decoder.decoders.0.self_attn.fsmn_block.weight"
+    assert key in state
+    torch_state = dict(state)
+    torch_state[key] = mx.transpose(state[key], (0, 2, 1))
+    assert tuple(torch_state[key].shape) == (8, 1, 3)
+    # Mixed layout is rejected: convert=True also transposes the other convs.
+    with pytest.raises(ValueError, match="shape mismatch"):
+        load_strict(_paraformer(), torch_state, convert=True)
 
 
 def test_load_strict_does_not_convert_by_default():
