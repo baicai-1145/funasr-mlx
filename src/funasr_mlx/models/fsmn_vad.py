@@ -354,21 +354,38 @@ class ModuleLayerList(nn.Module):
         return self[str(index)] if isinstance(index, int) else dict.__getitem__(self, index)
 
 
-class LinearTransform(nn.Module):
-    """``LinearTransform``: bias-free linear (checkpoint key ``…linear.weight``)."""
+class LinearTransform(nn.Linear):
+    """``LinearTransform``: a bias-free linear.
+
+    The reference is::
+
+        class LinearTransform(torch.nn.Module):
+            def __init__(self, input_dim, output_dim):
+                self.input_dim = input_dim
+                self.output_dim = output_dim
+                self.linear = torch.nn.Linear(input_dim, output_dim, bias=False)
+
+    ``BasicBlock.linear`` is the ``LinearTransform`` and ``torch.nn.Linear``'s own
+    parameter is called ``weight``, so the checkpoint path is
+    ``fsmn.<i>.linear.weight`` -- i.e. the ``LinearTransform`` *is* the
+    ``nn.Linear``.  Subclassing ``nn.Linear`` reproduces that exactly; wrapping a
+    ``nn.Linear`` in another module would shift the key to
+    ``fsmn.<i>.linear.linear.weight``.
+    """
 
     def __init__(self, input_dim: int, output_dim: int) -> None:
-        super().__init__()
+        super().__init__(input_dim, output_dim, bias=False)
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
-        self.linear = nn.Linear(input_dim, output_dim, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.linear(x)
 
 
 class AffineTransform(nn.Module):
-    """``AffineTransform``: linear with bias."""
+    """``AffineTransform``: ``self.linear = nn.Linear(input_dim, output_dim)``.
+
+    Unlike :class:`LinearTransform` the reference keeps a named ``linear``
+    submodule here, so the checkpoint keys are ``…affine.linear.weight`` and
+    ``…affine.linear.bias``.
+    """
 
     def __init__(self, input_dim: int, output_dim: int) -> None:
         super().__init__()
@@ -415,10 +432,16 @@ class FSMNBlock(nn.Module):
         )
 
     def __call__(self, x: mx.array, cache: mx.array | None = None):
-        """Return ``(output, new_cache)`` with ``output`` shaped ``(B, T, D)``."""
+        """Return ``(output, new_cache)`` with ``output`` shaped ``(B, T, D)``.
+
+        Layout: ``mx.nn.Conv1d`` is channels-last ``(batch, length, channels)``.
+        The reference works in ``(B, D, T)``; the time axis is moved to the middle
+        so the ``(lorder - 1) * lstride`` left padding (or cache concatenation) is
+        expressed on the same axis FunASR pads, then moved back for the conv.
+        """
         if x.ndim != 3:
             raise ValueError(f"expected (B, T, D) input, got shape {x.shape}")
-        x_per = mx.transpose(x, 0, 2, 1)  # (B, D, T)
+        x_per = mx.transpose(x, (0, 2, 1))  # (B, T, D) -> (B, D, T)
         if cache is not None:
             if cache.ndim != 3 or cache.shape[1] != self.dim:
                 raise ValueError(
@@ -431,7 +454,8 @@ class FSMNBlock(nn.Module):
             y_left = mx.pad(x_per, [(0, 0), (0, 0), (self.keep, 0)])
             new_cache = None
 
-        out = x_per + mx.transpose(self.conv_left(mx.transpose(y_left, 0, 2, 1)), 0, 2, 1)
+        left_out = self.conv_left(mx.transpose(y_left, (0, 2, 1)))
+        out = x_per + mx.transpose(left_out, (0, 2, 1))
 
         if self.conv_right is not None:
             # FunASR right-pads by rorder*rstride then drops rstride frames, which
@@ -442,15 +466,14 @@ class FSMNBlock(nn.Module):
                 future = mx.pad(
                     future, [(0, 0), (0, 0), (0, self.rorder * self.rstride)]
                 )
-                out = out + mx.transpose(
-                    self.conv_right(mx.transpose(future, 0, 2, 1)), 0, 2, 1
-                )
+                right_out = self.conv_right(mx.transpose(future, (0, 2, 1)))
+                out = out + mx.transpose(right_out, (0, 2, 1))
             else:
                 logger.warning(
                     "rorder=%d needs at least rstride=%d frames; right context skipped",
                     self.rorder, self.rstride,
                 )
-        return mx.transpose(out, 0, 2, 1), new_cache
+        return mx.transpose(out, (0, 2, 1)), new_cache
 
 
 class BasicBlock(nn.Module):
@@ -567,9 +590,6 @@ class WindowDetector:
 
     def get_window_size(self) -> int:
         return int(self.win_size_frame)
-
-    def frame_size_ms(self) -> int:
-        return int(self.frame_size_ms)
 
     def detect_one_frame(
         self, frame_state: FrameState, frame_count: int = 0, cache: dict | None = None
@@ -870,7 +890,11 @@ class FsmnVadModel(nn.Module):
             stats.scores = mx.concatenate([stats.scores, scores], axis=1)
 
         ids = [int(i) for i in self.vad_opts.sil_pdf_ids]
-        noise = mx.sum(scores[0][:, ids], axis=-1)
+        # FunASR: ``sum(scores[0][t][sil_pdf_id] for sil_pdf_id in sil_pdf_ids)``.
+        # ``mx.take`` with an explicit axis is used instead of ``scores[0][:, ids]``
+        # so the semantics do not depend on list-index broadcasting.
+        index = mx.array(ids, dtype=mx.int32)
+        noise = mx.sum(mx.take(scores[0], index, axis=1), axis=-1)
         stats.noise_scores.extend(float(v) for v in noise.tolist())
 
     # -- endpoint bookkeeping ------------------------------------------------
@@ -1351,7 +1375,7 @@ def convert_checkpoint_tensors(state: Mapping[str, mx.array | Any]) -> dict[str,
             d, _, k, w = value.shape
             if w != 1:
                 raise ValueError(f"{name}: only a trailing width of 1 is supported, got {w}")
-            value = mx.transpose(value, 0, 2, 1, 3).reshape(d, k, 1)
+            value = mx.transpose(value, (0, 2, 1, 3)).reshape(d, k, 1)
         converted[name] = value
     return converted
 

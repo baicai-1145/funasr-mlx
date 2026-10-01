@@ -78,6 +78,14 @@ def cjk_text(count: int) -> str:
     return "".join(chr(0x4E00 + i) for i in range(count))
 
 
+def test_tiny_vocab_is_the_cjk_fixture():
+    """The CJK fixture maps the first ``vocab_size - 1`` CJK chars to ids 1..n."""
+    vocab = tiny_vocab()
+    assert len(vocab) == 16
+    assert vocab.encode([cjk_text(3)]) == [1, 2, 3]
+    assert vocab.encode(["definitely-not-in-vocab"]) == [0]
+
+
 # --------------------------------------------------------------------------- #
 # config validation
 # --------------------------------------------------------------------------- #
@@ -174,11 +182,16 @@ def test_ascii_punc_map_covers_reference_marks():
     assert ASCII_PUNC_MAP["、"] == ","
 
 
-def test_expand_word_level_punc_inserts_ones():
-    assert expand_word_level_punc([2, 3, 1], ["中", "国", "人"]) == [2, 3, 1]
-    assert expand_word_level_punc([3, 1], ["中国", "人"]) == [3, 1, 1]
+def test_expand_word_level_punc_inserts_no_punc_ids():
+    # The reference inserts at index ``i`` of the token list while walking tokens
+    # in reverse, and hard-codes the inserted value as ``1``.
+    assert expand_word_level_punc([2, 3, 0], ["中", "国", "人"]) == [2, 3, 0]
+    assert expand_word_level_punc([3, 0], ["中国", "人"]) == [1, 3, 0]
     # Non-CJK words are left alone.
-    assert expand_word_level_punc([3, 1], ["ab", "中"]) == [3, 1]
+    assert expand_word_level_punc([3, 0], ["ab", "中"]) == [3, 0]
+    # ``1`` is only "no punctuation" when punc_list[1] is the blank mark; callers
+    # with a different label table must pass the right id explicitly.
+    assert expand_word_level_punc([3, 0], ["中国", "人"], no_punc_id=0) == [0, 3, 0]
 
 
 # --------------------------------------------------------------------------- #
@@ -216,36 +229,48 @@ def test_layer_norm_eps_is_funasr_value():
     assert model.encoder.encoders0[0].norm1.eps == pytest.approx(1e-12)
 
 
-def test_sanm_fsmn_padding_direction():
-    """kernel=3 -> 1 zero pad on each side; the memory branch is causal-left.
+def test_sanm_fsmn_padding_split_is_one_frame_each_side():
+    """kernel=3, sanm_shfit=0 -> ConstantPad1d((1, 1)), i.e. ``y_left = [0, x, 0]``.
 
-    With a depthwise kernel of ``[0, 1, 0]`` the memory at frame ``t`` must be
-    ``x[t] + x[t-1]`` with ``x[-1] == 0``; with ``[0, 0, 1]`` it must be
-    ``x[t] + x[t+1]`` with ``x[T] == 0``.
+    With a depthwise kernel whose tap 2 is the only non-zero entry,
+    ``out[t] = y_left[t - 2]``:
+
+    * ``left=1, right=1`` -> ``y_left = [0, x0, x1, ...]`` -> ``out = [0, 0, 0, x0, x1]``
+    * ``left=2, right=0`` -> ``y_left = [0, 0, x0, ...]`` -> ``out = [0, 0, 0, 0, x0]``
+
+    so the assertion below pins the split, not just the total padding.
     """
-    channels = 2
-    length = 4
+    channels, length = 2, 5
+    attn = SanmAttention(n_head=1, in_feat=channels, n_feat=channels, kernel_size=3)
+    assert (attn.left_pad, attn.right_pad) == (1, 1)
+
+    tap = mx.zeros((channels, 3, 1))
+    tap = tap + mx.array([[[0.0], [0.0], [1.0]]])  # only kernel index 2
+    attn.fsmn_block.weight = tap
+
     base = mx.arange(channels * length, dtype=mx.float32).reshape(1, length, channels)
+    memory = attn.forward_fsmn(base, None)
+    expected = base + mx.concatenate(
+        [mx.zeros((1, 3, channels)), base[:, 0 : length - 3, :]], axis=1
+    )
+    mx.eval(memory, expected)
+    assert memory.shape == (1, length, channels)
+    assert memory.tolist() == pytest.approx(expected.tolist(), abs=1e-5)
 
-    left = SanmAttention(n_head=1, in_feat=channels, n_feat=channels, kernel_size=3)
-    weight = mx.zeros((channels, 3, 1))
-    weight = weight + mx.array([[[0.0], [1.0], [0.0]]])
-    left.fsmn_block.weight = weight
-    memory_left = left.forward_fsmn(base, None)
-    mx.eval(memory_left)
-    expected_left = base + mx.pad(base[:, :-1, :], [(0, 0), (0, 1), (0, 0)])
-    mx.eval(expected_left)
-    assert memory_left.tolist() == pytest.approx(expected_left.tolist(), abs=1e-5)
 
-    right = SanmAttention(n_head=1, in_feat=channels, n_feat=channels, kernel_size=3)
-    weight_r = mx.zeros((channels, 3, 1))
-    weight_r = weight_r + mx.array([[[0.0], [0.0], [1.0]]])
-    right.fsmn_block.weight = weight_r
-    memory_right = right.forward_fsmn(base, None)
-    mx.eval(memory_right)
-    expected_right = base + mx.pad(base[:, 1:, :], [(0, 0), (0, 1), (0, 0)])
-    mx.eval(expected_right)
-    assert memory_right.tolist() == pytest.approx(expected_right.tolist(), abs=1e-5)
+def test_sanm_fsmn_uses_one_frame_of_left_context():
+    """Tap 1 with ``left=1`` must read ``x[t - 1]`` and nothing older."""
+    channels, length = 2, 4
+    attn = SanmAttention(n_head=1, in_feat=channels, n_feat=channels, kernel_size=3)
+    tap = mx.zeros((channels, 3, 1))
+    tap = tap + mx.array([[[0.0], [1.0], [0.0]]])  # only kernel index 1
+    attn.fsmn_block.weight = tap
+
+    base = mx.arange(channels * length, dtype=mx.float32).reshape(1, length, channels)
+    memory = attn.forward_fsmn(base, None)
+    expected = base + mx.pad(base[:, :-1, :], [(0, 0), (0, 1), (0, 0)])
+    mx.eval(memory, expected)
+    assert memory.tolist() == pytest.approx(expected.tolist(), abs=1e-5)
 
 
 def test_sanm_fsmn_mask_zeroes_padding():
@@ -263,6 +288,22 @@ def test_sanm_fsmn_mask_zeroes_padding():
 # --------------------------------------------------------------------------- #
 # architecture
 # --------------------------------------------------------------------------- #
+def test_flat_parameter_names_sees_every_tensor():
+    """Regression guard: MLX ``nn.Module`` stores children in its *dict* part.
+
+    A loader that walked ``vars(module)`` instead of ``module.parameters()`` would
+    silently see zero tensors and every checkpoint load would fail open/closed
+    in the wrong way.  Pin the exact tensor count so that can never regress.
+    """
+    model = CtPuncModel(tiny_config())
+    params = flat_parameter_names(model)
+    # embed 1 + decoder 2 + after_norm 2 + 2 encoder layers x 13
+    #   (norm1 2, norm2 2, linear_out 2, linear_q_k_v 2, fsmn_block 1, w_1 2, w_2 2)
+    assert len(params) == 31
+    assert all(isinstance(value, mx.array) for value in params.values())
+    assert "embed.weight" in params
+
+
 def test_parameter_names_match_funasr_checkpoint_layout():
     names = set(flat_parameter_names(CtPuncModel(tiny_config())))
     expected_subset = {
@@ -397,87 +438,142 @@ def test_load_state_dict_strict_rejects_shape_mismatch():
 # --------------------------------------------------------------------------- #
 # punctuator post-processing
 # --------------------------------------------------------------------------- #
-class StubPunctuator(CtPuncPunctuator):
-    """Punctuator whose model call is replaced by a scripted id table."""
+# Label ids for ``PUNC_LIST``.  ``0`` is the blank mark ("_") and therefore the
+# "no punctuation" class; using ``1`` for "none" is a fixture bug that silently
+# turns blanks into commas.
+PUNC_NONE = 0
+PUNC_COMMA = 1
+PUNC_PERIOD = 2
+PUNC_QUESTION = 3  # == sentence_end_id
+PUNC_DUN = 4
 
-    def __init__(self, script: dict[tuple[int, ...], list[int]], **config_overrides):
+ASCII_WORDS = ["hello", "world", "ok"]
+
+
+def stub_vocab(vocab_size: int = 16) -> CharVocab:
+    """Vocabulary that actually contains every token the stub tests feed in.
+
+    CJK characters occupy ids 1..15 and the ASCII words 16..18, so a test that
+    scripts ids 1, 2, 3 is really scripting CJK characters.
+    """
+    return CharVocab(["<unk>"] + [chr(0x4E00 + i) for i in range(15)] + list(ASCII_WORDS))
+
+
+class StubPunctuator(CtPuncPunctuator):
+    """Punctuator whose model call is replaced by a scripted table.
+
+    The script is keyed by the token-id tuple the punctuator will *actually*
+    look up (derived from :meth:`key`), never by hand-written ids: that removes
+    the whole class of fixture bugs where a token falls back to ``<unk>`` and the
+    ids silently become ``0, 0, 0``.  An unexpected mini-sentence is a hard error,
+    which also pins the chunking.
+    """
+
+    def __init__(self, **config_overrides):
         payload = dict(split_size=4, cache_pop_trigger_limit=6)
         payload.update(config_overrides)
         config = tiny_config(**payload)
-        self._script = script
+        self._script: dict[tuple[int, ...], list[int]] = {}
         self.seen_lengths: list[int] = []
         self.model = CtPuncModel(config)
-        self.vocab = tiny_vocab(config.vocab_size)
+        self.vocab = stub_vocab()
         self.config = config
+
+    def key(self, tokens) -> tuple[int, ...]:
+        return tuple(self.vocab.encode(list(tokens)))
+
+    def script(self, chunks) -> "StubPunctuator":
+        """``chunks`` is an iterable of ``(token_sequence, predicted_ids)``."""
+        self._script = {self.key(tokens): list(ids) for tokens, ids in chunks}
+        return self
 
     def predict_punc_ids(self, token_ids):  # type: ignore[override]
         ids = [int(i) for i in token_ids]
         self.seen_lengths.append(len(ids))
         if tuple(ids) not in self._script:
             raise AssertionError(f"unexpected mini-sentence ({len(ids)} tokens): {ids}")
-        return self._script[tuple(ids)]
+        return list(self._script[tuple(ids)])
 
 
 def test_empty_text_returns_empty_result():
-    punctuator = StubPunctuator({})
+    punctuator = StubPunctuator()
     assert punctuator.punctuate("") == PuncResult(text="", punc_array=None)
     assert punctuator.punctuate("   ") == PuncResult(text="", punc_array=None)
 
 
 def test_single_chunk_emits_tokens_and_punc_array():
-    chars = cjk_text(4)
-    punctuator = StubPunctuator({(1, 2, 3, 4): [1, 2, 3, 1]})
-    result = punctuator.punctuate(chars)
+    chars = list(cjk_text(4))
+    punctuator = StubPunctuator().script(
+        [(chars, [PUNC_COMMA, PUNC_PERIOD, PUNC_QUESTION, PUNC_NONE])]
+    )
+    result = punctuator.punctuate("".join(chars))
     assert punctuator.seen_lengths == [4]
-    assert result.text == chars[0:2] + "，" + chars[2:3] + "。" + chars[3:4]
-    assert result.punc_array == [1, 2, 3, 1]
+    # The reference appends the mark *after* each token, and a trailing CJK char
+    # without a terminator gets "。" plus a sentence_end_id rewrite of the last id.
+    assert result.text == (
+        chars[0] + "，" + chars[1] + "。" + chars[2] + "？" + chars[3] + "。"
+    )
+    assert result.punc_array == [PUNC_COMMA, PUNC_PERIOD, PUNC_QUESTION, PUNC_QUESTION]
 
 
 def test_ascii_tokens_get_spaces_and_ascii_marks():
-    ids = (1, 2, 3)
-    punctuator = StubPunctuator({ids: [1, 2, 1]})
-    result = punctuator.punctuate("hello world ok")
-    # The first ASCII token gets a leading space; "。" becomes "." for ASCII; the
+    punctuator = StubPunctuator().script(
+        [(ASCII_WORDS, [PUNC_COMMA, PUNC_PERIOD, PUNC_NONE])]
+    )
+    result = punctuator.punctuate(" ".join(ASCII_WORDS))
+    # First ASCII token gets a leading space; "。" becomes "." next to ASCII; the
     # trailing ASCII character forces a final "." and rewrites the last punc id.
     assert result.text == " Hello world, ok."
-    assert result.punc_array == [1, 2, 3]
+    assert result.punc_array == [PUNC_COMMA, PUNC_PERIOD, PUNC_QUESTION]
 
 
 def test_chunk_without_terminator_is_carried_forward():
-    # split_size=4 -> chunks [1..4] and [5..8]; the first has no terminator in the
-    # scan range [len-2 .. 2] so nothing is emitted and it is re-run as cache.
-    punctuator = StubPunctuator(
-        {
-            (1, 2, 3, 4): [1, 1, 1, 1],
-            (1, 2, 3, 4, 5, 6, 7, 8): [1, 1, 1, 1, 1, 1, 1, 3],
-        }
+    # split_size=4 -> chunks [0:4] and [4:8].  The first has no terminator inside
+    # the scan range [len-2 .. 2], so nothing is emitted and it is re-run as cache.
+    chars = list(cjk_text(8))
+    punctuator = StubPunctuator().script(
+        [
+            (chars[0:4], [PUNC_NONE] * 4),
+            (chars[0:8], [PUNC_NONE] * 7 + [PUNC_QUESTION]),
+        ]
     )
-    result = punctuator.punctuate(cjk_text(8))
+    result = punctuator.punctuate("".join(chars))
     assert punctuator.seen_lengths == [4, 8]
-    assert result.punc_array == [1, 1, 1, 1, 1, 1, 1, 3]
-    assert result.text == cjk_text(8) + "。"
+    assert result.punc_array == [PUNC_NONE] * 7 + [PUNC_QUESTION]
+    assert result.text == "".join(chars[0:7]) + "？" + chars[7] + "。"
 
 
 def test_over_long_chunk_is_cut_at_the_last_comma():
-    # 12 tokens / split_size=4 -> 3 chunks. Chunk 1 (8 tokens with cache) exceeds
+    # 12 tokens / split_size=4 -> 3 chunks.  Chunk 1 (8 tokens with cache) exceeds
     # cache_pop_trigger_limit=6 without a terminator, so the comma inside the scan
     # range is promoted to sentence_end_id and the rest becomes the next cache.
-    punctuator = StubPunctuator(
-        {
-            (1, 2, 3, 4): [1, 1, 1, 1],
-            (1, 2, 3, 4, 5, 6, 7, 8): [1, 1, 2, 1, 1, 1, 1, 1],
-            (4, 5, 6, 7, 8, 9, 10, 11, 12): [1, 3, 1, 1, 1, 1, 1, 1, 1],
-        }
+    chars = list(cjk_text(12))
+    punctuator = StubPunctuator().script(
+        [
+            (chars[0:4], [PUNC_NONE] * 4),
+            (chars[0:8], [PUNC_NONE, PUNC_NONE, PUNC_COMMA, PUNC_NONE, PUNC_NONE, PUNC_NONE,
+                          PUNC_NONE, PUNC_NONE]),
+            (chars[3:12], [PUNC_PERIOD] + [PUNC_NONE] * 8),
+        ]
     )
-    result = punctuator.punctuate(cjk_text(12))
+    result = punctuator.punctuate("".join(chars))
     assert punctuator.seen_lengths == [4, 8, 9]
-    assert result.punc_array == [1, 1, 3, 1, 3, 1, 1, 1, 1, 1, 1, 1]
-    chars = cjk_text(12)
-    assert result.text == chars[0:3] + "。" + chars[3:5] + "。" + chars[5:12]
+    assert result.punc_array == [
+        PUNC_NONE, PUNC_NONE, PUNC_QUESTION,
+        PUNC_PERIOD, PUNC_NONE, PUNC_NONE, PUNC_NONE, PUNC_NONE, PUNC_NONE, PUNC_NONE,
+        PUNC_NONE, PUNC_QUESTION,
+    ]
+    assert result.text == (
+        chars[0] + chars[1] + "。"
+        + chars[3] + "。"
+        + "".join(chars[4:12]) + "。"
+    )
 
 
 def test_punctuator_rejects_oversized_mini_sentence():
-    punctuator = StubPunctuator({}, max_input_tokens=2)
+    """The bound must live in the real predictor, not in a test stub."""
+    config = tiny_config(max_input_tokens=2)
+    punctuator = CtPuncPunctuator(CtPuncModel(config), stub_vocab(), config)
     with pytest.raises(ValueError, match="max_input_tokens"):
         punctuator.predict_punc_ids([1, 2, 3])
 
@@ -489,7 +585,7 @@ def test_punctuator_requires_matching_vocab_size():
 
 
 def test_reset_is_a_noop_for_offline_ct_punc():
-    assert StubPunctuator({}).reset() is None
+    assert StubPunctuator().reset() is None
 
 
 # --------------------------------------------------------------------------- #

@@ -545,16 +545,23 @@ class SanmAttention(nn.Module):
         return q_h, k_h, v_h, v
 
     def forward_fsmn(self, inputs: mx.array, mask: mx.array | None) -> mx.array:
-        """Depthwise memory branch; the mask is applied before *and* after the conv."""
+        """Depthwise memory branch; the mask is applied before *and* after the conv.
+
+        Layout: the convolution itself is ``mx.nn.Conv1d``, which is channels-last
+        ``(batch, length, channels)``.  The reference works in ``(batch, channels,
+        time)`` so the time axis is moved to the middle, the reference's
+        ``ConstantPad1d((left, right))`` is applied to it, and the result is moved
+        back before it is combined with the input.
+        """
         b = inputs.shape[0]
         mask3 = None
         if mask is not None:
             mask3 = mx.reshape(mask, (b, -1, 1))
             inputs = inputs * mask3
-        x = mx.transpose(inputs, 0, 2, 1)  # (B, C, T)
+        x = mx.transpose(inputs, (0, 2, 1))  # (B, T, C) -> (B, C, T)
         x = mx.pad(x, [(0, 0), (0, 0), (self.left_pad, self.right_pad)])
-        x = self.fsmn_block(x)  # (B, C, T)
-        x = mx.transpose(x, 0, 2, 1)  # (B, T, C)
+        x = mx.transpose(x, (0, 2, 1))  # (B, C, T_padded) -> (B, T_padded, C)
+        x = self.fsmn_block(x)  # channels-last conv -> (B, T, C)
         x = x + inputs
         if mask3 is not None:
             x = x * mask3
@@ -572,14 +579,14 @@ class SanmAttention(nn.Module):
         else:
             attn = mx.softmax(scores, axis=-1)
         x = attn @ value  # (B, H, T, d_k)
-        x = mx.transpose(x, 0, 2, 1, 3).reshape(n_batch, -1, self.h * self.d_k)
+        x = mx.transpose(x, (0, 2, 1, 3)).reshape(n_batch, -1, self.h * self.d_k)
         return self.linear_out(x)
 
     def __call__(self, x: mx.array, mask: mx.array | None = None) -> mx.array:
         q_h, k_h, v_h, v = self.forward_qkv(x)
         fsmn_memory = self.forward_fsmn(v, mask)
         q_h = q_h * (self.d_k ** -0.5)
-        scores = q_h @ mx.transpose(k_h, 0, 1, 3, 2)
+        scores = q_h @ mx.transpose(k_h, (0, 1, 3, 2))
         return self.forward_attention(v_h, scores, mask) + fsmn_memory
 
 
@@ -757,7 +764,7 @@ def convert_checkpoint_tensors(
                     f"{name}: expected a 3-D depthwise conv weight (C, 1, K), "
                     f"got shape {value.shape}"
                 )
-            value = mx.transpose(value, 0, 2, 1)
+            value = mx.transpose(value, (0, 2, 1))
         converted[name] = value
     return converted
 
@@ -863,12 +870,21 @@ def split_to_mini_sentence(words: Sequence[Any], word_limit: int = 20) -> list[l
     return sentences
 
 
-def expand_word_level_punc(punc_array: Sequence[int], tokens: Sequence[str]) -> list[int]:
+def expand_word_level_punc(
+    punc_array: Sequence[int],
+    tokens: Sequence[str],
+    no_punc_id: int = 1,
+) -> list[int]:
     """FunASR's jieba word-level ``punc_array`` expansion.
 
     Mirrors the reverse walk in ``CTTransformer.inference`` for CJK word tokens
-    longer than one character: insert ``len(token) - 1`` ``1`` ("no punctuation")
-    entries so the array lines up with the character-level token stream.
+    longer than one character: insert ``len(token) - 1`` entries of ``no_punc_id``
+    so the array lines up with the character-level token stream.
+
+    The reference hard-codes the inserted value as the literal ``1``; that is kept
+    as the default so behaviour is bit-identical, but note that ``1`` only means
+    "no punctuation" when ``punc_list[1] == "_"``.  Pass ``no_punc_id=0`` (or
+    whatever the target config uses) when the label table is ordered differently.
     """
     values = list(punc_array)
     total = len(tokens)
@@ -878,7 +894,7 @@ def expand_word_level_punc(punc_array: Sequence[int], tokens: Sequence[str]) -> 
         if CJK_RANGE[0] <= token[0] <= CJK_RANGE[1] and len(token) > 1:
             insert_at = total - i - 1
             for _ in range(len(token) - 1):
-                values.insert(insert_at, 1)
+                values.insert(insert_at, no_punc_id)
     return values
 
 

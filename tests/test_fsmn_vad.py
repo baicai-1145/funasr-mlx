@@ -176,6 +176,34 @@ def test_derived_frame_geometry():
 # --------------------------------------------------------------------------- #
 # encoder architecture
 # --------------------------------------------------------------------------- #
+def test_flat_parameter_names_sees_every_tensor():
+    """Regression guard: MLX ``nn.Module`` stores children in its *dict* part.
+
+    A loader that walked ``vars(module)`` instead of ``module.parameters()`` would
+    silently see zero tensors.  Pin the exact tensor count so that can never
+    regress.
+    """
+    params = flat_parameter_names(make_model())
+    # in_linear1 2 + in_linear2 2 + 2 blocks x 4 (linear 1, conv_left 1, affine 2)
+    # + out_linear1 2 + out_linear2 2
+    assert len(params) == 16
+    assert all(isinstance(value, mx.array) for value in params.values())
+    assert "encoder.in_linear1.linear.weight" in params
+
+
+def test_linear_transform_is_the_nn_linear_itself():
+    """``BasicBlock.linear`` is a ``LinearTransform`` whose own parameter is ``weight``.
+
+    The reference ``LinearTransform`` holds ``self.linear = nn.Linear(..., bias=False)``
+    and ``BasicBlock`` registers it under ``linear``, so the checkpoint path is
+    ``fsmn.<i>.linear.weight`` -- not ``fsmn.<i>.linear.linear.weight``.
+    """
+    block = FSMNBlock(dim=2, lorder=3, rorder=0, lstride=1, rstride=0)
+    params = flat_parameter_names(block)
+    assert set(params) == {"weight"}
+    assert params["weight"].shape == (2, 3, 1)
+
+
 def test_parameter_names_match_funasr_checkpoint_layout():
     names = set(flat_parameter_names(make_model()))
     expected_subset = {
@@ -427,7 +455,7 @@ def test_window_detector_sil_to_speech_and_back():
     )
     detector.reset()
     assert detector.get_window_size() == 20
-    assert detector.frame_size_ms() == 10
+    assert detector.frame_size_ms == 10  # plain int attribute, as in the reference
     transitions = [detector.detect_one_frame(FrameState.SPEECH) for _ in range(20)]
     assert transitions[14] == AudioChangeState.SIL_TO_SPEECH  # 15th frame fills the window
     assert all(t == AudioChangeState.SPEECH_TO_SPEECH for t in transitions[15:])
