@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core", reason="mlx is required for the model ports")
@@ -438,6 +439,64 @@ def test_cif_v1_is_row_independent_for_any_batch(batch):
 
     if batch > 1:
         assert not mx.allclose(frames[0], frames[1], atol=1e-6).item()
+
+
+def test_cif_v1_boundary_form_matches_the_longhand_expression():
+    """The simplification must be algebraically identical to the roll/zero form.
+
+    Recomputes the reference expression independently, straight from
+    ``cif_wo_hidden_v1``'s source formulas:
+        fire_idxs = floor(cumsum(a)) - floor(roll(cumsum(a))) > 0   (shifted)
+        rem[t]    = fires[t] - floor(fires[t])
+        frame[j]  = P[t_j] - P[t_{j-1}] + rem[t_{j-1}]*h[t_{j-1}] - rem[t_j]*h[t_j]
+    with every ``previous`` term zero at j = 0.
+    """
+    hidden_np = np.arange(2 * 6 * 3, dtype=np.float32).reshape(2, 6, 3) / 7.0
+    alphas_np = np.tile(np.array([0.5, 0.25, 0.5, 0.25, 0.5, 0.125], np.float32), (2, 1))
+    hidden = mx.array(hidden_np)
+    alphas = mx.array(alphas_np)
+
+    frames, fires = cif_v1(hidden, alphas, 1.0)
+    mx.eval(frames, fires)
+    got = np.asarray(frames)
+    fires_np = np.asarray(fires)
+
+    # The reference takes the cumulative sum in float64 before narrowing.
+    prefix = np.cumsum(alphas_np.astype(np.float64), axis=1)
+    rolled = np.roll(prefix, 1, axis=1)
+    rolled[:, 0] = 0.0
+    fire_idxs = (np.floor(prefix) - np.floor(rolled)) > 0
+    rem = fires_np - np.floor(fires_np)
+
+    for row in range(2):
+        times = list(np.flatnonzero(fire_idxs[row]))
+        assert times, "fixture must fire"
+        for j, t in enumerate(times):
+            prev = times[j - 1] if j else None
+            expected = prefix[row, t] - rem[row, t] * hidden_np[row, t]
+            if prev is not None:
+                expected -= prefix[row, prev]
+                expected += rem[row, prev] * hidden_np[row, prev]
+            assert got[row, j] == pytest.approx(float(expected), rel=1e-5, abs=1e-6)
+
+
+def test_cif_v1_is_bit_identical_across_repeated_calls():
+    """A cold first call must not differ from later ones.
+
+    The fire ordering comes from an argsort; keying every non-fire slot with a
+    single sentinel left the tail of the permutation backend- and
+    compilation-dependent.  The sort key is now tie-free, so repeated calls --
+    and per-utterance calls -- must agree exactly.
+    """
+    hidden = mx.arange(2 * 6 * 3, dtype=mx.float32).reshape(2, 6, 3) / 7.0
+    alphas = mx.broadcast_to(mx.array([[0.5, 0.25, 0.5, 0.25, 0.5, 0.125]], mx.float32), (2, 6))
+    first_frames, first_fires = cif_v1(hidden, alphas, 1.0)
+    mx.eval(first_frames, first_fires)
+    for _ in range(5):
+        frames, fires = cif_v1(hidden, alphas, 1.0)
+        mx.eval(frames, fires)
+        assert mx.array_equal(frames, first_frames).item()
+        assert mx.array_equal(fires, first_fires).item()
 
 
 def test_cif_v1_preserves_source_fire_ordering_in_a_batch():

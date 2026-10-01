@@ -484,20 +484,22 @@ def cif_v1(hidden: mx.array, alphas: mx.array, threshold: float = 1.0):
     max_label_len = max(max_label_len, 1)
     max_label_len = min(max_label_len, t)
 
-    # rank[b, time] = index of this fire inside its own utterance.
+    # ``time_of_rank[b, j]`` = time of the j-th fire of utterance b.
+    # The sort key is **tie-free**: fires carry 0..batch_len-1 and non-fires carry
+    # t..2t-1, so the resulting order never depends on sort stability.  Keying all
+    # non-fires with a single sentinel value left the tail of the permutation
+    # backend-dependent, which is a needless nondeterminism source.
     rank = mx.cumsum(fire_idxs.astype(mx.int32), axis=1) - 1
-    # Sorting ``rank`` (non-fires pushed behind with a large sentinel) inverts
-    # the map, giving ``time_of_rank[b, j]`` = time of the j-th fire of batch b.
-    big = mx.array(t, mx.int32)
-    time_of_rank = mx.argsort(mx.where(fire_idxs, rank, big), axis=1)  # (B, T)
-    # The gather below flattens the batch into one axis, so each row needs its
-    # own ``b * T`` offset.  The reference does the same thing with
+    filler = t + mx.arange(t, dtype=mx.int32)[None, :]
+    time_of_rank = mx.argsort(mx.where(fire_idxs, rank, filler), axis=1)  # (B, T)
+    # The gather flattens the batch onto one axis, so each row needs its own
+    # ``b * T`` offset.  The reference does the same thing with
     # ``batch_indexes = arange(B).unsqueeze(-1) * len_time`` added to
     # ``frame_idxs`` before flattening; without it every row re-reads row 0.
     offsets = (mx.arange(b, dtype=mx.int32) * t)[:, None]  # (B, 1)
     flat_time = mx.reshape(time_of_rank.astype(mx.int32) + offsets, (b * t,))
 
-    def _reorder(array: mx.array) -> mx.array:
+    def _gather(array: mx.array) -> mx.array:
         """Gather rows of ``array`` along the time axis in fire order.
 
         ``mx.take`` **flattens its input when ``axis`` is omitted** ("If the axis
@@ -512,33 +514,28 @@ def cif_v1(hidden: mx.array, alphas: mx.array, threshold: float = 1.0):
 
     prefix_sum_hidden = mx.cumsum(mx.expand_dims(alphas, -1) * hidden, axis=1)
 
-    # Slice to ``max_label_len`` *before* building the "previous" tensors so the
-    # shift stays inside the emitted-token window.
-    cur_p = _reorder(prefix_sum_hidden)[:, :max_label_len]
-    cur_h = _reorder(hidden)[:, :max_label_len]
-    cur_f = _reorder(fires)[:, :max_label_len]
-    cur_rem = cur_f - mx.floor(cur_f)
+    # One boundary per fire, then subtract the previous one.
+    #
+    #   boundary[j] = P[t_j] - rem[t_j] * h[t_j]
+    #   frames[j]   = boundary[j] - boundary[j-1]          (boundary[-1] = 0)
+    #
+    # Expanding the second line gives exactly the reference expression
+    #   P[t_j] - P[t_{j-1}] + rem[t_{j-1}] * h[t_{j-1}] - rem[t_j] * h[t_j]
+    # with ``rem[t] = fires[t] - floor(fires[t])`` and every previous term zero at
+    # j = 0.  That is the same algebra the reference reaches by rolling the
+    # gathered frames by one and zeroing the first entry of each batch
+    # (``cif_predictor.py:881-895``); this form needs a single gather per operand
+    # instead of two, and builds no separate "previous" tensors and no
+    # first-position ``where`` masks.
+    cur_p = _gather(prefix_sum_hidden)[:, :max_label_len]
+    cur_h = _gather(hidden)[:, :max_label_len]
+    cur_f = _gather(fires)[:, :max_label_len]
+    boundary = cur_p - mx.expand_dims(cur_f - mx.floor(cur_f), -1) * cur_h
 
-    prev_p = _reorder(prefix_sum_hidden)[:, :max_label_len]
-    prev_h = _reorder(hidden)[:, :max_label_len]
-    prev_f = _reorder(fires)[:, :max_label_len]
-    prev_rem = prev_f - mx.floor(prev_f)
-    prev_p = mx.concatenate([mx.zeros((b, 1, d), prev_p.dtype), prev_p[:, :-1]], axis=1)
-    prev_h = mx.concatenate([mx.zeros((b, 1, d), prev_h.dtype), prev_h[:, :-1]], axis=1)
-    prev_rem = mx.concatenate([mx.zeros((b, 1), prev_rem.dtype), prev_rem[:, :-1]], axis=1)
+    previous = mx.concatenate([mx.zeros((b, 1, d), boundary.dtype), boundary[:, :-1]], axis=1)
+    frames = boundary - previous
 
-    # The first fire of an utterance has no predecessor: zero it out.
-    positions = mx.arange(max_label_len, dtype=mx.int32)
-    is_first = (positions == 0)[None, :, None]
-    prev_p = mx.where(is_first, mx.array(0.0, prev_p.dtype), prev_p)
-    prev_h = mx.where(is_first, mx.array(0.0, prev_h.dtype), prev_h)
-    prev_rem = mx.where(positions[None, :] == 0, mx.array(0.0, prev_rem.dtype), prev_rem)
-
-    frames = (
-        cur_p - prev_p + mx.expand_dims(prev_rem, -1) * prev_h - mx.expand_dims(cur_rem, -1) * cur_h
-    )
-
-    valid = positions[None, :] < batch_len[:, None]
+    valid = mx.arange(max_label_len, dtype=mx.int32)[None, :] < batch_len[:, None]
     frames = mx.where(mx.expand_dims(valid, -1), frames, mx.array(0.0, frames.dtype))
     return frames, fires
 
