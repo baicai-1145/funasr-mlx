@@ -8,7 +8,9 @@ real-checkpoint acceptance, and there is no tokenizer and no transcription here.
 
 from __future__ import annotations
 
+import ast
 import math
+from pathlib import Path
 
 import pytest
 
@@ -119,6 +121,97 @@ def test_decoder_causal_mask_is_lower_triangular_neg_inf():
     # The mask is NOT a checkpoint parameter: torch registers it persistent=False.
     assert "decoder.mask" not in flatten_state_dict(decoder)
     assert "decoder._mask" not in flatten_state_dict(decoder)
+
+
+def _module_path(dotted: str):
+    """Resolve ``funasr_mlx.a.b`` to its file, or None."""
+    root = Path(__file__).resolve().parents[1] / "src" / "funasr_mlx"
+    candidate = root.joinpath(*dotted.split(".")[1:])
+    if candidate.with_suffix(".py").exists():
+        return candidate.with_suffix(".py")
+    if (candidate / "__init__.py").exists():
+        return candidate / "__init__.py"
+    return None
+
+
+def _module_level_names(path: Path) -> set[str]:
+    """Names a module defines at top level, without importing it."""
+    names: set[str] = set()
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(a.asname or a.name.split(".")[0] for a in node.names)
+    return names
+
+
+def test_every_model_symbol_imported_by_the_test_suite_exists():
+    """Guard the whole suite against unresolvable imports.
+
+    A missing symbol aborts collection for the entire file rather than failing
+    one test, and that has now happened twice (a ``flatten_state_dict_with_rules``
+    imported from this module before it was defined, and the same name missing
+    from CAM++ earlier). A single unresolvable import takes down the whole
+    guarded run, so it is worth pinning statically.
+
+    Pure ``ast``: no model module is imported and nothing is executed, so this
+    costs no memory and needs no device.
+    """
+    tests_dir = Path(__file__).resolve().parent
+    models_dir = Path(__file__).resolve().parents[1] / "src" / "funasr_mlx" / "models"
+    cache: dict[Path, set[str]] = {}
+    problems: list[str] = []
+    checked = 0
+
+    for test_file in sorted(tests_dir.glob("test_*.py")):
+        tree = ast.parse(test_file.read_text())
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("funasr_mlx.models")
+            ):
+                continue
+            path = _module_path(node.module)
+            if path is None:
+                problems.append(f"{test_file.name}:{node.lineno} no module {node.module}")
+                continue
+            if path not in cache:
+                cache[path] = _module_level_names(path)
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                checked += 1
+                if alias.name in cache[path]:
+                    continue
+                # A submodule import from the package root is legitimate.
+                if path.name == "__init__.py" and (models_dir / f"{alias.name}.py").exists():
+                    continue
+                problems.append(
+                    f"{test_file.name}:{node.lineno} {node.module}.{alias.name} is not defined"
+                )
+
+    assert problems == [], "unresolvable imports: " + "; ".join(problems)
+    assert checked > 0, "the audit found no imports, so it is not actually checking"
+
+
+def test_flatten_state_dict_with_rules_returns_the_same_maps_as_the_report():
+    """The tuple form must be the report's own dictionaries, not copies.
+
+    Delegating to :func:`flatten_state_dict` means one walk and one set of
+    dictionaries, so the two views cannot disagree about a rule.
+    """
+    model = _whisper()
+    report = flatten_state_dict(model)
+    tensors, rules = flatten_state_dict_with_rules(model)
+    assert tensors == report.tensors
+    assert rules == report.rules
+    assert set(tensors) == set(rules)
+    assert tensors, "the fixture must expose some parameters"
 
 
 def test_no_one_dimensional_tensor_carries_a_conv_layout_rule():
