@@ -68,6 +68,22 @@ def _infer(args):
         return {"text": result.text, "punctuation_ids": result.punc_array}
     if args.audio is None:
         raise ValueError("Audio models require --audio")
+    if args.model == "emotion2vec":
+        from .models.emotion2vec import preprocess_waveform
+
+        labels = model.config.labels
+        if not labels or all(label.startswith("unuse") for label in labels):
+            raise ValueError("emotion2vec inference needs the checkpoint's exact labels")
+        samples = read_audio(args.audio, max_seconds=min(30.0, model.config.max_samples / 16000))
+        waveform = preprocess_waveform(mx.array(samples), normalize=model.config.normalize)
+        result = model.emotion_scores(waveform)
+        mx.eval(result.feats)
+        return {
+            "key": args.audio.stem,
+            "labels": list(result.labels),
+            "scores": list(result.scores),
+            "embedding": result.feats.tolist(),
+        }
     samples = read_audio(args.audio)
     if args.model == "whisper":
         if args.prompt_tokens is None:
@@ -80,7 +96,7 @@ def _infer(args):
         mel = whisper_log_mel(
             samples, n_mels=model.dims.n_mels, pad_to_samples=2 * model.dims.n_audio_ctx * 160
         )
-        audio = model.embed_audio(mel[None])
+        audio = model.embed_audio(mx.swapaxes(mel, 0, 1)[None])
         mx.eval(audio)
         result = greedy_decode(
             model,
@@ -89,8 +105,6 @@ def _infer(args):
             GreedyDecodeConfig(eot_token_id=args.eot_token, max_tokens=args.max_tokens),
         )
         return {"token_ids": result.tokens, "average_logprobs": result.avg_logprobs}
-    if args.model == "emotion2vec":
-        raise NotImplementedError("emotion2vec high-level inference is not validated yet")
     defaults = {"sensevoice": (7, 6), "paraformer": (7, 6), "fsmn-vad": (5, 1), "campplus": (1, 1)}
     m, n = defaults[args.model]
     options = dict(config.get("frontend_conf") or {})
@@ -117,8 +131,18 @@ def _infer(args):
         mx.eval(embedding)
         return {"embedding": embedding.tolist()}
     cache = model.init_cache()
+    needed = (
+        features.shape[0] - 1
+    ) * model.vad_opts.frame_shift_length + model.vad_opts.frame_sample_length
+    if samples.size < needed:
+        raise ValueError("VAD feature frames exceed the supplied waveform")
+    # Snipped fbank frames do not consume a trailing incomplete frame.
     segments = model(
-        features[None], mx.array(samples)[None], cache, is_final=True, is_streaming_input=False
+        features[None],
+        mx.array(samples[:needed])[None],
+        cache,
+        is_final=True,
+        is_streaming_input=False,
     )
     return {"segments_ms": segments}
 

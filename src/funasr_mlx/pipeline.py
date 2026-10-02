@@ -26,6 +26,8 @@ def read_config(path: str | Path) -> dict:
 def create_model(family: str, config: dict):
     if not guarded_child_active():
         raise RuntimeError("Model construction requires the guarded launcher")
+    if not isinstance(config, dict):
+        raise ValueError("Model configuration must be a mapping")
     if family == "sensevoice":
         module = importlib.import_module(".models.sensevoice", __package__)
         return module.SenseVoiceSmall(module.sensevoice_config_from_dict(config))
@@ -45,7 +47,15 @@ def create_model(family: str, config: dict):
         module = importlib.import_module(".models.whisper", __package__)
         return module.Whisper(module.whisper_config_from_dict(config).dims)
     if family == "emotion2vec":
-        raise NotImplementedError("emotion2vec factory awaits exact checkpoint/head validation")
+        module = importlib.import_module(".models.emotion2vec", __package__)
+        options = config.get("model_conf", config)
+        if not isinstance(options, dict):
+            raise ValueError("emotion2vec configuration must be a mapping")
+        try:
+            parsed = module.Emotion2VecConfig(**options)
+        except TypeError as error:
+            raise ValueError(f"Invalid emotion2vec configuration: {error}") from error
+        return module.Emotion2VecModel(parsed)
     raise ValueError(f"Unknown model family: {family}")
 
 

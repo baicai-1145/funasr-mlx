@@ -1,56 +1,49 @@
 # Development Progress
 
-This is an unfinished native MLX port. No model is certified against a real checkpoint or real audio yet.
+All seven native MLX prototypes are integrated into main. This is unfinished: no official checkpoint or real-audio acceptance has been completed.
 
-## Constraints
+## Boundaries
 
-- Work directory: /Users/baicai1145/repos/funasr-mlx. FunASR reference code is read-only.
-- Hard project ceiling: 10,000,000,000 bytes. Stop project jobs at 8 GB; default job budget 2 GB, minimum host available-memory reserve 3 GB.
-- Maximum two implementation agents; workers perform static checks only. Lead serializes all numerical verification through the canonical git-common-dir lock.
-- MLX set_memory_limit is a guideline, not a hardware-enforced cap. Admission, bounded input/shards and an external RSS watchdog are necessary.
-- No full model weights were downloaded or loaded during this stage. All numerical work so far uses tiny dimensions.
+- Work directory: /Users/baicai1145/repos/funasr-mlx. FunASR reference code remains read-only.
+- Hard project ceiling: 10,000,000,000 bytes; stop threshold 8 GB; default job budget 2 GB; host reserve 3 GB.
+- Maximum two implementation agents; workers are static-only, and the lead serializes numerical verification under the canonical git-common-dir lock.
+- MLX memory limits are guidelines. Bounded input/shards, admission and external RSS monitoring are required.
+- No full model weights downloaded or loaded; all model numerical work uses tiny dimensions.
 
-## Verified Infrastructure
+## Latest Verified Main
 
-64 tests passed in the fresh guarded core run: memory policies, authenticated inherited guard descriptor/nonce, lock contention, simulated watchdog/timeout, lazy imports, strict safetensors metadata, tiny mmap checkpoint conversion, CLI inspection, Kaldi fbank, LFR/CMVN and Whisper log-mel.
+Fresh guarded complete suite: **350 passed**, zero failures and skips, in 1.43 seconds. Report: .tmp/final-main-memory.json; JUnit: .tmp/final-main.xml.
 
-Numerical frontend evidence includes six exact torchaudio Kaldi cases (three window types, two edge modes), six exact FunASR LFR cases and two torch-STFT/librosa Slaney cases.
+Sampled child peak RSS: 318,111,744 bytes. Sampled project peak RSS: 1,115,897,856 bytes. Lowest available host memory: 6,449,119,232 bytes. No memory-policy violation. These measurements apply to synthetic tests, not real models.
 
-Latest core test process sampled peak RSS: 289,456,128 bytes. Project sampled peak: 1,554,792,448 bytes.
+Core infrastructure has 64 focused tests. Numerical frontend evidence includes six exact torchaudio Kaldi cases, six FunASR LFR cases, and two torch-STFT/librosa Slaney cases. Real watchdog and supervisor-exit probes verified owned-child termination and cleanup; simulated tests cover denial, timeout, ownership and both descriptor paths.
 
-A separate bounded watchdog probe allocated 64 MB under a 48 MB process policy. The child was terminated by SIGTERM in approximately 0.15 seconds; sampled child RSS was 87,506,944 bytes. This verifies stop behavior, not a guarantee for arbitrary unbounded allocations.
+## Integrated Models
 
-Supervisor liveness is protected by a parent-only write pipe. A real bounded probe killed its own supervisor and verified that the orphan child stopped. Shard headroom, guarded model construction, explicit CMVN disable, relative CMVN paths and both pipe-descriptor cleanup paths have regression coverage.
-
-## Model Work
-
-All seven first implementations are committed in isolated worktrees, not yet integrated into main.
-
-| Model | Current Verification State |
+| Model | Evidence And Limitations |
 | --- | --- |
-| SenseVoiceSmall | Architecture and strict-loader regressions iterated; real checkpoint/audio untested |
-| Paraformer | SANM exact-source attention cases pass; CIF GPU mismatch remains open |
-| ct-punc | All tiny regressions and actual PyTorch convolution tap goldens pass; real checkpoint untested |
-| fsmn-vad | All tiny regressions and exact PyTorch source/cache goldens pass; real checkpoint untested |
-| CAM++ | Runtime fixes committed; test import corrected; fresh suite/source parity pending |
-| Whisper | Corrected to canonical OpenAI Whisper v20250625, not the SenseVoice fork; numerical parity pending |
-| emotion2vec+large | Official/fairseq architecture and classifier sources located; checkpoint namespace/API/SamePad issues being repaired |
+| SenseVoiceSmall | Architecture, strict loader, source SANM attention and synthetic audio CLI |
+| Paraformer | Exact-source attention/CIF, strict loader and synthetic CLI; CPU CIF default |
+| ct-punc | All tiny regressions, actual PyTorch convolution taps and local text CLI |
+| fsmn-vad | All tiny regressions, exact source/cache and local audio CLI |
+| CAM++ | Architecture/layout regressions, all-parameter native loading and embedding CLI |
+| Whisper | Canonical OpenAI v20250625 full forward and weight transfer for B=1/B=2; raw greedy IDs only |
+| emotion2vec+large | Official fairseq CNN and positional construction goldens, strict namespace and synthetic head CLI |
 
-CIF defaults to an entirely MLX CPU computation with float64 alpha accumulation, matching the exact reference. Six small ASR source differential cases pass. The installed Metal execution path remains unverified after reproducible corruption; no warmup workaround or GPU-correctness claim is accepted.
+CPU CIF encloses the entire private mathematical subtree in one MLX CPU stream and evaluates its result before returning. Alpha accumulation uses float64 then narrows to float32 exactly as the reference. The installed Metal path remains unverified after reproducible corruption; no warmup workaround or GPU correctness claim is accepted.
 
-## Team And Artifacts
+Twenty-one integration tests create bounded synthetic checkpoints, load every actual native parameter through the public factory/loader, and exercise all seven CLI workflows. They also reject family/shape mismatches. Integration fixed CAM++ string-key container access, Whisper mel layout, VAD snipped-frame tail alignment and duplicate emotion batch axes. The emotion factory accepts its validated dataclass schema and requires exact labels for scoring. Edge cases explicitly reject unknown configuration keys and overlong input without silent truncation. A default LFR-width-five/stride-one VAD test verifies unchanged temporal cadence.
 
-Herdr team: pm4f14. Reports: /Users/baicai1145/repos/funasr/.pi/herdr-team/pm4f14/reports.
+## Integration Record
 
-- asr worktree: /Users/baicai1145/repos/funasr/.pi/herdr-team/pm4f14/worktrees/asr. Current tasks: task-19 CIF gather repair (after task-18 CAM API + emotion review).
-- speech-utils worktree: /Users/baicai1145/repos/funasr/.pi/herdr-team/pm4f14/worktrees/speech-utils. Current task: task-20 emotion checkpoint/review repairs.
-- Latest relevant ASR commits: 73512f2 canonical Whisper, 733ba39 CIF algebra, 03b308a CAM checkpoint-rule API.
-- Latest relevant utilities commit: 63ba959 emotion API/SamePad/utility fixtures (needs further review repairs).
+- Core infrastructure commit: d734024.
+- ASR branch integrated through e7b3155 after 136 focused/source tests passed.
+- Utility branch integrated through 406916c after 129 focused/source tests passed.
+- Independent static cross-reviews: Herdr tasks 35 and 36. Final core/CLI integration review: task 38. Its configuration-error consistency finding was addressed; claims that admission must truncate and LFR width equals stride were rejected against explicit policy/source formulas and new regression evidence.
+- Team: pm4f14. Reports: /Users/baicai1145/repos/funasr/.pi/herdr-team/pm4f14/reports.
 
-Guarded launcher: PYTHONPATH=src python3 -m funasr_mlx.runtime --root . --report .tmp/check.json -- python3 -m pytest tests/... -q --tb=short --basetemp=.tmp/pytest-check.
-
-Unmerged worktree verification uses .tmp/verify_worktree.py. Small source references are in .tmp/emotion2vec-reference and .tmp/openai-whisper-model.py. Exact-source differential tests are in tests/test_reference_parity.py. The standalone cold GPU/CPU reproduction is .tmp/cif_probe.py. Reports and JUnit XML are under .tmp/.
+Differential tests: tests/test_reference_parity.py, tests/test_model_reference.py and tests/test_emotion_reference.py. Small pinned references are under .tmp/emotion2vec-reference and .tmp/openai-whisper-model.py. The cold CPU/Metal diagnostic is .tmp/cif_probe.py. All temporary artifacts and reports remain under .tmp/.
 
 ## Remaining Acceptance
 
-Independent reviews, numerical parity, strict real-checkpoint conversion/loading, tokenizer/labels and audio workflows, real-audio regression, quantization quality, then measured latency/RTF and peak memory. Tiny architecture tests do not establish production support or fastest/lowest-memory claims.
+Official checkpoint conversion/loading for every model, canonical tokenizer and label assets, full-model real-audio accuracy, streaming workflow acceptance, quantization quality, then measured steady-state latency, real-time factor and memory. CAM++ full-source model parity and emotion full-encoder parity remain broader checks than the validated components. Small tests do not establish production support, fastest inference or lowest memory.

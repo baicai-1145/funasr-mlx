@@ -192,7 +192,9 @@ class NamedLayerList(mxnn.Module):
         for name in self._names:
             yield getattr(self, name)
 
-    def __getitem__(self, index: int) -> mxnn.Module:
+    def __getitem__(self, index: int | str) -> mxnn.Module:
+        if isinstance(index, str):
+            return dict.__getitem__(self, index)
         return getattr(self, self._names[index])
 
     def __call__(self, x: mx.array) -> mx.array:
