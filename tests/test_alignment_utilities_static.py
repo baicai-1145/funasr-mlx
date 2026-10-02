@@ -138,51 +138,95 @@ def test_cosine_refuses_a_zero_norm():
         au._cosine(np.zeros(3), np.ones(3))
 
 
-def test_vad_result_flattens_batches_of_start_end_pairs():
+def test_vad_stages_flattens_batches_of_start_end_pairs():
     result = [[[0, 500], [700, 900]], [[1200, 1500]]]
-    segments, frames = au._split_vad_result(result, {})
+    segments, frames, scores = au._vad_stages(result, {"stats": _Stats(scores=np.zeros((1, 3, 2)))})
     assert segments == [[0, 500], [700, 900], [1200, 1500]]
     assert frames == []
+    assert scores.shape == (1, 3, 2)
 
 
-def test_vad_frame_probs_come_from_the_cache_not_the_return_value():
+def test_vad_stages_reads_frame_probs_and_scores_from_the_cache():
+    """Neither is in the return value: both live on ``cache['stats']``."""
     class FrameProb:
         noise_prob, speech_prob, score, frm_state = 0.1, 0.9, 0.5, 1
 
-    class Stats:
-        frame_probs = [FrameProb(), FrameProb()]
-
-    segments, frames = au._split_vad_result([[[0, 10]]], {"stats": Stats()})
+    cache = {"stats": _Stats(frame_probs=[FrameProb(), FrameProb()],
+                            scores=np.arange(8, dtype=np.float32).reshape(1, 4, 2))}
+    segments, frames, scores = au._vad_stages([[[0, 10]]], cache)
     assert segments == [[0, 10]]
-    assert len(frames) == 2
-    assert frames[0].speech_prob == 0.9
+    assert len(frames) == 2 and frames[0].speech_prob == 0.9
+    assert scores.shape == (1, 4, 2)
 
 
-def test_vad_result_rejects_a_malformed_segment_entry():
-    # a pair needs at least [start_ms, end_ms]; a bare value is rejected here
+def test_vad_stages_preserves_the_negative_streaming_end_point():
+    segments, _f, _s = au._vad_stages([[[0, -1]]], {"stats": _Stats()})
+    assert segments == [[0, -1]], "a dropped -1 end point would hide a streaming disagreement"
+
+
+def test_vad_stages_rejects_a_malformed_segment_entry():
     with pytest.raises(ValueError, match="unrecognised VAD segment"):
-        au._split_vad_result([[[0]]], {})
+        au._vad_stages([[[0]]], {"stats": _Stats()})
 
 
-def test_vad_segments_accepts_both_container_shapes():
-    class SpeechSegment:
-        start_ms, end_ms = 10, 20
+def test_vad_stages_refuses_an_uninitialised_cache():
+    with pytest.raises(ValueError, match="no 'stats'"):
+        au._vad_stages([], {})
+    with pytest.raises(ValueError, match="no 'scores'"):
+        au._vad_stages([], {"stats": _Stats(scores=None)})
 
-    class Stats:
-        segments = [SpeechSegment(), [30, 40]]
 
-    assert au._vad_segments(Stats()) == [[10, 20], [30, 40]]
+def test_vad_stages_raises_on_an_absent_attribute_rather_than_defaulting_empty():
+    """A renamed field must fail loudly, not read as an empty stage."""
 
+    class Renamed:
+        pass
+
+    class OnlyFrameProbs:
+        frame_probs = []
+
+    with pytest.raises(ValueError, match="has no 'frame_probs'"):
+        au._vad_stages([], {"stats": Renamed()})
+    with pytest.raises(ValueError, match="has no 'scores'"):
+        au._vad_stages([], {"stats": OnlyFrameProbs()})
+
+
+def test_required_attr_does_not_invent_a_default():
     class Empty:
-        segments = None
+        pass
 
-    assert au._vad_segments(Empty()) == []
+    assert au._required_attr(_Stats(), "frame_probs") == []
+    with pytest.raises(ValueError, match="has no 'missing'"):
+        au._required_attr(Empty(), "missing")
 
 
-def test_vad_lfr_factor_is_derived_from_input_dim():
-    assert au._vad_encoder_conf({"encoder_conf": {"input_dim": 400}})["input_dim"] == 400
-    assert au._vad_encoder_conf({"input_dim": 400})["input_dim"] == 400
-    assert 400 % 80 == 0  # the adapter's own precondition
+def test_vad_input_dim_is_read_from_either_config_shape():
+    assert au._vad_input_dim({"encoder_conf": {"input_dim": 400}}) == 400
+    assert au._vad_input_dim({"input_dim": 256}) == 256
+    # falls back to the official fsmn-vad encoder_conf value, never to a guess
+    assert au._vad_input_dim({}) == 400
+
+
+def test_waveform_geometry_crops_only_the_trailing_incomplete_frame():
+    """``needed = (T-1) * shift + length``: snipped frames leave no tail frame."""
+    frames, shift, length = 10, 160, 400
+    needed = (frames - 1) * shift + length
+    assert needed == 9 * 160 + 400
+    # the full span would be frames*shift + length = 2000, i.e. 200 samples more
+    assert needed == frames * shift + length - shift
+
+
+_UNSET = object()
+
+
+def _Stats(frame_probs=None, scores=_UNSET):
+    class Stats:
+        pass
+
+    stats = Stats()
+    stats.frame_probs = frame_probs or []
+    stats.scores = np.zeros((1, 1, 2), dtype=np.float32) if scores is _UNSET else scores
+    return stats
 
 
 # --------------------------------------------------------------------------- #

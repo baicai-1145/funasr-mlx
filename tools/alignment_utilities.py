@@ -47,19 +47,32 @@ the family.
 
 Assets
 ------
-A JSON object of filesystem paths supplied by the lead.
+A JSON object of filesystem paths supplied by the lead.  Nothing is downloaded
+and no model is fetched implicitly: every path must already exist on disk, and a
+missing one is a hard error.
 
 ``model_dir``
-    A local FunASR model directory (``config.yaml`` plus the weights file).
-    Required for ``--mode reference``: ``AutoModel`` expects the standard
-    directory layout and copying weights around to fake one would be worse than
-    asking for it.
+    The **original** FunASR model directory (``config.yaml`` plus the ``.pt``
+    weights), used only by ``--mode reference``.  ``AutoModel`` expects the
+    standard directory layout; synthesising one by copying weights would be
+    worse than asking for it.
+``checkpoint``
+    The **converted native** checkpoint (safetensors) consumed by
+    ``funasr_mlx.pipeline.load_model``, used only by ``--mode native``.  This is
+    a different artefact from ``model_dir``, not an alias for it.
+``config``
+    Optional per-family native config path for ``load_model``; when absent the
+    checkpoint's own config is used.
 ``labels``
     Label list, one per line, read verbatim and in order (emotion2vec).
 ``tokens``
     ct-punc character vocabulary, only needed by the native side.
 ``speaker_a`` / ``speaker_b``
     Two utterances for a campplus cosine pair.
+``frontend_conf``
+    Optional per-family frontend overrides.  FSMN-VAD needs the LFR stack
+    factors; they default to the official ``(lfr_m=5, lfr_n=1)`` over an 80-bin
+    mel, derived from ``input_dim`` where the config exposes it.
 """
 from __future__ import annotations
 
@@ -203,38 +216,54 @@ def run_fsmn_vad_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
         feats, waveform, cache=cache, is_final=True, is_streaming_input=False,
         output_frame_probs=True,
     )
-    segments, frame_probs = _split_vad_result(result, cache)
+    segments, frame_probs, scores = _vad_stages(result, cache)
 
     _write_npz(out_dir, entry["key"], "reference", {
+        # raw encoder posterior -- the numeric stage the two sides can actually
+        # be compared on, ahead of any thresholded state
+        "scores": _numpy(scores).reshape(-1, _numpy(scores).shape[-1]).astype(np.float32),
         "frame_prob": np.asarray(
             [[p.noise_prob, p.speech_prob, p.score] for p in frame_probs],
             dtype=np.float32,
         ).reshape(-1, 3),
         "frame_state": np.asarray([p.frm_state for p in frame_probs], dtype=np.int32),
-        "segment_bounds": np.asarray(
-            [[s.start_ms, s.end_ms] for s in segments], dtype=np.int32
-        ).reshape(-1, 2),
+        "segment_bounds": np.asarray(segments, dtype=np.int32).reshape(-1, 2),
     })
     _write_json(out_dir, entry["key"], "reference", {
         "family": "fsmn-vad",
         "segments_ms": [[int(pair[0]), int(pair[1])] for pair in segments],
-        "n_frames": len(frame_probs),
+        "n_frames": int(_numpy(scores).reshape(-1, _numpy(scores).shape[-1]).shape[0]),
+        "n_frame_probs": len(frame_probs),
         "duration_seconds": samples.size / SAMPLE_RATE,
         "frontend": type(frontend).__name__,
     })
 
 
-def _split_vad_result(result: Any, cache: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
-    """Flatten the reference's segments and lift its frame probs out of the cache.
+def _numpy(value: Any) -> Any:
+    """Detach either a torch tensor or an MLX array to numpy."""
+    import numpy as np
 
-    Two facts about ``FsmnVADStreaming.forward`` that are easy to get wrong and
-    are **not** visible from its signature:
+    if hasattr(value, "detach"):  # torch
+        return value.detach().to("cpu").numpy()
+    return np.asarray(value)
 
-    * it returns ``segments`` as ``list[list[list[int]]]`` -- a *batch* of
-      ``[start_ms, end_ms]`` pairs per call -- not speech-segment objects;
-    * it never returns the frame probs.  ``output_frame_probs=True`` makes it
-      append ``E2EVadFrameProb`` objects to ``cache["stats"].frame_probs``, so
-      that is where they have to be read from.
+
+def _vad_stages(result: Any, cache: Mapping[str, Any]) -> tuple[list[Any], list[Any], Any]:
+    """``(segments, frame_probs, raw_scores)`` from a VAD forward result.
+
+    Three facts about the FSMN-VAD forward that are not visible from its
+    signature, all confirmed by reading the body rather than guessing:
+
+    * it returns ``list[list[list[int]]]`` -- a *batch* of ``[start_ms, end_ms]``
+      pairs per call -- so the caller must flatten it;
+    * it **never returns** frame probabilities.  ``output_frame_probs=True`` makes
+      it append ``E2EVadFrameProb`` objects to ``cache["stats"].frame_probs``;
+    * the raw encoder posterior is accumulated onto ``cache["stats"].scores``
+      across chunks.  That is the meaningful numeric stage to compare, because
+      ``frame_probs`` are already thresholded into states.
+
+    ``-1`` end points (``[start, -1]``) are preserved as the reference emits
+    them; a comparator that drops them would hide a streaming disagreement.
     """
     segments: list[Any] = []
     for batch in result or []:
@@ -243,19 +272,43 @@ def _split_vad_result(result: Any, cache: Mapping[str, Any]) -> tuple[list[Any],
                 raise ValueError(f"unrecognised VAD segment entry: {pair!r}")
             segments.append([int(pair[0]), int(pair[1])])
     stats = cache.get("stats")
-    frame_probs = list(getattr(stats, "frame_probs", None) or []) if stats else []
-    return segments, frame_probs
+    if stats is None:
+        raise ValueError("VAD cache has no 'stats'; init_cache() was not run")
+    # Both attributes are verified on the reference ``Stats`` and the native
+    # ``VadStats``.  They are read strictly: a missing one is a wiring error and
+    # silently yielding an empty list would turn it into a fake agreement.
+    frame_probs = _required_attr(stats, "frame_probs")
+    scores = _required_attr(stats, "scores")
+    if scores is None:
+        raise ValueError("VAD stats carry no 'scores'; the encoder did not run")
+    return segments, list(frame_probs), scores
+
+
+def _required_attr(obj: Any, name: str) -> Any:
+    """``getattr`` that refuses to invent a default."""
+    if not hasattr(obj, name):
+        raise ValueError(
+            f"{type(obj).__name__} has no {name!r}; read the source rather than "
+            "guessing a container name"
+        )
+    return getattr(obj, name)
 
 
 def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
                         out_dir: Path) -> None:
     """Native ``funasr_mlx.models.fsmn_vad.FsmnVadModel`` forward.
 
-    FSMN-VAD consumes **LFR-stacked** fbank: the official ``encoder_conf`` has
-    ``input_dim: 400`` against an 80-bin mel, i.e. ``lfr_m = 5``.  That factor is
-    read back out of ``input_dim`` rather than assumed, because a wrong stack
-    factor changes the encoder input width and would fail deep inside the model
-    instead of here.
+    Input geometry follows ``funasr_mlx/cli.py`` exactly:
+
+    * features are ``(1, T, input_dim)`` and the waveform is **not** the whole
+      signal -- it is the ``(1, needed)`` span those ``T`` snipped frames cover,
+      ``needed = (T - 1) * frame_shift_length + frame_sample_length``.  Snipped
+      fbank frames do not consume a trailing incomplete frame, so passing the
+      full waveform would hand the decibel/SNR bookkeeping a span the features do
+      not describe.
+    * FSMN-VAD consumes **LFR-stacked** fbank: the official ``input_dim: 400``
+      over an 80-bin mel is ``lfr_m = 5``.  That factor is read back out of
+      ``input_dim`` rather than assumed.
     """
     import mlx.core as mx
     import numpy as np
@@ -268,34 +321,38 @@ def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     samples = np.asarray(read_audio(entry["audio"]), dtype=np.float32)
     _check_audio(entry, samples)
 
-    encoder_conf = _vad_encoder_conf(config)
-    input_dim = int(encoder_conf["input_dim"])
+    input_dim = _vad_input_dim(config)
     n_mels = 80
     if input_dim % n_mels:
         raise ValueError(
             f"input_dim {input_dim} is not a multiple of the {n_mels}-bin mel filterbank; "
             "the LFR stack factor cannot be derived"
         )
-    frontend = WavFrontend(FbankConfig(
-        fs=int(encoder_conf.get("sample_rate", SAMPLE_RATE)),
-        n_mels=n_mels,
-        lfr_m=input_dim // n_mels,
-        lfr_n=1,
-    ))
-    feats = frontend.fbank(samples)[None, ...]  # (1, T, input_dim)
+    options = dict((config or {}).get("frontend_conf") or {}) if isinstance(config, Mapping) else {}
+    options.pop("cmvn_file", None)
+    options.setdefault("lfr_m", input_dim // n_mels)
+    options.setdefault("lfr_n", 1)
+    features = WavFrontend(FbankConfig.from_dict(options))(samples)  # (T, input_dim)
+    if features.shape[0] == 0:
+        raise ValueError(f"{entry['key']}: frontend produced no frames")
+
+    needed = (
+        features.shape[0] - 1
+    ) * model.vad_opts.frame_shift_length + model.vad_opts.frame_sample_length
+    if samples.size < needed:
+        raise ValueError(f"{entry['key']}: VAD feature frames exceed the waveform")
+    waveform = mx.array(samples[:needed])[None, ...]  # (1, needed)
 
     cache = model.init_cache()
     result = model(
-        mx.array(feats), mx.array(samples), cache, is_final=True, is_streaming_input=False
+        features[None, ...], waveform, cache, is_final=True, is_streaming_input=False
     )
-    stats = result[0] if isinstance(result, (list, tuple)) else result
-    segments = list(_vad_segments(stats))
-    frame_probs = list(getattr(stats, "frame_probs", None) or [])
+    segments, frame_probs, scores = _vad_stages(result, cache)
+    posterior = np.asarray(scores).reshape(-1, np.asarray(scores).shape[-1])
 
     arrays: dict[str, Any] = {
-        "segment_bounds": np.asarray(
-            [[int(s[0]), int(s[1])] for s in segments], dtype=np.int32
-        ).reshape(-1, 2),
+        "scores": posterior.astype(np.float32),
+        "segment_bounds": np.asarray(segments, dtype=np.int32).reshape(-1, 2),
     }
     if frame_probs:
         arrays["frame_prob"] = np.asarray(
@@ -306,41 +363,24 @@ def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     _write_npz(out_dir, entry["key"], "native", arrays)
     _write_json(out_dir, entry["key"], "native", {
         "family": "fsmn-vad",
-        "segments_ms": [[int(s[0]), int(s[1])] for s in segments],
-        "n_frames": len(frame_probs),
+        "segments_ms": [[int(pair[0]), int(pair[1])] for pair in segments],
+        "n_frames": int(posterior.shape[0]),
+        "n_frame_probs": len(frame_probs),
         "duration_seconds": samples.size / SAMPLE_RATE,
         "lfr_m": input_dim // n_mels,
+        "waveform_samples": int(needed),
     })
 
 
-def _vad_encoder_conf(config: Any) -> Mapping[str, Any]:
-    """The FSMN ``encoder_conf`` mapping from whatever ``load_model`` returned."""
+def _vad_input_dim(config: Any) -> int:
+    """The FSMN encoder ``input_dim``, wherever ``load_model`` surfaced it."""
     if isinstance(config, Mapping):
-        merged = dict(config)
-        merged.update(config.get("encoder_conf") or {})
-        return merged
-    return {}
-
-
-def _vad_segments(stats: Any) -> list[Any]:
-    """Segment ``[start_ms, end_ms]`` pairs, tolerating either container shape.
-
-    The native model returns segments either as ``SpeechSegment`` dataclasses or
-    as plain ``[start, end]`` pairs depending on the call path, so both are
-    normalised here rather than assumed at the call site.
-    """
-    raw = getattr(stats, "segments", None)
-    if raw is None:
-        return []
-    out: list[Any] = []
-    for item in raw:
-        if hasattr(item, "start_ms"):
-            out.append([item.start_ms, item.end_ms])
-        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            out.append([item[0], item[1]])
-        else:
-            raise ValueError(f"unrecognised VAD segment entry: {item!r}")
-    return out
+        encoder_conf = config.get("encoder_conf") or {}
+        if isinstance(encoder_conf, Mapping) and "input_dim" in encoder_conf:
+            return int(encoder_conf["input_dim"])
+        if "input_dim" in config:
+            return int(config["input_dim"])
+    return 400  # the official fsmn-vad encoder_conf value
 
 
 # --------------------------------------------------------------------------- #
@@ -512,20 +552,20 @@ def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     samples = np.asarray(read_audio(utterance), dtype=np.float32)
     _check_audio(entry, samples)
 
-    # fbank() takes a rank-1 waveform and returns (T, n_mels); add the batch axis.
-    feats = frontend.fbank(samples)[None, ...]
-    feats = feats - mx.mean(feats, axis=1, keepdims=True)  # extract_feature parity
-    embedding = model.embed(feats)
+    # WavFrontend is callable and returns (T, n_mels); the reference's
+    # extract_feature subtracts the mean over the time axis.
+    features = frontend(samples)
+    features = features - mx.mean(features, axis=0, keepdims=True)
+    embedding = model(features[None, ...])
 
     arrays: dict[str, Any] = {
         "embedding": np.asarray(embedding[0]).astype(np.float32),
     }
     other = assets.get("speaker_b")
     if other:
-        other_samples = np.asarray(read_audio(str(other)), dtype=np.float32)
-        other_feats = frontend.fbank(other_samples)[None, ...]
-        other_feats = other_feats - mx.mean(other_feats, axis=1, keepdims=True)
-        second = model.embed(other_feats)
+        other_features = frontend(np.asarray(read_audio(str(other)), dtype=np.float32))
+        other_features = other_features - mx.mean(other_features, axis=0, keepdims=True)
+        second = model(other_features[None, ...])
         arrays["embedding_b"] = np.asarray(second[0]).astype(np.float32)
         arrays["cosine"] = np.asarray([_cosine(embedding[0], second[0])],
                                       dtype=np.float32)
