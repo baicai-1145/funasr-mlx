@@ -8,6 +8,7 @@ against PyTorch was executed.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 
 import mlx.core as mx
 import mlx.nn as mxnn
@@ -486,17 +487,48 @@ def _conv_parameter_keys(module, prefix: str = "") -> set[str]:
     converter, which then transposed it a second time.  ``nn.Module`` is a
     ``dict`` subclass and plain dicts are stored on modules too, so both are
     walked.
+
+    ``dict.keys`` is used rather than ``dict.items``: ``items`` yields
+    ``(key, value)`` **tuples**, and formatting one into an f-string produces a
+    stringified tuple instead of the leaf name, which yields a key set that
+    matches nothing.
     """
     keys: set[str] = set()
     for key, value in dict.items(module):
         name = f"{prefix}.{key}" if prefix else key
         if isinstance(value, mxnn.Module):
             if isinstance(value, mxnn.Conv1d):
-                keys.update(f"{name}.{leaf}" for leaf in dict.items(value))
+                keys.update(f"{name}.{leaf}" for leaf in dict.keys(value))
             keys |= _conv_parameter_keys(value, name)
         elif isinstance(value, dict):
             keys |= _conv_parameter_keys(value, name)
     return keys
+
+
+#: The conv paths the official ``audio.py`` builds, with the MLX shapes the
+#: tiny config produces.  Asserted directly so a walker that silently matches
+#: nothing (the tuple-key bug) fails here instead of only surfacing as a
+#: confusing conversion mismatch.
+EXPECTED_CONV_SHAPES: Mapping[str, tuple[int, ...]] = {
+    "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight": (8, 5, 1),
+    "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.bias": (8,),
+    "modality_encoders.AUDIO.relative_positional_encoder.1.0.weight": (16, 5, 4),
+    "modality_encoders.AUDIO.relative_positional_encoder.1.0.bias": (16,),
+    "modality_encoders.AUDIO.relative_positional_encoder.2.0.weight": (16, 5, 4),
+}
+
+
+def test_conv_parameter_walker_finds_every_official_conv_key():
+    model = Emotion2VecModel(tiny_config(vocab_size=5, labels=("a", "b", "c", "d", "e")))
+    found = _conv_parameter_keys(model)
+    names = flat_parameter_names(model)
+    for key, shape in EXPECTED_CONV_SHAPES.items():
+        assert key in found, key
+        assert names[key].shape == shape, key
+    # nothing that is not a conv weight may be swept in
+    assert found <= set(names)
+    assert "proj.weight" not in found
+    assert "modality_encoders.AUDIO.project_features.2.weight" not in found
 
 
 def _fake_pytorch_state(model: Emotion2VecModel) -> dict[str, mx.array]:
@@ -567,8 +599,11 @@ def test_conv_weights_are_transposed_back_from_the_pytorch_layout():
     assert converted[key].shape == (8, 5, 1)
     assert flat_parameter_names(model)[key].shape == (8, 5, 1)
     pos = "modality_encoders.AUDIO.relative_positional_encoder.1.0.weight"
-    assert state[pos].shape == (16, 4, 5)
-    assert converted[pos].shape == (16, 5, 4)
+    assert state[pos].shape == (16, 4, 5)  # torch (out, in//g, K)
+    assert converted[pos].shape == (16, 5, 4)  # MLX (out, K, in//g)
+    # round-trip: every conv weight must come back exactly
+    for name, value in flat_parameter_names(model).items():
+        assert converted[name].shape == value.shape, name
 
 
 def test_module_list_stack_indexes_by_position_and_by_string_key():
