@@ -93,11 +93,9 @@ def test_no_one_dimensional_tensor_carries_a_conv_layout_rule():
     the kernel rule and was then transposed with three axes -- a hard ValueError
     on every conv that has one, and ``mxnn.Conv1d`` defaults to ``bias=True``.
     """
-    report = flatten_state_dict_with_rules(_campplus())
+    tensors, rules = flatten_state_dict_with_rules(_campplus())
     offenders = [
-        name
-        for name, tensor in report.tensors.items()
-        if name.endswith("bias") and report.rules[name] != IDENTITY_LAYOUT
+        name for name in tensors if name.endswith("bias") and rules[name] != IDENTITY_LAYOUT
     ]
     assert offenders == [], f"conv biases must be IDENTITY, got {offenders}"
 

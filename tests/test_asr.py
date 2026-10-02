@@ -1326,7 +1326,9 @@ class _MixedConvHolder(mxnn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.conv1 = mxnn.Conv1d(3, 5, (3,), bias=True)
+        # mxnn.Conv1d takes a SCALAR kernel_size (convolution.py:39,
+        # ``kernel_size: int``); only Conv2d accepts a tuple.
+        self.conv1 = mxnn.Conv1d(3, 5, 3, bias=True)
         self.conv2 = mxnn.Conv2d(2, 4, (3, 5), bias=True)  # deliberately non-square
 
 
@@ -1362,9 +1364,9 @@ def test_conv_layout_rule_applies_to_the_weight_only(name, rule, torch_shape):
     1-D array with three axes -- a ValueError on every conv that has a bias,
     which is essentially every conv in a real checkpoint.
     """
-    report = flatten_state_dict_with_rules(_mixed_conv_holder())
-    assert report.rules[name] == rule
-    tensor = report.tensors[name]
+    tensors, rules = flatten_state_dict_with_rules(_mixed_conv_holder())
+    assert rules[name] == rule
+    tensor = tensors[name]
     assert tuple(tensor.shape) != tuple(torch_shape) or rule == IDENTITY_LAYOUT
 
 
@@ -1376,10 +1378,10 @@ def test_standalone_conv_weights_and_biases_round_trip_through_the_loader():
     -> torch state -> ``load_strict(convert=True)`` -> exact round trip.
     """
     source = _mixed_conv_holder()
-    report = flatten_state_dict_with_rules(source)
+    tensors, rules = flatten_state_dict_with_rules(source)
     torch_state = {}
-    for name, tensor in report.tensors.items():
-        rule = report.rules[name]
+    for name, tensor in tensors.items():
+        rule = rules[name]
         if rule == CONV1D_LAYOUT:
             torch_state[name] = mx.transpose(tensor, (0, 2, 1))
         elif rule == CONV2D_LAYOUT:
@@ -1396,7 +1398,7 @@ def test_standalone_conv_weights_and_biases_round_trip_through_the_loader():
     clone = _MixedConvHolder()
     load_strict(clone, torch_state, convert=True)
     restored = flatten_state_dict(clone)
-    for name, tensor in report.tensors.items():
+    for name, tensor in tensors.items():
         assert mx.array_equal(restored[name], tensor).item(), name
 
 

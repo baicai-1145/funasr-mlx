@@ -222,12 +222,8 @@ def test_no_one_dimensional_tensor_carries_a_conv_layout_rule():
     on every conv that has one, which is every conv in the published encoder
     (``nn.Conv1d`` defaults to ``bias=True``).
     """
-    report = flatten_state_dict_with_rules(_whisper())
-    biases = [
-        name
-        for name, tensor in report.tensors.items()
-        if name.endswith("bias") and report.rules[name] != IDENTITY_LAYOUT
-    ]
+    tensors, rules = flatten_state_dict_with_rules(_whisper())
+    biases = [name for name in tensors if name.endswith("bias") and rules[name] != IDENTITY_LAYOUT]
     assert biases == [], f"conv biases must be IDENTITY, got {biases}"
 
 
