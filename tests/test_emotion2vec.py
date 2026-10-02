@@ -8,7 +8,6 @@ against PyTorch was executed.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 
 import mlx.core as mx
 import mlx.nn as mxnn
@@ -505,26 +504,53 @@ def _conv_parameter_keys(module, prefix: str = "") -> set[str]:
     return keys
 
 
-#: The conv paths the official ``audio.py`` builds, with the MLX shapes the
-#: tiny config produces.  Asserted directly so a walker that silently matches
-#: nothing (the tuple-key bug) fails here instead of only surfacing as a
-#: confusing conversion mismatch.
-EXPECTED_CONV_SHAPES: Mapping[str, tuple[int, ...]] = {
-    "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight": (8, 5, 1),
-    "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.bias": (8,),
-    "modality_encoders.AUDIO.relative_positional_encoder.1.0.weight": (16, 5, 4),
-    "modality_encoders.AUDIO.relative_positional_encoder.1.0.bias": (16,),
-    "modality_encoders.AUDIO.relative_positional_encoder.2.0.weight": (16, 5, 4),
-}
+def positional_kernel(config: Emotion2VecConfig) -> int:
+    """``audio.py:87``: ``k = max(3, conv_pos_width // conv_pos_depth)``."""
+    return max(3, config.conv_pos_width // config.conv_pos_depth)
+
+
+def expected_conv_shapes(config: Emotion2VecConfig) -> dict[str, tuple[int, ...]]:
+    """The conv paths ``audio.py`` builds, with every extent derived from config.
+
+    Two asymmetries the official source imposes and a hand-written expectation
+    kept getting wrong:
+
+    * the feature CNN is built with ``bias=conv_bias`` (**False**), so
+      ``conv_layers.<i>.0.bias`` must be **absent** -- asserting it is present
+      fails; the positional conv uses ``bias=True``, so its bias exists;
+    * the positional kernel is ``max(3, conv_pos_width // conv_pos_depth)``, which
+      for the tiny config is ``max(3, 12 // 2) = 6``, not the feature CNN's 5.
+    """
+    first_out, first_kernel, _stride = parse_feature_encoder_spec(
+        config.feature_encoder_spec
+    )[0]
+    shapes: dict[str, tuple[int, ...]] = {
+        # feature CNN: conv_bias=False, so kernel only, and it is a depthwise conv
+        "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight": (
+            first_out, first_kernel, 1,
+        ),
+    }
+    kernel = positional_kernel(config)
+    channels = config.embed_dim // config.conv_pos_groups
+    for index in range(config.conv_pos_depth):
+        base = f"modality_encoders.AUDIO.relative_positional_encoder.{index + 1}.0"
+        shapes[f"{base}.weight"] = (config.embed_dim, kernel, channels)
+        shapes[f"{base}.bias"] = (config.embed_dim,)
+    return shapes
 
 
 def test_conv_parameter_walker_finds_every_official_conv_key():
-    model = Emotion2VecModel(tiny_config(vocab_size=5, labels=("a", "b", "c", "d", "e")))
+    config = tiny_config(vocab_size=5, labels=("a", "b", "c", "d", "e"))
+    model = Emotion2VecModel(config)
     found = _conv_parameter_keys(model)
     names = flat_parameter_names(model)
-    for key, shape in EXPECTED_CONV_SHAPES.items():
+    expected = expected_conv_shapes(config)
+    for key, shape in expected.items():
         assert key in found, key
         assert names[key].shape == shape, key
+    # the feature CNN has no bias (official conv_bias=False): it must be ABSENT
+    assert "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.bias" not in found
+    assert "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.bias" not in names
     # nothing that is not a conv weight may be swept in
     assert found <= set(names)
     assert "proj.weight" not in found
@@ -595,12 +621,15 @@ def test_conv_weights_are_transposed_back_from_the_pytorch_layout():
     assert state[key].shape == (8, 1, 5)
     converted, discarded = convert_checkpoint_tensors(state)
     assert discarded == ()
-    # after conversion the tensor is in MLX layout (out, K, in//g) = (8, 5, 1)
+    # after conversion the tensor is in MLX layout (out, K, in//g)
     assert converted[key].shape == (8, 5, 1)
     assert flat_parameter_names(model)[key].shape == (8, 5, 1)
+    # the positional kernel is max(3, conv_pos_width // conv_pos_depth), not 5
+    kernel = positional_kernel(tiny_config())
+    assert kernel == 6
     pos = "modality_encoders.AUDIO.relative_positional_encoder.1.0.weight"
-    assert state[pos].shape == (16, 4, 5)  # torch (out, in//g, K)
-    assert converted[pos].shape == (16, 5, 4)  # MLX (out, K, in//g)
+    assert state[pos].shape == (16, 4, kernel)  # torch (out, in//g, K)
+    assert converted[pos].shape == (16, kernel, 4)  # MLX (out, K, in//g)
     # round-trip: every conv weight must come back exactly
     for name, value in flat_parameter_names(model).items():
         assert converted[name].shape == value.shape, name
