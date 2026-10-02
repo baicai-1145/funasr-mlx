@@ -1348,7 +1348,7 @@ def _mixed_conv_holder():
 
 
 @pytest.mark.parametrize(
-    "name,rule,torch_shape",
+    "name,rule,expected_torch_shape",
     [
         ("conv1.weight", CONV1D_LAYOUT, (5, 3, 3)),
         ("conv1.bias", IDENTITY_LAYOUT, (5,)),
@@ -1356,18 +1356,39 @@ def _mixed_conv_holder():
         ("conv2.bias", IDENTITY_LAYOUT, (4,)),
     ],
 )
-def test_conv_layout_rule_applies_to_the_weight_only(name, rule, torch_shape):
-    """A conv's 1-D bias must be IDENTITY in both layouts.
+def test_conv_layout_rule_applies_to_the_weight_only(name, rule, expected_torch_shape):
+    """The rule follows the parameter NAME; a tensor's shape cannot decide it.
 
-    The rule follows the *owning module*, so before this was pinned the bias
-    inherited the kernel rule and ``load_strict(convert=True)`` transposed a
-    1-D array with three axes -- a ValueError on every conv that has a bias,
-    which is essentially every conv in a real checkpoint.
+    A conv's 1-D bias must be IDENTITY in both layouts -- before this was pinned
+    the bias inherited the kernel rule and ``load_strict(convert=True)``
+    transposed a 1-D array with three axes, a ValueError on every biased conv.
+
+    This previously asserted the torch shape *differs* from the native one, which
+    is unsound: ``conv1`` has ``in_channels == kernel_size == 3``, so both
+    layouts are ``(5, 3, 3)`` even though the axes are transposed. Shape
+    equality says nothing about layout identity. So this asserts the transformed
+    **contents** against an explicit axis permutation, using the deliberately
+    non-uniform values from :func:`_mixed_conv_holder`.
     """
     tensors, rules = flatten_state_dict_with_rules(_mixed_conv_holder())
     assert rules[name] == rule
-    tensor = tensors[name]
-    assert tuple(tensor.shape) != tuple(torch_shape) or rule == IDENTITY_LAYOUT
+
+    native = tensors[name]
+    converted = convert_checkpoint_tensor(name, native, rule)
+    assert tuple(converted.shape) == tuple(expected_torch_shape)
+
+    if rule == IDENTITY_LAYOUT:
+        assert mx.array_equal(converted, native).item()
+        return
+
+    order = (0, 2, 1) if rule == CONV1D_LAYOUT else (0, 3, 1, 2)
+    assert mx.array_equal(converted, mx.transpose(native, order)).item()
+    # Non-identity, demonstrated rather than assumed.
+    assert not mx.array_equal(converted, native).item()
+    if rule == CONV1D_LAYOUT:
+        # The case that broke the old assertion: identical shape on both sides
+        # and still a genuine transpose.
+        assert tuple(converted.shape) == tuple(native.shape)
 
 
 def test_standalone_conv_weights_and_biases_round_trip_through_the_loader():

@@ -127,6 +127,36 @@ def test_decoder_causal_mask_is_lower_triangular_neg_inf():
     assert "decoder._mask" not in flatten_state_dict(_whisper())
 
 
+class _UnrelatedHolder(mxnn.Module):
+    """Neither a ``TextDecoder`` nor a ``Whisper``, but with similar names."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._mask = mx.arange(4, dtype=mx.float32)
+        self.trainable_mask = mx.ones((4, 4), mx.float32)
+
+
+def test_only_the_named_owner_excludes_the_mask_buffer():
+    """The exclusion is owner + key, so an unrelated ``_mask`` is still a weight.
+
+    Matching the leaf name alone would silently drop a real parameter called
+    ``_mask`` on any other module -- the blanket-private-drop failure.  Both
+    parameters here are ordinary arrays and must survive.
+    """
+    keys = set(flatten_state_dict(_UnrelatedHolder()))
+    assert "_mask" in keys, "an unrelated module's _mask is a real parameter"
+    assert "trainable_mask" in keys
+
+    # The genuine owner still excludes it, standalone...
+    decoder = TextDecoder(n_vocab=16, n_ctx=12, n_state=N_STATE, n_head=N_HEAD, n_layer=2)
+    assert "_mask" not in flatten_state_dict(decoder)
+    # ...as part of a full model...
+    assert "decoder._mask" not in flatten_state_dict(_whisper())
+    # ...and under a caller prefix.
+    prefixed = flatten_state_dict(decoder, "model.decoder")
+    assert "model.decoder._mask" not in prefixed
+
+
 def test_mask_is_excluded_under_every_prefix_form():
     """One leaf-name rule must cover the full model, a submodule and a prefix."""
     keys = set(flatten_state_dict(_whisper()))

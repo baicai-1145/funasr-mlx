@@ -200,24 +200,21 @@ def _rule_for(module: mxnn.Module) -> str:
     return CONV1D_LAYOUT if isinstance(module, mxnn.Conv1d) else IDENTITY_LAYOUT
 
 
-#: Leaf parameter names that are **absent from every published checkpoint**.
+#: Buffers canonical registers with ``persistent=False``, which are therefore
+#: **absent from every published checkpoint**: its derived causal ``mask``
+#: (OpenAI release v20250625 ``model.py:225``) and ``alignment_heads``
+#: (``:276``, ``:285``).
 #:
-#: Canonical registers its derived causal ``mask`` with ``persistent=False``
-#: (OpenAI release v20250625 ``model.py:225``) and ``alignment_heads`` the same
-#: way (``:276``, ``:285``).  Leaving either in the parameter inventory makes a
-#: strict load of a perfectly good checkpoint fail with a spurious "missing"
-#: key, which is exactly what happened: this set previously named the *torch*
-#: field ``decoder.mask`` while the native module stores ``self._mask``, so the
-#: exclusion never fired and ``decoder._mask`` was still collected.
+#: The actual table is :data:`NON_PERSISTENT_BUFFERS`, defined **after** the
+#: class definitions it names and reached through
+#: :func:`_is_non_persistent_buffer`, which resolves the global at call time.
+#: It pairs each buffer with the module type that owns it, rather than matching
+#: a leaf name, so an unrelated parameter called ``_mask`` on some other module
+#: is still collected.
 #:
-#: Matched on the **leaf** name rather than the full dotted path, so one entry
-#: covers every prefix: ``decoder._mask`` on a full ``Whisper``, ``_mask`` on a
-#: standalone ``TextDecoder``, and either under a caller-supplied ``prefix``.
-#:
-#: This is an explicit list of exactly those two buffers.  A blanket "skip every
-#: private array" rule would also swallow real parameters -- the encoder's
-#: ``positional_embedding`` is a *persistent* buffer (``:181``) and must stay.
-NON_PERSISTENT_BUFFERS = frozenset({"_mask", "alignment_heads"})
+#: Either way this is an explicit list of exactly those buffers.  A blanket
+#: "skip every private array" rule would swallow real parameters -- both
+#: ``positional_embedding`` buffers are *persistent* (``:181``) and must stay.
 
 
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
@@ -239,9 +236,9 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
         if isinstance(value, mxnn.Module):
             _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
-            # Leaf match rather than the full dotted name, so one entry covers
-            # the full model, a standalone submodule and any caller prefix.
-            if name.rsplit(".", 1)[-1] in NON_PERSISTENT_BUFFERS:
+            # Owner + native key, so the full model, a standalone submodule and
+            # any caller prefix are all covered by one entry.
+            if _is_non_persistent_buffer(module, key):
                 continue
             tensors[name] = value
             rules[name] = _rule_for(module) if key == "weight" else IDENTITY_LAYOUT
@@ -961,6 +958,38 @@ def _mel_to_hz(mels: mx.array) -> mx.array:
     freqs = f_sp * mels
     log_region = min_log_hz * mx.exp(logstep * (mels - min_log_mel))
     return mx.where(mels >= min_log_mel, log_region, freqs)
+
+
+NON_PERSISTENT_BUFFERS: frozenset[tuple[type, str]] = frozenset(
+    {
+        (TextDecoder, "_mask"),
+        (Whisper, "alignment_heads"),
+    }
+)
+"""``(owning module type, native parameter name)`` pairs canonical registers with
+``persistent=False``, so they appear in no published ``state_dict``.
+
+Defined here rather than beside :func:`_flatten_into` because it names the two
+classes, which do not exist yet at that point in the module -- referencing them
+in a literal there would be a ``NameError`` at import time.  :func:`_flatten_into`
+looks the global up when it runs, so the ordering costs nothing.
+
+Pairing the buffer with its owner matters: matching the leaf name alone would
+silently drop an unrelated trainable parameter called ``_mask`` on any other
+module, which is the blanket-private-drop failure this exists to avoid.
+"""
+
+
+def _is_non_persistent_buffer(owner: Any, key: str) -> bool:
+    """Whether ``owner``'s parameter ``key`` is a derived, non-persistent buffer.
+
+    ``isinstance`` rather than an exact type match, so a subclass still matches.
+    The result is independent of any flatten prefix or of whether the owning
+    module is reached standalone or as part of a full ``Whisper``.
+    """
+    return any(
+        isinstance(owner, owner_type) and key == name for owner_type, name in NON_PERSISTENT_BUFFERS
+    )
 
 
 def mel_filterbank(
