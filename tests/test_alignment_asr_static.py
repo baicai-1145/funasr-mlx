@@ -370,15 +370,82 @@ def test_saved_tensors_are_bounded_and_truncation_is_recorded():
     assert alignment._stage_record("encoder", small)["truncated"] is False
 
 
-def test_split_funasr_config_prefers_model_conf_and_refuses_emptiness():
+def test_build_model_conf_reproduces_automodel_merge():
+    """The whole config must be merged over model_conf, as AutoModel does.
+
+    Forwarding only model_conf -- or only the *_conf keys -- drops the top-level
+    encoder/decoder/predictor NAME strings and builds a model with no encoder.
+    """
     config = {
-        "model_conf": {"encoder": "sanm_encoder", "input_size": 560},
-        "decoder_conf": {"vocab_size": 7000},
-        "ctc_conf": {"ctc_weight": 0.0},
+        "model": "Paraformer",
+        "model_conf": {"ctc_weight": 0.0, "lsm_weight": 0.1},
+        "encoder": "SANMEncoder",
+        "decoder": "ParaformerSANMDecoder",
+        "predictor": "CifPredictorV2",
+        "encoder_conf": {"output_size": 512},
+        "frontend_conf": {"n_mels": 80},
     }
-    split = alignment._split_funasr_config(config)
-    assert split["encoder"] == "sanm_encoder"
-    assert split["decoder_conf"] == {"vocab_size": 7000}
-    assert split["ctc_conf"] == {"ctc_weight": 0.0}
+    merged = alignment.build_model_conf(config)
+    assert merged["encoder"] == "SANMEncoder"
+    assert merged["decoder"] == "ParaformerSANMDecoder"
+    assert merged["predictor"] == "CifPredictorV2"
+    assert merged["ctc_weight"] == 0.0
+    # Whole-config values win over model_conf, exactly like deep_update order.
+    assert merged["encoder_conf"] == {"output_size": 512}
+
+
+def test_resolve_asset_paths_reads_configuration_json_not_config_yaml(tmp_path):
+    """config.yaml ships cmvn_file: null; only configuration.json names it."""
+    (tmp_path / "am.mvn").write_text("cmvn")
+    (tmp_path / "config.yaml").write_text("frontend_conf:\n  cmvn_file: null\n")
+    (tmp_path / "tokens.json").write_text('["<blank>", "<s>"]')
+    (tmp_path / "model.pt").write_bytes(b"x")
+    (tmp_path / "configuration.json").write_text(
+        json.dumps(
+            {
+                "file_path_metas": {
+                    "init_param": "model.pt",
+                    "config": "config.yaml",
+                    "frontend_conf": {"cmvn_file": "am.mvn"},
+                    "tokenizer_conf": {"token_list": "tokens.json"},
+                }
+            }
+        )
+    )
+    assets = alignment.resolve_asset_paths(tmp_path / "config.yaml")
+    assert assets["cmvn_file"].endswith("am.mvn")
+    assert assets["token_list"].endswith("tokens.json")
+    assert assets["init_param"].endswith("model.pt")
+    assert assets["bpemodel"] is None
+
     with pytest.raises(alignment.AlignmentError):
-        alignment._split_funasr_config({"frontend_conf": {}})
+        alignment.resolve_asset_paths(tmp_path)  # a directory is not a config file
+
+
+def test_sensevoice_and_paraformer_derive_input_size_from_the_frontend():
+    """input_size=560 is derived from WavFrontend.output_size(), not configured.
+
+    WavFrontend.output_size() is n_mels * lfr_m; the Mel23 variant registered
+    elsewhere uses a different formula, so the wrong class would silently give a
+    different width.
+    """
+    variant = {v.key: v for v in alignment.SUPPORTED}
+    assert (
+        variant["sensevoice-small"].frontend["n_mels"]
+        * variant["sensevoice-small"].frontend["lfr_m"]
+        == 560
+    )
+    assert variant["sensevoice-small"].frontend["n_mels"] == 80
+    # The registry module must actually host the configured encoder.
+    assert (
+        variant["sensevoice-small"].reference_import in variant["sensevoice-small"].registry_imports
+    )
+
+
+def test_paraformer_registry_imports_cover_its_configured_names():
+    """encoder/decoder/predictor are name strings resolved through the registry."""
+    paraformer = {v.key: v for v in alignment.SUPPORTED}["paraformer-zh"]
+    joined = " ".join(paraformer.registry_imports)
+    assert "sanm.encoder" in joined
+    assert "paraformer.decoder" in joined
+    assert "paraformer.cif_predictor" in joined

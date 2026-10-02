@@ -67,9 +67,11 @@ class Variant:
     #: FunASR import path + class for the reference backend.
     reference_import: str = ""
     reference_class: str = ""
-    #: Modules that must be imported so FunASR's registry can resolve the
-    #: ``encoder:``/``decoder:``/``predictor:`` name strings in the config.
+    #: FunASR modules that must be imported so ``tables.encoder_classes`` /
+    #: ``decoder_classes`` can resolve the config's submodule NAME strings.
     registry_imports: tuple[str, ...] = ()
+    #: The config keys whose values must be resolved from configuration.json
+    #: rather than config.yaml, which ships them as ``null``.
     notes: str = ""
     #: Whisper-only: the official tiny variant's dimensions are read from the
     #: checkpoint, so nothing is hard-coded here.
@@ -96,31 +98,42 @@ SUPPORTED: tuple[Variant, ...] = (
     Variant(
         key="paraformer-zh",
         family="paraformer",
-        checkpoint="models/paraformer-zh/model.pt",
-        config="models/paraformer-zh/config.yaml",
+        checkpoint="models/paraformer/model.pt",
+        config="models/paraformer/config.yaml",
         max_seconds=30.0,
         frontend=dict(_ASR_FRONTEND),
         reference_import="funasr.models.paraformer.model",
         reference_class="Paraformer",
         registry_imports=(
             "funasr.models.sanm.encoder",
-            "funasr.models.sanm.decoder",
+            "funasr.models.paraformer.decoder",
+            "funasr.models.paraformer.cif_predictor",
         ),
-        notes="Non-autoregressive. Final logits are the DECODER log-softmax.",
+        notes=(
+            "config.yaml has ctc_weight=0.0, so no CTC head is built. Final "
+            "logits are the DECODER log-softmax from cal_decoder_with_predictor."
+        ),
     ),
     Variant(
         key="sensevoice-small",
         family="sensevoice",
-        checkpoint="models/SenseVoiceSmall/model.pt",
-        config="models/SenseVoiceSmall/config.yaml",
+        checkpoint="models/sensevoice/model.pt",
+        config="models/sensevoice/config.yaml",
         max_seconds=30.0,
-        # SenseVoiceSmall consumes a 560-dim fbank; the official frontend builds
-        # it from 80 mels x 7 LFR frames.
+        # The official config is 80 mels with lfr_m=7, so the frontend's
+        # output_size() -- which is what becomes the model's input_size -- is
+        # 80 * 7 = 560.
         frontend={**_ASR_FRONTEND, "n_mels": 80, "lfr_m": 7, "lfr_n": 6},
         reference_import="funasr.models.sense_voice.model",
         reference_class="SenseVoiceSmall",
-        registry_imports=("funasr.models.sanm.encoder",),
-        notes="CTC. Conditioning ids (lid/textnorm/event-emo) are recorded.",
+        # SenseVoiceEncoderSmall lives in the same module as SenseVoiceSmall, so
+        # importing the reference module registers it.
+        registry_imports=("funasr.models.sense_voice.model",),
+        notes=(
+            "input_size=560 comes from WavFrontend.output_size(), not the config. "
+            "CMVN and the BPE model come from configuration.json; config.yaml ships "
+            "cmvn_file: null. Conditioning ids (lid/textnorm/event-emo) recorded."
+        ),
     ),
     Variant(
         key="whisper-tiny",
@@ -281,9 +294,14 @@ def build_alignment_spec(
             "family": variant.family,
             "checkpoint": str(assets_root / variant.checkpoint),
             "config": str(assets_root / variant.config),
-            "cmvn": str(assets_root / variant.config.rsplit("/", 1)[0] / cmvn_name)
-            if not variant.family == "whisper"
-            else None,
+            # CMVN and tokenizer filenames are declared only in configuration.json;
+            # config.yaml ships cmvn_file: null, so they are never guessed here.
+            "cmvn": None
+            if variant.family == "whisper"
+            else resolve_asset_paths(assets_root / variant.config).get("cmvn_file"),
+            "assets": {}
+            if variant.family == "whisper"
+            else resolve_asset_paths(assets_root / variant.config),
             "frontend": variant.frontend,
             "reference_import": variant.reference_import,
             "reference_class": variant.reference_class,
@@ -531,24 +549,69 @@ def _load_checkpoint_state(path: Path) -> dict[str, Any]:
     return {str(key): value for key, value in payload.items()}
 
 
-def _split_funasr_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Split an official FunASR YAML into the constructor's keyword arguments.
+def _deep_update(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Recursive dict merge, matching FunASR's ``deep_update`` semantics."""
+    for key, value in source.items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _deep_update(target[key], value)
+        else:
+            target[key] = value
+    return target
 
-    The official files nest most sub-configs under ``model_conf`` while the
-    constructor also accepts ``encoder_conf``/``decoder_conf``/... at top level,
-    and takes the submodule *names* (``encoder: sanm_encoder``) as strings that
-    resolve through FunASR's registry. Splitting here keeps that mapping visible
-    and checkable instead of buried in a splat.
+
+def build_model_conf(config: dict[str, Any]) -> dict[str, Any]:
+    """Reproduce AutoModel's construction kwargs exactly.
+
+    ``auto_model.py:779-781`` does::
+
+        model_conf = {}
+        deep_update(model_conf, kwargs.get("model_conf", {}))
+        deep_update(model_conf, kwargs)
+        model = model_class(**model_conf)
+
+    So the WHOLE config is merged over ``model_conf``, which is how the
+    top-level ``encoder:``/``decoder:``/``predictor:`` NAME strings and their
+    ``*_conf`` dicts reach the constructor. Forwarding only ``model_conf`` -- or
+    only the ``*_conf`` keys -- silently builds a model with no encoder.
     """
-    model_conf = dict(config.get("model_conf") or {})
-    for name in ("encoder_conf", "decoder_conf", "predictor_conf", "ctc_conf"):
-        # ``name not in model_conf`` tests the key, not the value; testing the
-        # value would both be wrong and raise, since a sub-config is unhashable.
-        if config.get(name) is not None and name not in model_conf:
-            model_conf[name] = config[name]
-    if not model_conf:
-        raise AlignmentError("config has no model_conf; refusing to guess the model's structure")
-    return model_conf
+    merged: dict[str, Any] = {}
+    _deep_update(merged, config.get("model_conf") or {})
+    _deep_update(merged, config)
+    return merged
+
+
+def resolve_asset_paths(config_path: str | Path) -> dict[str, Any]:
+    """Resolve asset filenames from ``configuration.json``, not config.yaml.
+
+    The official ``config.yaml`` ships ``cmvn_file: null`` and ``bpemodel: null``;
+    the real filenames live in ``configuration.json`` under ``file_path_metas``.
+    Guessing ``am.mvn`` by convention happens to work for these two models and
+    would break silently for any model that differs, so it is read from the
+    authoritative source.
+    """
+    config_path = Path(config_path)
+    directory = config_path.parent
+    metas_path = directory / "configuration.json"
+    if not metas_path.is_file():
+        raise AlignmentError(
+            f"{directory}/configuration.json is missing; CMVN and tokenizer "
+            "filenames are only declared there, not in config.yaml"
+        )
+    metas = json.loads(metas_path.read_text()).get("file_path_metas", {})
+    frontend = metas.get("frontend_conf") or {}
+    tokenizer = metas.get("tokenizer_conf") or {}
+
+    def _resolve(name: Any) -> str | None:
+        return str(directory / name) if name else None
+
+    return {
+        "directory": str(directory),
+        "init_param": _resolve(metas.get("init_param")),
+        "cmvn_file": _resolve(frontend.get("cmvn_file")),
+        "bpemodel": _resolve(tokenizer.get("bpemodel")),
+        "token_list": _resolve(tokenizer.get("token_list")),
+        "seg_dict_file": _resolve(tokenizer.get("seg_dict_file")),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -564,9 +627,13 @@ def run_reference(spec: dict[str, Any], output_root: str | Path | None = None) -
 
     if variant["family"] == "whisper":
         model, extras = _build_canonical_whisper(variant)
-        loader = None
+        frontend, loader = None, model.load_state_dict
+        assets = {"init_param": variant["checkpoint"], "cmvn_file": None}
     else:
-        model, extras = _build_funasr_reference(variant)
+        assets = resolve_asset_paths(variant["config"])
+        # configuration.json is authoritative for the weights filename too.
+        variant = {**variant, "checkpoint": assets["init_param"] or variant["checkpoint"]}
+        model, extras, frontend = _build_funasr_reference(variant, assets)
         loader = model.load_state_dict
 
     state = _load_checkpoint_state(Path(variant["checkpoint"]))
@@ -579,7 +646,6 @@ def run_reference(spec: dict[str, Any], output_root: str | Path | None = None) -
     loader(state, strict=True)
     model = model.float().eval()
 
-    frontend = _build_reference_frontend(variant)
     samples = [
         _run_reference_sample(model, frontend, variant, item, output_root, torch)
         for item in spec["inputs"]
@@ -602,12 +668,17 @@ def run_reference(spec: dict[str, Any], output_root: str | Path | None = None) -
     return metadata
 
 
-def _build_funasr_reference(variant: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
-    """Construct the real FunASR model from the official config.
+def _build_funasr_reference(
+    variant: dict[str, Any], assets: dict[str, Any]
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Construct the real FunASR model exactly as ``AutoModel`` does.
 
-    Registry imports come first: the config names submodules as strings
-    (``encoder: sanm_encoder``) and those resolve through modules that register
-    themselves on import, so skipping them would fail with an opaque lookup error.
+    Order matters and follows ``auto_model.py:755-781``: the tokenizer supplies
+    ``vocab_size``, the built frontend supplies ``input_size`` via
+    ``output_size()``, and only then is the model constructed from
+    ``build_model_conf``. Both of those values are DERIVED, not configured --
+    the official config.yaml contains neither, so omitting either silently builds
+    a model with the wrong widths.
     """
     import importlib
 
@@ -617,11 +688,26 @@ def _build_funasr_reference(variant: dict[str, Any]) -> tuple[Any, dict[str, Any
         importlib.import_module(module_path)
 
     config = yaml.safe_load(Path(variant["config"]).read_text())
-    model_conf = _split_funasr_config(config)
+    frontend = _build_reference_frontend(config, assets)
+    vocab_size = _reference_vocab_size(config, assets)
+
+    model_conf = build_model_conf(config)
+    model_conf["input_size"] = int(frontend.output_size())
+    model_conf["vocab_size"] = int(vocab_size["size"])
+
     module = importlib.import_module(variant["reference_import"])
     model = getattr(module, variant["reference_class"])(**model_conf)
 
-    extras: dict[str, Any] = {"model_conf_keys": sorted(model_conf)}
+    extras: dict[str, Any] = {
+        "model_conf_keys": sorted(model_conf),
+        "input_size": int(frontend.output_size()),
+        "frontend_output_size_formula": "n_mels * lfr_m",
+        "vocab_size": vocab_size,
+        "cmvn_file": assets.get("cmvn_file"),
+        "encoder_name": config.get("encoder"),
+        "decoder_name": config.get("decoder"),
+        "predictor_name": config.get("predictor"),
+    }
     # Conditioning id tables must be recorded, not assumed: they decide what the
     # model actually consumed and are impossible to infer from a tensor shape.
     for attribute in ("lid_dict", "textnorm_dict", "lid_int_dict"):
@@ -629,32 +715,79 @@ def _build_funasr_reference(variant: dict[str, Any]) -> tuple[Any, dict[str, Any
         if isinstance(table, dict):
             extras[attribute] = {str(k): int(v) for k, v in table.items()}
     extras["ctc_weight"] = float(getattr(model, "ctc_weight", 0.0) or 0.0)
-    extras["has_ctc_head"] = hasattr(model, "ctc") and getattr(model, "ctc", None) is not None
-    return model, extras
+    extras["has_ctc_head"] = getattr(model, "ctc", None) is not None
+    return model, extras, frontend
 
 
-def _build_reference_frontend(variant: dict[str, Any]) -> Any:
-    """The real FunASR ``WavFrontend``, with the official CMVN and Kaldi scaling."""
-    import importlib
+def _build_reference_frontend(config: dict[str, Any], assets: dict[str, Any]) -> Any:
+    """FunASR's own ``WavFrontend``, from config.yaml's own frontend_conf.
 
-    for module_path in ("funasr.frontends.wav_frontend",):
-        importlib.import_module(module_path)
+    ``frontend_conf`` is forwarded verbatim -- including ``window: hamming``,
+    which differs from the library default and would otherwise be guessed wrong.
+    The CMVN comes from configuration.json, because config.yaml ships it null.
+    """
+    frontend_conf = dict(config.get("frontend_conf") or {})
+    frontend_conf.pop("cmvn_file", None)
     frontend_class = _resolve_wav_frontend()
+    return frontend_class(cmvn_file=assets.get("cmvn_file"), **frontend_conf)
 
-    settings = dict(variant["frontend"])
-    cmvn = settings.pop("cmvn_file", None) or variant["cmvn"]
-    kwargs = {
-        "fs": int(settings["fs"]),
-        "window": settings.get("window", "hanning"),
-        "n_mels": int(settings["n_mels"]),
-        "frame_length": float(settings["frame_length"]),
-        "frame_shift": float(settings["frame_shift"]),
-        "dither": float(settings.get("dither", 0.0)),
-        "lfr_m": int(settings["lfr_m"]),
-        "lfr_n": int(settings["lfr_n"]),
-        "upsacle_samples": bool(settings.get("upsacle_samples", True)),
-    }
-    return frontend_class(cmvn_file=cmvn, **kwargs)
+
+def _reference_vocab_size(config: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
+    """Derive ``vocab_size`` from the official tokenizer, and record its order.
+
+    Token ids are only comparable between backends once the vocabulary ORDER is
+    pinned, so the id list is fingerprinted here rather than assumed to match.
+    """
+    import importlib
+    import json as _json
+
+    tokenizer_name = config.get("tokenizer")
+    tokenizer_conf = dict(config.get("tokenizer_conf") or {})
+    token_list_path = assets.get("token_list")
+    bpemodel = assets.get("bpemodel")
+
+    if tokenizer_name == "CharTokenizer" and token_list_path:
+        tokens = _json.loads(Path(token_list_path).read_text())
+        return {
+            "class": tokenizer_name,
+            "size": len(tokens),
+            "token_list": token_list_path,
+            "head": [str(t) for t in tokens[:8]],
+            "first_ids": list(range(min(8, len(tokens)))),
+        }
+
+    for module_path, attribute in (
+        ("funasr.tokenizer.sentencepiece_tokenizer", "SentencepiecesTokenizer"),
+        ("funasr.tokenizer.char_tokenizer", "CharTokenizer"),
+    ):
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        if not hasattr(module, attribute):
+            continue
+        if attribute != tokenizer_name:
+            continue
+        if bpemodel:
+            tokenizer_conf.setdefault("bpemodel", bpemodel)
+        tokenizer = getattr(module, attribute)(**tokenizer_conf)
+        size = getattr(tokenizer, "vocab_size", None)
+        if size is None:
+            raise AlignmentError(
+                f"{tokenizer_name} exposes no vocab_size; refusing to guess the "
+                "vocabulary size the checkpoint was trained with"
+            )
+        return {
+            "class": attribute,
+            "size": int(size),
+            "bpemodel": bpemodel,
+            "module": module_path,
+        }
+
+    raise AlignmentError(
+        f"cannot derive vocab_size for tokenizer {tokenizer_name!r}; the constructor "
+        "requires it and config.yaml does not contain it"
+    )
 
 
 def _resolve_wav_frontend() -> Any:
