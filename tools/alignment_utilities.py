@@ -92,6 +92,7 @@ field                         published artefact
     ``lfr_n: 1`` alongside ``n_mels: 80`` and ``dither: 0.0``; those are used
     as given and only defaulted from ``input_dim`` when absent.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -117,6 +118,7 @@ FAMILIES = ("fsmn-vad", "ct-punc", "campplus", "emotion2vec")
 # --------------------------------------------------------------------------- #
 def guarded_alignment(function):
     """Require authenticated supervision before importing numerical backends."""
+
     @wraps(function)
     def run(*args, **kwargs):
         from funasr_mlx.memory import guarded_child_active
@@ -124,6 +126,7 @@ def guarded_alignment(function):
         if not guarded_child_active():
             raise RuntimeError("Alignment execution requires the guarded launcher")
         return function(*args, **kwargs)
+
     return run
 
 
@@ -153,8 +156,9 @@ def _write_json(out_dir: Path, key: str, mode: str, payload: Mapping[str, Any]) 
     return target
 
 
-def _reject_overlong(entry: Mapping[str, Any], actual: float, limit_field: str,
-                     limit: float, unit: str) -> None:
+def _reject_overlong(
+    entry: Mapping[str, Any], actual: float, limit_field: str, limit: float, unit: str
+) -> None:
     """Refuse an over-limit input instead of truncating it."""
     if limit <= 0:
         raise ValueError(f"{entry.get('key')}: {limit_field} must be positive")
@@ -225,8 +229,13 @@ def _reference_waveform(path: str) -> Any:
 
 
 def _check_audio(entry: Mapping[str, Any], samples: Any) -> None:
-    _reject_overlong(entry, samples.size / SAMPLE_RATE, "limit_seconds",
-                     float(entry.get("limit_seconds", 0.0)), "s")
+    _reject_overlong(
+        entry,
+        samples.size / SAMPLE_RATE,
+        "limit_seconds",
+        float(entry.get("limit_seconds", 0.0)),
+        "s",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -367,8 +376,7 @@ def _required_attr(obj: Any, name: str) -> Any:
 
 
 @guarded_alignment
-def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                        out_dir: Path) -> None:
+def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path) -> None:
     """Native ``funasr_mlx.models.fsmn_vad.FsmnVadModel`` forward.
 
     Input geometry follows ``funasr_mlx/cli.py`` exactly:
@@ -465,8 +473,9 @@ def _vad_input_dim(config: Any) -> int:
 # ct-punc
 # --------------------------------------------------------------------------- #
 @guarded_alignment
-def run_ct_punc_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                          out_dir: Path) -> None:
+def run_ct_punc_reference(
+    entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
+) -> None:
     """Official ``CTTransformer.punc_forward`` over jieba-split mini-sentences.
 
     The word split and the id stream both come from FunASR's own helpers and
@@ -482,8 +491,9 @@ def run_ct_punc_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
     tokenizer = _reference_tokenizer(auto)
 
     text = str(entry["text"])
-    _reject_overlong(entry, float(len(text)), "limit_chars",
-                     float(entry.get("limit_chars", 0.0)), "chars")
+    _reject_overlong(
+        entry, float(len(text)), "limit_chars", float(entry.get("limit_chars", 0.0)), "chars"
+    )
 
     tokens = list(split_words(text, jieba_usr_dict=getattr(module, "jieba_usr_dict", None)))
     token_ids = list(tokenizer.encode(tokens))
@@ -503,23 +513,32 @@ def run_ct_punc_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
         blocks.append(block)
         punc_ids.extend(int(value) for value in block.argmax(axis=-1))
 
-    _write_npz(out_dir, entry["key"], "reference", {
-        "token_ids": np.asarray(token_ids, dtype=np.int32),
-        "punc_ids": np.asarray(punc_ids, dtype=np.int32),
-        "logits": np.concatenate(blocks, axis=0).astype(np.float32),
-    })
-    _write_json(out_dir, entry["key"], "reference", {
-        "family": "ct-punc",
-        "text": text,
-        "tokens": tokens,
-        "punc_array": punc_ids,
-        "n_mini_sentences": len(mini_words),
-    })
+    _write_npz(
+        out_dir,
+        entry["key"],
+        "reference",
+        {
+            "token_ids": np.asarray(token_ids, dtype=np.int32),
+            "punc_ids": np.asarray(punc_ids, dtype=np.int32),
+            "logits": np.concatenate(blocks, axis=0).astype(np.float32),
+        },
+    )
+    _write_json(
+        out_dir,
+        entry["key"],
+        "reference",
+        {
+            "family": "ct-punc",
+            "text": text,
+            "tokens": tokens,
+            "punc_array": punc_ids,
+            "n_mini_sentences": len(mini_words),
+        },
+    )
 
 
 @guarded_alignment
-def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                       out_dir: Path) -> None:
+def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path) -> None:
     """Native ``funasr_mlx.models.ct_punc.CtPuncModel.punc_forward``."""
     import mlx.core as mx
     import numpy as np
@@ -527,27 +546,46 @@ def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     from funasr_mlx.pipeline import load_model
 
     model, _config = load_model(
-        _require(assets, "checkpoint"), family="ct-punc", config=assets.get("config")
+        _require(assets, "checkpoint"),
+        family="ct-punc",
+        config={
+            **_load_yaml(_require(assets, "config")),
+            "model_conf": {
+                **_load_yaml(_require(assets, "config")).get("model_conf", {}),
+                "vocab_size": len(_load_ct_punc_tokens(_require(assets, "tokens"))),
+            },
+        },
     )
     text = str(entry["text"])
-    _reject_overlong(entry, float(len(text)), "limit_chars",
-                     float(entry.get("limit_chars", 0.0)), "chars")
+    _reject_overlong(
+        entry, float(len(text)), "limit_chars", float(entry.get("limit_chars", 0.0)), "chars"
+    )
 
-    token_ids = list(CharVocab(_load_ct_punc_tokens(_require(assets, "tokens"))).encode(
-        list(split_words(text))
-    ))
+    token_ids = list(
+        CharVocab(_load_ct_punc_tokens(_require(assets, "tokens"))).encode(list(split_words(text)))
+    )
     logits = model.punc_forward(mx.array([token_ids], dtype=mx.int32))
     punc_ids = model.argmax_punc_ids(logits)[0]
-    _write_npz(out_dir, entry["key"], "native", {
-        "token_ids": np.asarray(token_ids, dtype=np.int32),
-        "punc_ids": np.asarray(punc_ids, dtype=np.int32),
-        "logits": np.asarray(logits[0]).astype(np.float32),
-    })
-    _write_json(out_dir, entry["key"], "native", {
-        "family": "ct-punc",
-        "text": text,
-        "punc_array": [int(value) for value in punc_ids],
-    })
+    _write_npz(
+        out_dir,
+        entry["key"],
+        "native",
+        {
+            "token_ids": np.asarray(token_ids, dtype=np.int32),
+            "punc_ids": np.asarray(punc_ids, dtype=np.int32),
+            "logits": np.asarray(logits[0]).astype(np.float32),
+        },
+    )
+    _write_json(
+        out_dir,
+        entry["key"],
+        "native",
+        {
+            "family": "ct-punc",
+            "text": text,
+            "punc_array": [int(value) for value in punc_ids],
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -642,8 +680,7 @@ def _cosine(first: Any, second: Any) -> float:
 
 
 @guarded_alignment
-def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                        out_dir: Path) -> None:
+def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path) -> None:
     """Native ``CAMPPlus.embed`` with the reference's mean-subtracted features."""
     import mlx.core as mx
     import numpy as np
@@ -698,8 +735,9 @@ def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
 # emotion2vec
 # --------------------------------------------------------------------------- #
 @guarded_alignment
-def run_emotion2vec_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                              out_dir: Path) -> None:
+def run_emotion2vec_reference(
+    entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
+) -> None:
     """Official ``Emotion2vec``: frame features, pooled embedding, logits, probs.
 
     The config is **not** inferred.  It is whatever ``AutoModel`` loaded, because
@@ -723,10 +761,11 @@ def run_emotion2vec_reference(entry: Mapping[str, Any], assets: Mapping[str, Any
     source = source.view(1, -1)
 
     with torch.no_grad():
-        feats = module.extract_features(source, padding_mask=None)["x"]
-        num_extra = int(cfg.get("modalities", {}).get("audio", {}).get(
-            "num_extra_tokens", 0
-        ))
+        # remove_extra_tokens=False: the adapter strips them itself below, from
+        # the config it recorded. extract_features' own default (True) would
+        # already have stripped them, and stripping twice loses 10 frames.
+        feats = module.extract_features(source, padding_mask=None, remove_extra_tokens=False)["x"]
+        num_extra = int(cfg.get("modalities", {}).get("audio", {}).get("num_extra_tokens", 0))
         frames = feats[:, num_extra:, :]
         pooled = frames.mean(dim=1)
         logits = module.proj(pooled) if getattr(module, "proj", None) is not None else None
@@ -751,9 +790,7 @@ def run_emotion2vec_reference(entry: Mapping[str, Any], assets: Mapping[str, Any
         )
         keep = [i for i, label in enumerate(labels) if not label.startswith("unuse")]
         report["selected_labels"] = [labels[i] for i in keep]
-        report["selected_scores"] = [
-            float(probabilities[0, i]) for i in keep
-        ]
+        report["selected_scores"] = [float(probabilities[0, i]) for i in keep]
     else:
         report["selected_labels"] = []
         report["selected_scores"] = []
@@ -827,9 +864,9 @@ def _dig(mapping: Mapping[str, Any], dotted: str) -> Any:
     return node
 
 
-def emotion_native_config(raw: Mapping[str, Any], labels: Sequence[str]) -> tuple[
-    dict[str, Any], dict[str, Any]
-]:
+def emotion_native_config(
+    raw: Mapping[str, Any], labels: Sequence[str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Map the official ``Emotion2vec`` yaml onto native config kwargs.
 
     Returns ``(kwargs, report)``.  Every official key is placed in exactly one
@@ -846,8 +883,11 @@ def emotion_native_config(raw: Mapping[str, Any], labels: Sequence[str]) -> tupl
             continue
         mapped.append(source)
 
-    defaulted = {source: value for source, value in _EMOTION_DEFAULTED.items()
-                 if _dig_or_none(raw, source) is None}
+    defaulted = {
+        source: value
+        for source, value in _EMOTION_DEFAULTED.items()
+        if _dig_or_none(raw, source) is None
+    }
     for source, value in defaulted.items():
         kwargs[_EMOTION_FIELD_MAP.get(source, source.rsplit(".", 1)[-1])] = value
 
@@ -879,8 +919,9 @@ def _dig_or_none(mapping: Mapping[str, Any], dotted: str) -> Any:
         return None
 
 
-def _emotion_unmapped_keys(raw: Mapping[str, Any], mapped: Sequence[str],
-                           defaulted: Mapping[str, Any]) -> dict[str, Any]:
+def _emotion_unmapped_keys(
+    raw: Mapping[str, Any], mapped: Sequence[str], defaulted: Mapping[str, Any]
+) -> dict[str, Any]:
     """Official leaf keys that reach no native field, grouped by why.
 
     They are not an error -- most are fairseq training knobs -- but an
@@ -894,18 +935,38 @@ def _emotion_unmapped_keys(raw: Mapping[str, Any], mapped: Sequence[str],
     ema, objective, optimisation, other_modalities, audio_unmapped = [], [], [], [], []
     for key, value in top.items():
         if key == "modalities" or key in {
-            "embed_dim", "depth", "num_heads", "mlp_ratio", "norm_eps", "norm_affine",
-            "layer_norm_first", "end_of_block_targets", "normalize", "_name",
+            "embed_dim",
+            "depth",
+            "num_heads",
+            "mlp_ratio",
+            "norm_eps",
+            "norm_affine",
+            "layer_norm_first",
+            "end_of_block_targets",
+            "normalize",
+            "_name",
         }:
             continue
         if key.startswith("ema") or key in {"skip_ema", "max_update", "log_norms"}:
             ema.append(key)
         elif key.startswith("loss_") or key in {
-            "d2v_loss", "recon_loss", "cls_loss", "cls_type", "shared_decoder",
-            "adversarial_training", "adversarial_hidden_dim", "adversarial_weight",
-            "decoder_group", "min_target_var", "min_pred_var", "mae_init",
-            "layer_norm_target_layer", "batch_norm_target_layer",
-            "instance_norm_target_layer", "instance_norm_targets", "layer_norm_targets",
+            "d2v_loss",
+            "recon_loss",
+            "cls_loss",
+            "cls_type",
+            "shared_decoder",
+            "adversarial_training",
+            "adversarial_hidden_dim",
+            "adversarial_weight",
+            "decoder_group",
+            "min_target_var",
+            "min_pred_var",
+            "mae_init",
+            "layer_norm_target_layer",
+            "batch_norm_target_layer",
+            "instance_norm_target_layer",
+            "instance_norm_targets",
+            "layer_norm_targets",
         }:
             objective.append(key)
         elif "dropout" in key or "drop_path" in key or key == "layerdrop":
@@ -980,14 +1041,16 @@ def _emotion_consistency_checks(raw: Mapping[str, Any], report: dict[str, Any]) 
     model_depth = audio.get("model_depth")
     depth = (raw.get("model_conf") or {}).get("depth")
     if model_depth is not None and depth is not None:
-        checks["model_depth_vs_depth"] = {"model_depth": model_depth, "depth": depth,
-                                          "agree": model_depth == depth}
+        checks["model_depth_vs_depth"] = {
+            "model_depth": model_depth,
+            "depth": depth,
+            "agree": model_depth == depth,
+        }
     declared = (raw.get("model_conf") or {}).get("supported_modality")
     if declared is not None:
         checks["supported_modality"] = declared
         present = sorted(
-            m for m in (raw.get("model_conf") or {}).get("modalities", {})
-            if m not in {"_name"}
+            m for m in (raw.get("model_conf") or {}).get("modalities", {}) if m not in {"_name"}
         )
         checks["modalities_present"] = present
         checks["modalities_beyond_declared"] = [m for m in present if m != declared.lower()]
@@ -995,8 +1058,9 @@ def _emotion_consistency_checks(raw: Mapping[str, Any], report: dict[str, Any]) 
 
 
 @guarded_alignment
-def run_emotion2vec_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                           out_dir: Path) -> None:
+def run_emotion2vec_native(
+    entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
+) -> None:
     """Native emotion forward via the shipping loader, with the disposition report.
 
     The official yaml is mapped field by field rather than splatted into the
@@ -1016,35 +1080,44 @@ def run_emotion2vec_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     labels = _read_labels(_require(assets, "labels"))
     kwargs, config_report = emotion_native_config(raw, labels)
 
-    model, config = load_model(
-        _require(assets, "checkpoint"), family="emotion2vec", config=kwargs
-    )
+    model, config = load_model(_require(assets, "checkpoint"), family="emotion2vec", config=kwargs)
 
     samples = np.asarray(read_audio(entry["audio"]), dtype=np.float32)
     _check_audio(entry, samples)
     waveform = preprocess_waveform(
         mx.array(samples[None, :]), normalize=bool(getattr(config, "normalize", True))
     )
-    frames, logits, pooled = model.classify(waveform)
+    # classify() returns (pooled features, logits, frames) in that order.
+    pooled, logits, frames = model.classify(waveform)
     probabilities = mx.softmax(logits, axis=-1)
 
-    _write_npz(out_dir, entry["key"], "native", {
-        "frames": np.asarray(frames[0]).astype(np.float32),
-        "pooled": np.asarray(pooled[0]).astype(np.float32),
-        "logits": np.asarray(logits[0]).astype(np.float32),
-        "probabilities": np.asarray(probabilities[0]).astype(np.float32),
-    })
+    _write_npz(
+        out_dir,
+        entry["key"],
+        "native",
+        {
+            "frames": np.asarray(frames[0]).astype(np.float32),
+            "pooled": np.asarray(pooled[0]).astype(np.float32),
+            "logits": np.asarray(logits[0]).astype(np.float32),
+            "probabilities": np.asarray(probabilities[0]).astype(np.float32),
+        },
+    )
     keep = [i for i, label in enumerate(labels) if not label.startswith("unuse")]
-    _write_json(out_dir, entry["key"], "native", {
-        "family": "emotion2vec",
-        "duration_seconds": samples.size / SAMPLE_RATE,
-        "n_frames": int(frames.shape[1]),
-        "labels": labels,
-        "selected_labels": [labels[i] for i in keep],
-        "selected_scores": [float(probabilities[0, i]) for i in keep],
-        "config_map": config_report,
-        "disposition": _native_parameter_disposition(flat_parameter_names(model)),
-    })
+    _write_json(
+        out_dir,
+        entry["key"],
+        "native",
+        {
+            "family": "emotion2vec",
+            "duration_seconds": samples.size / SAMPLE_RATE,
+            "n_frames": int(frames.shape[1]),
+            "labels": labels,
+            "selected_labels": [labels[i] for i in keep],
+            "selected_scores": [float(probabilities[0, i]) for i in keep],
+            "config_map": config_report,
+            "disposition": _native_parameter_disposition(flat_parameter_names(model)),
+        },
+    )
 
 
 def _native_parameter_disposition(parameters: Mapping[str, Any]) -> dict[str, Any]:
@@ -1082,8 +1155,9 @@ _DISPATCH: dict[tuple[str, str], Any] = {
 }
 
 
-def run_manifest(manifest: str | Path, assets: str | Path, out_dir: str | Path,
-                 mode: str) -> list[Path]:
+def run_manifest(
+    manifest: str | Path, assets: str | Path, out_dir: str | Path, mode: str
+) -> list[Path]:
     """Run every manifest entry in ``mode``; return the JSON paths written."""
     if mode not in {"reference", "native"}:
         raise ValueError(f"mode must be reference or native, got {mode!r}")
@@ -1114,8 +1188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--assets", required=True)
     parser.add_argument("--out", required=True)
     arguments = parser.parse_args(argv)
-    for path in run_manifest(arguments.manifest, arguments.assets, arguments.out,
-                             arguments.mode):
+    for path in run_manifest(arguments.manifest, arguments.assets, arguments.out, arguments.mode):
         print(path)
     return 0
 

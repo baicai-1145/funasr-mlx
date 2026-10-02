@@ -26,15 +26,34 @@ def main():
     names = {}
     config = raw
     disposition = {}
+    allowed = None
     if args.family == "emotion2vec":
         labels = (model_dir / "tokens.txt").read_text().splitlines()
         config, disposition = emotion_native_config(raw, labels)
         prefix = "d2v_model."
-        names = {name: name.removeprefix(prefix) for name in inventory["tensors"]}
-        unknown = sorted(name for name in inventory["tensors"] if not name.startswith(prefix))
-        if unknown:
-            raise ValueError(f"Emotion inventory contains tensors outside {prefix}: {unknown[:8]}")
-        config["skip_ema"] = bool(raw.get("skip_ema", True))
+        allowed = tuple(sorted(inventory["tensors"]))
+        missing = sorted(name for name in ("proj.weight", "proj.bias") if name not in allowed)
+        if missing:
+            raise ValueError(f"Emotion inference head missing from inventory: {missing}")
+        names = {name: name.removeprefix(prefix) for name in allowed if name.startswith(prefix)}
+    if args.family == "ct-punc":
+        # The official tokenizer ships as tokens.json; the model needs the
+        # vocabulary size to size its embedding (471067 x 516).
+        tokens = json.loads((model_dir / "tokens.json").read_text())
+        config = json.loads(json.dumps(raw))  # plain dict, no yaml tags
+        config.setdefault("model_conf", {})["vocab_size"] = len(tokens)
+    if args.family == "sensevoice":
+        # The strict loader sizes ctc_lo from vocab_size; the official yaml
+        # leaves it to the tokenizer (25055 pieces in the shipped bpe model).
+        import sentencepiece as _spm
+
+        _sp = _spm.SentencePieceProcessor()
+        _sp.load(str(model_dir / "chn_jpn_yue_eng_ko_spectok.bpe.model"))
+        config = json.loads(json.dumps(raw))
+        config.setdefault("model_conf", {})["vocab_size"] = int(_sp.get_piece_size())
+        config.setdefault("model_conf", {})["input_size"] = int(
+            (raw.get("frontend_conf") or {}).get("n_mels", 80)
+        ) * int((raw.get("frontend_conf") or {}).get("lfr_m", 7))
     if (model_dir / "am.mvn").is_file():
         config.setdefault("frontend_conf", {})["cmvn_file"] = str(model_dir / "am.mvn")
     info = convert_checkpoint(
@@ -47,6 +66,7 @@ def main():
         stream_large_tensors=True,
         name_map=names,
         config=config,
+        allowed_source_keys=allowed or None,
     )
     (args.destination / "source-config.yaml").write_text((model_dir / "config.yaml").read_text())
     (args.destination / "config-disposition.json").write_text(json.dumps(disposition, indent=2))

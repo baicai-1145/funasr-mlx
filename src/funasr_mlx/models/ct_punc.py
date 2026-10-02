@@ -176,12 +176,16 @@ class SanmEncoderConfig:
     padding_idx: int = -1
 
     def __post_init__(self) -> None:
-        for name in ("input_size", "output_size", "attention_heads", "linear_units",
-                     "num_blocks", "kernel_size"):
+        for name in (
+            "input_size",
+            "output_size",
+            "attention_heads",
+            "linear_units",
+            "num_blocks",
+            "kernel_size",
+        ):
             object.__setattr__(self, name, _as_int(getattr(self, name), name, minimum=1))
-        object.__setattr__(
-            self, "sanm_shfit", _as_int(self.sanm_shfit, "sanm_shfit", minimum=0)
-        )
+        object.__setattr__(self, "sanm_shfit", _as_int(self.sanm_shfit, "sanm_shfit", minimum=0))
         object.__setattr__(
             self, "padding_idx", _as_int(self.padding_idx, "padding_idx", minimum=-1)
         )
@@ -230,6 +234,11 @@ class SanmEncoderConfig:
         """Build from a FunASR ``encoder_conf`` mapping."""
         if not isinstance(config, Mapping):
             raise TypeError(f"encoder_conf must be a mapping, got {type(config).__name__}")
+        # The official config passes pos_enc_class (a class object the SANM
+        # encoder only reads for other input_layers; input_layer="pe" never
+        # touches it). It selects no weights here, so accept-and-ignore keeps
+        # the config loadable while adding no silent behaviour.
+        config = {k: v for k, v in config.items() if k != "pos_enc_class"}
         return cls(**_known_fields(cls, config, "encoder_conf"))
 
 
@@ -294,8 +303,7 @@ class CtPuncConfig:
         )
         _require(
             isinstance(self.encoder, SanmEncoderConfig),
-            "encoder must be a SanmEncoderConfig, got "
-            f"{type(self.encoder).__name__}",
+            f"encoder must be a SanmEncoderConfig, got {type(self.encoder).__name__}",
         )
         _require(
             self.encoder.input_size == self.embed_unit,
@@ -377,9 +385,7 @@ class CharVocab:
         return cls(tokens, unk_symbol=unk_symbol)
 
     @classmethod
-    def from_config(
-        cls, config: Mapping[str, Any], path: str | Path | None = None
-    ) -> "CharVocab":
+    def from_config(cls, config: Mapping[str, Any], path: str | Path | None = None) -> "CharVocab":
         """Build from a FunASR ``tokenizer_conf`` mapping (or an explicit path)."""
         source = config or {}
         if "tokenizer_conf" in source:
@@ -521,13 +527,17 @@ class SanmAttention(nn.Module):
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.linear_q_k_v = nn.Linear(in_feat, n_feat * 3)
         self.fsmn_block = nn.Conv1d(
-            n_feat, n_feat, kernel_size, stride=1, padding=0, dilation=1,
-            groups=n_feat, bias=False,
+            n_feat,
+            n_feat,
+            kernel_size,
+            stride=1,
+            padding=0,
+            dilation=1,
+            groups=n_feat,
+            bias=False,
         )
         self.left_pad = (kernel_size - 1) // 2 if left_pad is None else int(left_pad)
-        self.right_pad = (
-            kernel_size - 1 - self.left_pad if right_pad is None else int(right_pad)
-        )
+        self.right_pad = kernel_size - 1 - self.left_pad if right_pad is None else int(right_pad)
         if self.left_pad < 0 or self.right_pad < 0:
             raise ValueError(
                 f"depthwise padding must be non-negative, got "
@@ -589,7 +599,7 @@ class SanmAttention(nn.Module):
     def __call__(self, x: mx.array, mask: mx.array | None = None) -> mx.array:
         q_h, k_h, v_h, v = self.forward_qkv(x)
         fsmn_memory = self.forward_fsmn(v, mask)
-        q_h = q_h * (self.d_k ** -0.5)
+        q_h = q_h * (self.d_k**-0.5)
         scores = q_h @ mx.transpose(k_h, (0, 1, 3, 2))
         return self.forward_attention(v_h, scores, mask) + fsmn_memory
 
@@ -680,9 +690,7 @@ class SanmEncoder(nn.Module):
         if self.after_norm is not None:
             xs_pad = self.after_norm(xs_pad)
 
-        olens = [
-            int(v) for v in mx.sum(masks[:, 0, :], axis=-1).astype(mx.int32).tolist()
-        ]
+        olens = [int(v) for v in mx.sum(masks[:, 0, :], axis=-1).astype(mx.int32).tolist()]
         return xs_pad, olens
 
 
@@ -1054,15 +1062,15 @@ class CtPuncPunctuator:
                     drop_last = True
                     replacement = "。" if last_char != "," else "."
                 elif (
-                    last_char not in cfg.sentence_end_puncs
-                    and len(last_char.encode("utf-8")) != 1
+                    last_char not in cfg.sentence_end_puncs and len(last_char.encode("utf-8")) != 1
                 ):
                     replacement = "。"
                 elif last_char not in (".", "?") and len(last_char.encode("utf-8")) == 1:
                     replacement = "."
                 if replacement is not None:
                     out_text = (
-                        accumulated_text[:-1] + replacement if drop_last
+                        accumulated_text[:-1] + replacement
+                        if drop_last
                         else accumulated_text + replacement
                     )
                     rewrite_last_punc = True

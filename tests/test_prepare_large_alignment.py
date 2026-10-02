@@ -1,12 +1,11 @@
 import json
-from pathlib import Path
 
 import yaml
 
 from tools.prepare_large_alignment import main
 
 
-def _write_campaign(tmp_path, tensors, family="emotion2vec", config=None):
+def _write_campaign(tmp_path, tensors, family="emotion2vec", config=None, declared=None):
     model_dir = tmp_path / "models" / family
     model_dir.mkdir(parents=True)
     (model_dir / "config.yaml").write_text(
@@ -37,7 +36,7 @@ def _write_campaign(tmp_path, tensors, family="emotion2vec", config=None):
                         "dtype": str(value.dtype).replace("torch.", ""),
                         "bytes": value.numel() * value.element_size(),
                     }
-                    for name, value in tensors.items()
+                    for name, value in (declared if declared is not None else tensors).items()
                 },
                 "checkpoint": str(model_dir / "model.pt"),
             }
@@ -66,8 +65,14 @@ def test_emotion_conversion_strips_scope_prefix_and_records_disposition(
         "d2v_model.blocks.0.attn.proj.weight": torch.eye(32, dtype=torch.float32).reshape(
             1, 32, 32
         ),
+        "proj.weight": torch.ones(32, 2),
+        "proj.bias": torch.zeros(2),
+        "d2v_model.decoder.proj.weight": torch.ones(2, 2),
     }
-    _write_campaign(tmp_path, tensors)
+    declared = {
+        name: value for name, value in tensors.items() if name != "d2v_model.decoder.proj.weight"
+    }
+    _write_campaign(tmp_path, tensors, declared=declared)
     destination = tmp_path / "native-full" / "emotion2vec"
     monkeypatch.setattr(
         "sys.argv",
@@ -84,11 +89,11 @@ def test_emotion_conversion_strips_scope_prefix_and_records_disposition(
     main()
     captured = json.loads(capsys.readouterr().out)
     assert captured["family"] == "emotion2vec"
-    assert captured["parameters"] == 2
+    assert captured["parameters"] == 4
     from funasr_mlx.checkpoints import inspect_checkpoint, safetensor_header
 
     info = inspect_checkpoint(destination)
-    assert info.tensor_count == 2
+    assert info.tensor_count == 4
     header = safetensor_header(destination / info.files[0])
     assert "modality_encoders.AUDIO.extra_tokens" in header
     assert "d2v_model" not in " ".join(header)
@@ -96,13 +101,20 @@ def test_emotion_conversion_strips_scope_prefix_and_records_disposition(
     disposition = json.loads((destination / "config-disposition.json").read_text())
     assert "scope_map" in disposition
     assert (destination / "source-config.yaml").is_file()
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    assert index["metadata"]["training_only_skipped"] == ["d2v_model.decoder.proj.weight"]
 
 
 def test_emotion_conversion_refuses_tensors_outside_scope(tmp_path, monkeypatch):
     import torch
 
-    tensors = {"encoder.weight": torch.ones(4, 4)}
-    _write_campaign(tmp_path, tensors)
+    tensors = {
+        "proj.weight": torch.ones(4, 4),
+        "proj.bias": torch.zeros(4),
+        "encoder.weight": torch.ones(4, 4),
+    }
+    declared = {"proj.weight": tensors["proj.weight"], "proj.bias": tensors["proj.bias"]}
+    _write_campaign(tmp_path, tensors, declared=declared)
     destination = tmp_path / "native"
     monkeypatch.setattr(
         "sys.argv",
@@ -119,6 +131,6 @@ def test_emotion_conversion_refuses_tensors_outside_scope(tmp_path, monkeypatch)
     try:
         main()
     except ValueError as error:
-        assert "outside d2v_model." in str(error)
+        assert "outside declared inference subset" in str(error)
     else:
         raise AssertionError("conversion must refuse unscoped tensor names")

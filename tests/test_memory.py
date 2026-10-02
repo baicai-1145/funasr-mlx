@@ -31,7 +31,24 @@ def test_unsafe_policies_rejected(overrides):
         MemoryPolicy(**overrides)
 
 
-def test_low_host_memory_refuses_job(monkeypatch, tmp_path):
+def test_default_policy_admits_low_available_snapshot(monkeypatch, tmp_path):
+    from funasr_mlx import memory
+
+    monkeypatch.setattr(
+        memory,
+        "_psutil",
+        lambda: SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=1 * GB)),
+    )
+    monkeypatch.setattr(memory, "project_rss", lambda root: 0)
+    # macOS frees purgeable pages on demand; default policies rely on the
+    # external RSS watchdog instead of the available-memory snapshot.
+    assert preflight(tmp_path, MemoryPolicy()) == {
+        "available": 1 * GB,
+        "project_rss": 0,
+    }
+
+
+def test_enforced_min_available_still_refuses(monkeypatch, tmp_path):
     from funasr_mlx import memory
 
     monkeypatch.setattr(
@@ -41,7 +58,7 @@ def test_low_host_memory_refuses_job(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(memory, "project_rss", lambda root: 0)
     with pytest.raises(MemoryBudgetExceeded, match="available"):
-        preflight(tmp_path, MemoryPolicy())
+        preflight(tmp_path, MemoryPolicy(process_limit=3 * GB, enforce_min_available=True))
 
 
 def test_high_project_memory_refuses_job(monkeypatch, tmp_path):

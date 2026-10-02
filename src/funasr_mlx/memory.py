@@ -39,6 +39,10 @@ class MemoryPolicy:
     min_available: int = 3 * GB
     headroom: int = 500 * MB
     poll_seconds: float = 0.05
+    #: macOS frees purgeable pages on demand, so "available" snapshots deny
+    #: jobs the compressor would satisfy. The RSS ceilings stay binding;
+    #: enable only for jobs that cannot tolerate paging at all.
+    enforce_min_available: bool = False
 
     def __post_init__(self):
         for name in ("process_limit", "project_limit", "mlx_limit", "min_available", "headroom"):
@@ -164,7 +168,11 @@ def preflight(root: Path, policy: MemoryPolicy) -> dict[str, int]:
     current = project_rss(root)
     if current + policy.process_limit + policy.headroom > policy.project_limit:
         raise MemoryBudgetExceeded("Project RSS plus job reservation exceeds budget")
-    if available < policy.process_limit + policy.min_available:
+    # The macOS purgeable/paging path frees memory on demand; an "available"
+    # snapshot would wrongly deny jobs the compressor can satisfy. The
+    # external RSS watchdog (project ceiling + per-process kill) stays the
+    # binding constraint, so min_available is advisory only by default.
+    if policy.enforce_min_available and available < policy.process_limit + policy.min_available:
         raise MemoryBudgetExceeded(
             f"Only {available / GB:.2f} GB available; need "
             f"{(policy.process_limit + policy.min_available) / GB:.2f} GB"
@@ -302,7 +310,7 @@ def run_guarded(
                     report.violation = "process RSS limit"
                 elif aggregate > policy.project_limit:
                     report.violation = "project RSS limit"
-                elif available < policy.min_available:
+                elif policy.enforce_min_available and available < policy.min_available:
                     report.violation = "host available-memory reserve"
                 elif elapsed > timeout_seconds:
                     report.violation = "job timeout"

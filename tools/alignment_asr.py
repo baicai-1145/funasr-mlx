@@ -710,7 +710,14 @@ def _load_checkpoint_state(path: Path) -> dict[str, Any]:
     """
     import torch
 
-    payload = torch.load(str(path), map_location="cpu", weights_only=True, mmap=True)
+    try:
+        payload = torch.load(str(path), map_location="cpu", weights_only=True, mmap=True)
+    except RuntimeError as error:
+        # Paraformer's official checkpoint is legacy (non-zip) serialization;
+        # mmap is unavailable there and the payload must load into RSS.
+        if "mmap" not in str(error):
+            raise
+        payload = torch.load(str(path), map_location="cpu", weights_only=True)
     for container in ("model", "state_dict", "model_state_dict"):
         if isinstance(payload, dict) and container in payload:
             payload = payload[container]
@@ -1265,6 +1272,11 @@ def _build_reference_frontend(config: dict[str, Any], assets: dict[str, Any]) ->
     """
     frontend_conf = dict(config.get("frontend_conf") or {})
     frontend_conf.pop("cmvn_file", None)
+    # The official yaml omits dither, and FunASR's WavFrontend then defaults to
+    # 1.0 -- random noise on every run. The native side uses the spec's dither
+    # (0.0), so pin the reference to the same value or the comparison measures
+    # dither noise instead of the port.
+    frontend_conf.setdefault("dither", 0.0)
     frontend_class = _resolve_wav_frontend()
     return frontend_class(cmvn_file=assets.get("cmvn_file"), **frontend_conf)
 
@@ -1301,6 +1313,12 @@ def _reference_vocab_size(
             None,
         )
 
+    # configuration.json's tokenizer_conf is authoritative where config.yaml
+    # ships nulls (bpemodel: None would reach sentencepiece as a literal None).
+    if bpemodel:
+        tokenizer_conf = {k: v for k, v in tokenizer_conf.items() if v is not None}
+        tokenizer_conf.setdefault("bpemodel", bpemodel)
+
     for module_path, attribute in (
         ("funasr.tokenizer.sentencepiece_tokenizer", "SentencepiecesTokenizer"),
         ("funasr.tokenizer.char_tokenizer", "CharTokenizer"),
@@ -1317,6 +1335,11 @@ def _reference_vocab_size(
             tokenizer_conf.setdefault("bpemodel", bpemodel)
         tokenizer = getattr(module, attribute)(**tokenizer_conf)
         size = getattr(tokenizer, "vocab_size", None)
+        if size is None:
+            # SentencepiecesTokenizer spells it get_vocab_size() over the
+            # underlying piece table.
+            getter = getattr(tokenizer, "get_vocab_size", None)
+            size = getter() if callable(getter) else None
         if size is None:
             raise AlignmentError(
                 f"{tokenizer_name} exposes no vocab_size; refusing to guess the "
@@ -1441,10 +1464,17 @@ def _run_reference_sample(
     audio = _load_audio(item["audio"])
     _reject_overlength(item["key"], int(audio.shape[0]), variant)
     with torch.no_grad():
-        fbank = frontend(audio)
+        # WavFrontend.forward(input(B,T), input_lengths) returns (feats,
+        # feats_len) and already applies LFR + CMVN internally.
+        fbank, _fbank_len = frontend(
+            torch.from_numpy(audio)[None, :],
+            torch.tensor([audio.shape[0]], dtype=torch.int32),
+        )
         fbank = np.asarray(fbank, dtype=np.float32)
-        speech = torch.from_numpy(fbank)[None, :, :]
-        lengths = torch.tensor([fbank.shape[0]], dtype=torch.int32)
+        # frontend returns (B=1, T, D); keep batch dim for the model but save
+        # the (T, D) row so the comparison geometry matches the native side.
+        speech = torch.from_numpy(fbank)
+        lengths = torch.tensor([fbank.shape[1]], dtype=torch.int32)
 
         finals: dict[str, Any] = {}
         token_ids: list[int] | None = None
@@ -1490,8 +1520,11 @@ def _run_reference_sample(
         else:  # pragma: no cover - dispatched earlier
             raise AlignmentError(f"reference path for {variant['family']} is not wired")
 
-    stages = [_stage_record("frontend", fbank, path=output_root / f"{item['key']}_frontend.npz")]
-    saved: dict[str, Any] = {"frontend": fbank}
+    fbank_row = fbank[0] if fbank.ndim == 3 else fbank
+    stages = [
+        _stage_record("frontend", fbank_row, path=output_root / f"{item['key']}_frontend.npz")
+    ]
+    saved: dict[str, Any] = {"frontend": fbank_row}
     for stage_name, value in finals.items():
         stages.append(
             _stage_record(stage_name, value, path=output_root / f"{item['key']}_{stage_name}.npz")
@@ -1508,7 +1541,7 @@ def _run_reference_sample(
         # disagreement rather than as a mysterious numeric difference.
         "audio_samples": int(audio.shape[0]),
         "audio_seconds": round(int(audio.shape[0]) / float(SAMPLE_RATE), 6),
-        "fbank_frames": int(fbank.shape[0]),
+        "fbank_frames": int(fbank.shape[0] if fbank.ndim == 2 else fbank.shape[1]),
         "stages": stages,
         "token_ids": token_ids,
         "conditioning_ids": conditioning or None,
@@ -1566,7 +1599,9 @@ def _sensevoice_ctc_logits(model: Any, encoder_out: Any) -> Any:
         raise AlignmentError(
             "SenseVoiceSmall has no ctc head; refusing to substitute another head for the real one"
         )
-    return head.log_softmax(head(encoder_out))
+    # CTC.log_softmax() itself applies ctc_lo then log-softmax
+    # (ctc/ctc.py:201). Pre-projecting here would double-apply it.
+    return head.log_softmax(encoder_out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1694,8 +1729,12 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
     output_root = Path(output_root or spec["output_root"]) / "native"
     output_root.mkdir(parents=True, exist_ok=True)
 
+    # The native side must be sized by the CONVERTED artifact's config (which
+    # carries the tokenizer-derived vocab_size), not the original yaml whose
+    # nulls the native defaults would silently mis-size (55465 vs 25055).
+    _native_config_path = Path(native_checkpoint) / "config.json"
     model, _ = pipeline.load_model(
-        native_checkpoint, family=variant["family"], config=variant["config"]
+        native_checkpoint, family=variant["family"], config=_native_config_path
     )
 
     parameters = flatten_state_dict(model)
@@ -1720,7 +1759,7 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
             f"native key inventory mismatch: missing={inventory['missing']} "
             f"unexpected={inventory['unexpected']} shapes={len(inventory['shape_mismatch'])}"
         )
-    inexact = sorted(name for name, array in parameters.items() if str(array.dtype) != "float32")
+    inexact = sorted(name for name, array in parameters.items() if array.dtype != mx.float32)
     if inexact:
         raise AlignmentError(
             f"{len(inexact)} native parameters are not float32 (for example {inexact[:5]}); "
@@ -1824,12 +1863,16 @@ def _run_native_sample(
 
     audio = _load_audio(item["audio"])
     _reject_overlength(item["key"], int(audio.shape[0]), variant)
+    # The native frontend takes rank-1 mono and returns (T, D) directly.
     fbank = np.asarray(frontend(audio), dtype=np.float32)
     speech = mx.array(fbank)[None, :, :]
     lengths = mx.array([fbank.shape[0]], dtype=mx.int32)
 
-    stages = [_stage_record("frontend", fbank, path=output_root / f"{item['key']}_frontend.npz")]
-    saved: dict[str, Any] = {"frontend": fbank}
+    fbank_row = fbank[0] if fbank.ndim == 3 else fbank
+    stages = [
+        _stage_record("frontend", fbank_row, path=output_root / f"{item['key']}_frontend.npz")
+    ]
+    saved: dict[str, Any] = {"frontend": fbank_row}
     finals: dict[str, Any] = {}
     token_ids: list[int] | None = None
     conditioning: dict[str, Any] | None = None
@@ -1882,7 +1925,7 @@ def _run_native_sample(
         "duration_seconds": item["duration_seconds"],
         "audio_samples": int(audio.shape[0]),
         "audio_seconds": round(int(audio.shape[0]) / float(SAMPLE_RATE), 6),
-        "fbank_frames": int(fbank.shape[0]),
+        "fbank_frames": int(fbank.shape[0] if fbank.ndim == 2 else fbank.shape[1]),
         "stages": stages,
         "token_ids": token_ids,
         "conditioning_ids": conditioning,

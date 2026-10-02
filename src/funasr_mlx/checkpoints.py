@@ -177,6 +177,7 @@ def convert_checkpoint(
     allow_legacy: bool = False,
     stream_large_tensors: bool = False,
     name_map: Mapping[str, str] | None = None,
+    allowed_source_keys: tuple[str, ...] | None = None,
 ) -> CheckpointInfo:
     """Convert a local torch ZIP checkpoint with mmap and one tensor at a time.
 
@@ -219,6 +220,7 @@ def convert_checkpoint(
         raise ValueError("Expected a nonempty state_dict mapping")
     destination.mkdir(parents=True)
     pending, buffered, shard_number, weight_map = {}, 0, 0, {}
+    skipped: list[str] = []
 
     def flush():
         nonlocal pending, buffered, shard_number
@@ -235,6 +237,13 @@ def convert_checkpoint(
     for original_name, tensor in state.items():
         if not isinstance(original_name, str) or not isinstance(tensor, torch.Tensor):
             raise ValueError("Non-tensor checkpoint entries are not silently discarded")
+        if allowed_source_keys is not None and original_name not in allowed_source_keys:
+            if ".decoder." not in original_name and ".ema" not in original_name:
+                raise ValueError(
+                    f"Checkpoint key outside declared inference subset: {original_name}"
+                )
+            skipped.append(original_name)
+            continue
         if prefix and not original_name.startswith(prefix):
             raise ValueError(f"Tensor outside requested source prefix: {original_name}")
         name = (name_map or {}).get(original_name, original_name[len(prefix) :])
@@ -284,6 +293,7 @@ def convert_checkpoint(
             "source_format": "zip" if is_zip else "legacy",
             "stream_large_tensors": stream_large_tensors,
             "name_map": dict(name_map or {}),
+            "training_only_skipped": sorted(skipped),
         },
         "weight_map": weight_map,
     }
