@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import struct
+import zipfile
 from typing import Mapping
 
 import numpy as np
@@ -173,13 +174,16 @@ def convert_checkpoint(
     tensor_limit: int = 384_000_000,
     prefix: str = "",
     config: Mapping | None = None,
+    allow_legacy: bool = False,
+    stream_large_tensors: bool = False,
+    name_map: Mapping[str, str] | None = None,
 ) -> CheckpointInfo:
     """Convert a local torch ZIP checkpoint with mmap and one tensor at a time.
 
     Only call inside the guarded launcher. No network or pickle fallback.
     Strict inference loading later checks the architecture's keys and shapes.
     """
-    from .memory import guarded_child_active
+    from .memory import MemoryPolicy, guarded_child_active
 
     if not guarded_child_active():
         raise RuntimeError("Checkpoint conversion must run under the memory guard")
@@ -195,7 +199,16 @@ def convert_checkpoint(
     import torch
     from safetensors.numpy import save_file
 
-    state = torch.load(source, map_location="cpu", weights_only=True, mmap=True)
+    import os
+
+    policy = MemoryPolicy(**json.loads(os.environ["FUNASR_MLX_MEMORY_POLICY"]))
+    is_zip = zipfile.is_zipfile(source)
+    if not is_zip:
+        if not allow_legacy:
+            raise ValueError("Legacy checkpoint requires explicit allow_legacy admission")
+        if source.stat().st_size + 500_000_000 > policy.process_limit:
+            raise ValueError("Legacy checkpoint plus reader headroom exceeds job budget")
+    state = torch.load(source, map_location="cpu", weights_only=True, mmap=is_zip)
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
     elif isinstance(state, dict) and "state_dict" in state:
@@ -224,8 +237,11 @@ def convert_checkpoint(
             raise ValueError("Non-tensor checkpoint entries are not silently discarded")
         if prefix and not original_name.startswith(prefix):
             raise ValueError(f"Tensor outside requested source prefix: {original_name}")
-        name = original_name[len(prefix) :]
-        if tensor.numel() * max(tensor.element_size(), 4) > tensor_limit:
+        name = (name_map or {}).get(original_name, original_name[len(prefix) :])
+        if name in weight_map or name in pending:
+            raise ValueError(f"Duplicate converted tensor name: {name}")
+        large = tensor.numel() * max(tensor.element_size(), 4) > tensor_limit
+        if large and not stream_large_tensors:
             raise ValueError(f"Tensor exceeds conversion buffer bound: {name}")
         if tensor.dtype == torch.bfloat16:
             tensor = tensor.float()
@@ -235,6 +251,22 @@ def convert_checkpoint(
         if name.endswith(("running_mean", "running_var")):
             output_dtype = "float32"
         size = array.size * np.dtype(output_dtype).itemsize
+        if large:
+            from .checkpoint_stream import write_tensor
+
+            flush()
+            shard_number += 1
+            filename = f"model-{shard_number:05d}.safetensors"
+            write_tensor(
+                destination / filename,
+                name,
+                array,
+                dtype=output_dtype,
+                metadata={"format": "funasr-mlx", "model": model},
+            )
+            weight_map[name] = filename
+            del array, tensor
+            continue
         if buffered and buffered + size > shard_bytes:
             flush()
         array = np.asarray(array, dtype=output_dtype, order="C")
@@ -245,7 +277,14 @@ def convert_checkpoint(
         del array, tensor
     flush()
     index = {
-        "metadata": {"format": "funasr-mlx", "model": model, "dtype": dtype},
+        "metadata": {
+            "format": "funasr-mlx",
+            "model": model,
+            "dtype": dtype,
+            "source_format": "zip" if is_zip else "legacy",
+            "stream_large_tensors": stream_large_tensors,
+            "name_map": dict(name_map or {}),
+        },
         "weight_map": weight_map,
     }
     (destination / "model.safetensors.index.json").write_text(json.dumps(index, indent=2) + "\n")
