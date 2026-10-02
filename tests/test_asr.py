@@ -1363,32 +1363,42 @@ def test_conv_layout_rule_applies_to_the_weight_only(name, rule, expected_torch_
     the bias inherited the kernel rule and ``load_strict(convert=True)``
     transposed a 1-D array with three axes, a ValueError on every biased conv.
 
-    This previously asserted the torch shape *differs* from the native one, which
-    is unsound: ``conv1`` has ``in_channels == kernel_size == 3``, so both
-    layouts are ``(5, 3, 3)`` even though the axes are transposed. Shape
-    equality says nothing about layout identity. So this asserts the transformed
-    **contents** against an explicit axis permutation, using the deliberately
-    non-uniform values from :func:`_mixed_conv_holder`.
+    ``convert_checkpoint_tensor`` is **torch -> MLX**, so this builds the torch
+    input first and converts *back*, rather than converting a native array and
+    expecting a torch one. That direction matters: Conv1d's ``(0, 2, 1)`` is
+    self-inverse, so feeding it the native array happened to work, while Conv2d's
+    ``(0, 2, 3, 1)`` and ``(0, 3, 1, 2)`` are not inverses of each other and the
+    test was silently exercising the wrong transformation.
+
+    Contents are asserted, not shapes: ``conv1`` has ``in_channels ==
+    kernel_size == 3``, so both layouts are ``(5, 3, 3)`` even though the axes are
+    transposed, and shape equality says nothing about layout identity.
     """
     tensors, rules = flatten_state_dict_with_rules(_mixed_conv_holder())
     assert rules[name] == rule
-
     native = tensors[name]
-    converted = convert_checkpoint_tensor(name, native, rule)
-    assert tuple(converted.shape) == tuple(expected_torch_shape)
 
     if rule == IDENTITY_LAYOUT:
-        assert mx.array_equal(converted, native).item()
+        assert tuple(native.shape) == tuple(expected_torch_shape)
+        assert mx.array_equal(convert_checkpoint_tensor(name, native, rule), native).item()
         return
 
-    order = (0, 2, 1) if rule == CONV1D_LAYOUT else (0, 3, 1, 2)
-    assert mx.array_equal(converted, mx.transpose(native, order)).item()
-    # Non-identity, demonstrated rather than assumed.
-    assert not mx.array_equal(converted, native).item()
+    # Inverse of the torch -> MLX permutation, i.e. native (out, kh, kw, in) ->
+    # torch (out, in, kh, kw) for Conv2d; Conv1d's (0, 2, 1) is self-inverse.
+    to_torch = (0, 2, 1) if rule == CONV1D_LAYOUT else (0, 3, 1, 2)
+    torch_tensor = mx.transpose(native, to_torch)
+    assert tuple(torch_tensor.shape) == tuple(expected_torch_shape)
+    # Non-identity, demonstrated rather than assumed: a torch-layout tensor that
+    # already matched the native one would make the rule untestable.
+    assert not mx.array_equal(torch_tensor, native).item()
     if rule == CONV1D_LAYOUT:
-        # The case that broke the old assertion: identical shape on both sides
-        # and still a genuine transpose.
-        assert tuple(converted.shape) == tuple(native.shape)
+        # The case that broke two earlier revisions of this test: identical shape
+        # on both sides and still a genuine transpose.
+        assert tuple(torch_tensor.shape) == tuple(native.shape)
+
+    round_trip = convert_checkpoint_tensor(name, torch_tensor, rule)
+    assert tuple(round_trip.shape) == tuple(native.shape)
+    assert mx.array_equal(round_trip, native).item()
 
 
 def test_standalone_conv_weights_and_biases_round_trip_through_the_loader():
