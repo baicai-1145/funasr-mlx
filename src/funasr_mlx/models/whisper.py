@@ -200,20 +200,24 @@ def _rule_for(module: mxnn.Module) -> str:
     return CONV1D_LAYOUT if isinstance(module, mxnn.Conv1d) else IDENTITY_LAYOUT
 
 
-#: Buffers the canonical module registers with ``persistent=False``, which are
-#: therefore **absent from every published checkpoint**.
+#: Leaf parameter names that are **absent from every published checkpoint**.
 #:
-#: ``TextDecoder`` registers its derived causal ``mask`` that way
-#: (OpenAI release v20250625 ``model.py:225``); ``Whisper`` does the same for
-#: ``alignment_heads`` (``:276``).  Leaving ``mask`` in the parameter inventory
-#: makes a strict load of a perfectly good checkpoint fail with a spurious
-#: "missing" key.
+#: Canonical registers its derived causal ``mask`` with ``persistent=False``
+#: (OpenAI release v20250625 ``model.py:225``) and ``alignment_heads`` the same
+#: way (``:276``, ``:285``).  Leaving either in the parameter inventory makes a
+#: strict load of a perfectly good checkpoint fail with a spurious "missing"
+#: key, which is exactly what happened: this set previously named the *torch*
+#: field ``decoder.mask`` while the native module stores ``self._mask``, so the
+#: exclusion never fired and ``decoder._mask`` was still collected.
 #:
-#: This is an explicit allowlist of exactly those buffers.  A blanket
-#: "skip every private array" rule would also swallow real parameters, and the
-#: encoder's ``positional_embedding`` is a *persistent* buffer (``:181``) that
-#: must stay.
-NON_PERSISTENT_BUFFERS = frozenset({"decoder.mask", "alignment_heads"})
+#: Matched on the **leaf** name rather than the full dotted path, so one entry
+#: covers every prefix: ``decoder._mask`` on a full ``Whisper``, ``_mask`` on a
+#: standalone ``TextDecoder``, and either under a caller-supplied ``prefix``.
+#:
+#: This is an explicit list of exactly those two buffers.  A blanket "skip every
+#: private array" rule would also swallow real parameters -- the encoder's
+#: ``positional_embedding`` is a *persistent* buffer (``:181``) and must stay.
+NON_PERSISTENT_BUFFERS = frozenset({"_mask", "alignment_heads"})
 
 
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
@@ -235,7 +239,9 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
         if isinstance(value, mxnn.Module):
             _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
-            if name in NON_PERSISTENT_BUFFERS:
+            # Leaf match rather than the full dotted name, so one entry covers
+            # the full model, a standalone submodule and any caller prefix.
+            if name.rsplit(".", 1)[-1] in NON_PERSISTENT_BUFFERS:
                 continue
             tensors[name] = value
             rules[name] = _rule_for(module) if key == "weight" else IDENTITY_LAYOUT

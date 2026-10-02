@@ -119,8 +119,53 @@ def test_decoder_causal_mask_is_lower_triangular_neg_inf():
             value = mask[i, j].item()
             assert math.isinf(value) and value < 0 if j > i else value == 0.0
     # The mask is NOT a checkpoint parameter: torch registers it persistent=False.
-    assert "decoder.mask" not in flatten_state_dict(decoder)
-    assert "decoder._mask" not in flatten_state_dict(decoder)
+    # Assert on the real forms. The previous version checked "decoder.mask" and
+    # "decoder._mask" against a STANDALONE decoder, whose keys carry no "decoder."
+    # prefix, so both assertions were trivially true and the prefixed key the
+    # canonical golden load actually sees was never exercised.
+    assert "_mask" not in flatten_state_dict(decoder)
+    assert "decoder._mask" not in flatten_state_dict(_whisper())
+
+
+def test_mask_is_excluded_under_every_prefix_form():
+    """One leaf-name rule must cover the full model, a submodule and a prefix."""
+    keys = set(flatten_state_dict(_whisper()))
+    assert keys, "the fixture must expose parameters"
+    assert not any(key.rsplit(".", 1)[-1] == "_mask" for key in keys)
+    prefixed = set(flatten_state_dict(_whisper(), "model"))
+    assert not any(key.rsplit(".", 1)[-1] == "_mask" for key in prefixed)
+    assert "model.decoder.blocks.0.attn.query.weight" in prefixed
+
+
+def test_persistent_buffers_are_not_over_excluded():
+    """``positional_embedding`` is persistent and must survive the exclusion."""
+    keys = set(flatten_state_dict(_whisper()))
+    assert "encoder.positional_embedding" in keys
+    # Sanity: the rule really is filtering, not filtering everything.
+    assert len(keys) > 10
+
+
+def test_alignment_heads_is_excluded_once_it_is_an_array():
+    """``alignment_heads`` is persistent=False in canonical too (model.py:276)."""
+    model = _whisper()
+    assert model.alignment_heads is None
+    model.alignment_heads = mx.zeros((2, N_HEAD, N_STATE // 2), mx.float32)
+    keys = set(flatten_state_dict(model))
+    assert "alignment_heads" not in keys
+
+
+def test_published_key_set_loads_strictly_without_a_fabricated_mask():
+    """The inventory IS the published key set: nothing missing, nothing invented.
+
+    A strict load of exactly the flattened names must succeed, which is only
+    true if the non-persistent buffers are excluded from *both* sides. Fabricating
+    a ``decoder._mask`` entry to satisfy the loader would defeat the point.
+    """
+    model = _whisper()
+    state = dict(flatten_state_dict(model))
+    assert not any(key.rsplit(".", 1)[-1] in {"_mask", "alignment_heads"} for key in state)
+    clone = _whisper()
+    assert load_strict(clone, state).loaded == sorted(state)
 
 
 def _module_path(dotted: str):
