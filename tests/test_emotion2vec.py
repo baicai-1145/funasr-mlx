@@ -497,8 +497,8 @@ def test_no_extra_block_namespace_in_the_checkpoint_keys():
     """C3: children must be registered directly, not under an alias attribute."""
     config = tiny_config(vocab_size=5, labels=("a", "b", "c", "d", "e"))
     names = flat_parameter_names(Emotion2VecModel(config))
-    assert not any(".block." in name for name in names)
-    assert not any(".layers." in name for name in names)
+    for forbidden in (".block.", ".layers.", ".encoder."):
+        assert not any(forbidden in name for name in names), forbidden
     assert any(name.startswith("modality_encoders.AUDIO.local_encoder.conv_layers.0.0.")
                for name in names)
     assert any(name.startswith("modality_encoders.AUDIO.relative_positional_encoder.1.0.")
@@ -535,14 +535,33 @@ def test_tree_flatten_returns_a_dict_only_with_an_explicit_destination():
 def test_conv_weights_are_transposed_back_from_the_pytorch_layout():
     model = Emotion2VecModel(tiny_config(vocab_size=5, labels=("a", "b", "c", "d", "e")))
     state = _fake_pytorch_state(model)
+    key = "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight"
+    # the PyTorch-side fixture is (out, in//g, K) = (8, 1, 5)
+    assert state[key].shape == (8, 1, 5)
     converted, discarded = convert_checkpoint_tensors(state)
     assert discarded == ()
-    key = "modality_encoders.AUDIO.local_encoder.conv_layers.0.0.weight"
-    assert converted[key].shape == (8, 1, 5)  # (out, in//g, K)
-    assert flat_parameter_names(model)[key].shape == (8, 5, 1)  # (out, K, in//g)
+    # after conversion the tensor is in MLX layout (out, K, in//g) = (8, 5, 1)
+    assert converted[key].shape == (8, 5, 1)
+    assert flat_parameter_names(model)[key].shape == (8, 5, 1)
     pos = "modality_encoders.AUDIO.relative_positional_encoder.1.0.weight"
-    assert converted[pos].shape == (16, 4, 5)
-    assert flat_parameter_names(model)[pos].shape == (16, 5, 4)
+    assert state[pos].shape == (16, 4, 5)
+    assert converted[pos].shape == (16, 5, 4)
+
+
+def test_module_list_stack_indexes_by_position_and_by_string_key():
+    """``Module.update`` hands back the string keys that were registered."""
+    from funasr_mlx.models.emotion2vec import ModuleListStack
+
+    stack = ModuleListStack([TransposeLast(), TransposeLast(), TransposeLast()])
+    assert len(stack) == 3
+    assert stack[0] is not None
+    assert stack["0"] is not None
+    assert stack[-1] is not None
+    assert stack["2"] is not None
+    with pytest.raises(KeyError):
+        stack["not-a-key"]
+    with pytest.raises(IndexError):
+        stack[3]
 
 
 def test_conv_weight_conversion_rejects_a_wrong_rank():
