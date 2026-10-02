@@ -154,7 +154,8 @@ def test_load_strict_round_trips_and_reports_torch_only_buffers():
 
     clone = _campplus()
     loaded = load_strict(clone, {k: v for k, v in state.items()})
-    assert loaded == sorted(state)
+    assert loaded.loaded == sorted(state)
+    assert loaded.dropped == []
     for key, value in state.items():
         assert mx.array_equal(flatten_state_dict(clone)[key], value).item()
 

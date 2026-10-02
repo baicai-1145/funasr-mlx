@@ -123,7 +123,7 @@ def test_load_strict_round_trips_and_rejects_mismatch():
     model = _whisper()
     state = flatten_state_dict(model)
     clone = _whisper()
-    assert load_strict(clone, state) == sorted(state)
+    assert load_strict(clone, state).loaded == sorted(state)
     with pytest.raises(CheckpointKeyError):
         load_strict(_whisper(), {k: v for k, v in state.items() if k != "decoder.ln.bias"})
 
@@ -218,7 +218,57 @@ def test_kv_cache_matches_a_single_full_forward():
 
     step = model.logits(mx.array([[5]], dtype=mx.int32), audio_features, cache)
     assert cache["blocks.0.attn.key"].shape[1] == 5  # appended, not replaced
-    assert mx.allclose(step[0, -1, :], reference[0, -1, :], atol=1e-4).item()
+    # Token 5 sits at position 4 of full_tokens = [1, 2, 3, 4, 5, 6], so the
+    # matching reference row is index 4.  Index -1 is position 5, which is the
+    # prediction for token 6 given one more token -- a different prediction, not
+    # a cached-vs-uncached difference.
+    assert mx.allclose(step[0, -1, :], reference[0, 4, :], atol=1e-4).item()
+
+
+def test_kv_cache_matches_a_full_forward_at_every_position():
+    """Decoding one token at a time must reproduce the full pass row for row.
+
+    Stronger than comparing a single row: it exercises the positional offset and
+    the self-attention cache append at every step, and it is where a positional
+    or mask-extent error would show up.
+    """
+    model = _whisper().eval()
+    mel = mx.arange(1 * 40 * N_MELS, dtype=mx.float32).reshape(1, 40, N_MELS) / 97.0
+    audio_features = model.embed_audio(mel)
+    full_tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+
+    reference = model.logits(full_tokens, audio_features)
+
+    cache: dict[str, mx.array] = {}
+    for position in range(full_tokens.shape[1]):
+        step = model.logits(
+            mx.array([[full_tokens[0, position]]], dtype=mx.int32), audio_features, cache
+        )
+        mx.eval(step)
+        assert mx.allclose(step[0, -1, :], reference[0, position, :], atol=1e-4).item(), (
+            f"cached step {position} differs from the full forward at that position"
+        )
+        assert cache["blocks.0.attn.key"].shape[1] == position + 1
+
+
+def test_greedy_decode_bound_ignores_the_cross_attention_cache():
+    """Only self-attention grows, so only it may trip the cache bound.
+
+    The bound is ``n_text_ctx + max_tokens``, but cross-attention is keyed once
+    at ``n_audio_ctx``.  Here ``n_audio_ctx`` (20) exceeds the bound (16), and on
+    every published Whisper it is 1500 against 448, so taking the max over *all*
+    cache entries made decoding raise unconditionally.
+    """
+    model = _whisper().eval()
+    assert model.dims.n_audio_ctx > model.dims.n_text_ctx + 4
+    audio_features = model.embed_audio(mx.zeros((1, 40, N_MELS), mx.float32))
+    result = greedy_decode(
+        model,
+        audio_features,
+        mx.array([[1, 2]], dtype=mx.int32),
+        GreedyDecodeConfig(max_tokens=4, eot_token_id=15),
+    )
+    assert result.tokens and all(len(row) <= 4 for row in result.tokens)
 
 
 def test_suppress_masks_several_token_ids():
@@ -290,16 +340,32 @@ def test_encoder_halves_the_time_axis_exactly_once():
     assert _stride1d(encoder.conv2) == (2,)
 
 
-@pytest.mark.parametrize("frames", [4, 39, 41, 60])
+@pytest.mark.parametrize("frames", [4, 38, 41, 42, 60])
 def test_encoder_rejects_a_mis_sized_mel_input(frames):
     """The canonical encoder asserts an exact length; it must not slice to fit.
 
     Slicing the positional table to whatever length the conv stack produced is
     what previously hid the conv1 stride bug from this whole suite.
+
+    Canonical ``conv2`` is ``Conv1d(..., kernel_size=3, stride=2, padding=1)``,
+    so the output length is ``floor((L + 2 - 3) / 2) + 1 == ceil(L / 2)``.  The
+    check is on the **output** matching ``n_ctx``, not on the input being exactly
+    ``2 * n_ctx``: an odd input is accepted whenever it halves to ``n_ctx``.
     """
     encoder = AudioEncoder(n_mels=N_MELS, n_ctx=20, n_state=N_STATE, n_head=N_HEAD, n_layer=2)
     with pytest.raises(ValueError, match="incorrect audio shape"):
         encoder(mx.zeros((1, frames, N_MELS), mx.float32))
+
+
+def test_encoder_accepts_an_odd_length_that_halves_to_n_ctx():
+    """39 mel frames reduce to exactly 20, which canonical accepts.
+
+    The contract is "the encoder output must equal ``n_ctx``", so rejecting this
+    would be stricter than the reference; 38 (->19) and 42 (->21) are the
+    genuinely wrong neighbours.
+    """
+    encoder = AudioEncoder(n_mels=N_MELS, n_ctx=20, n_state=N_STATE, n_head=N_HEAD, n_layer=2)
+    assert encoder(mx.zeros((1, 39, N_MELS), mx.float32)).shape == (1, 20, N_STATE)
 
 
 def test_residual_block_applies_cross_attention_before_the_mlp():

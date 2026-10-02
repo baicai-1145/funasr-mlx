@@ -83,6 +83,7 @@ __all__ = [
     "Linear",
     "LoadReport",
     "ModelDimensions",
+    "NON_PERSISTENT_BUFFERS",
     "ModuleStack",
     "MultiHeadAttention",
     "ResidualAttentionBlock",
@@ -198,6 +199,22 @@ def _rule_for(module: mxnn.Module) -> str:
     return CONV1D_LAYOUT if isinstance(module, mxnn.Conv1d) else IDENTITY_LAYOUT
 
 
+#: Buffers the canonical module registers with ``persistent=False``, which are
+#: therefore **absent from every published checkpoint**.
+#:
+#: ``TextDecoder`` registers its derived causal ``mask`` that way
+#: (OpenAI release v20250625 ``model.py:225``); ``Whisper`` does the same for
+#: ``alignment_heads`` (``:276``).  Leaving ``mask`` in the parameter inventory
+#: makes a strict load of a perfectly good checkpoint fail with a spurious
+#: "missing" key.
+#:
+#: This is an explicit allowlist of exactly those buffers.  A blanket
+#: "skip every private array" rule would also swallow real parameters, and the
+#: encoder's ``positional_embedding`` is a *persistent* buffer (``:181``) that
+#: must stay.
+NON_PERSISTENT_BUFFERS = frozenset({"decoder.mask", "alignment_heads"})
+
+
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
     """Collect tensors from a module tree.
 
@@ -217,6 +234,8 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
         if isinstance(value, mxnn.Module):
             _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
+            if name in NON_PERSISTENT_BUFFERS:
+                continue
             tensors[name] = value
             rules[name] = _rule_for(module)
 
@@ -1138,11 +1157,19 @@ def greedy_decode(
             break
         tokens = mx.expand_dims(next_tokens, -1)
 
-    cache_len = max((v.shape[1] for v in kv_cache.values()), default=0)
+    # Only the SELF-attention cache grows, one step at a time.  Cross-attention is
+    # keyed and stored once at ``n_audio_ctx`` and never appended, so including
+    # it would compare an audio length against a text bound -- and since
+    # ``n_audio_ctx`` is larger than ``n_text_ctx`` for every published Whisper
+    # (1500 vs 448), that trips the check on the very first decode.
+    self_cache_len = max(
+        (v.shape[1] for k, v in kv_cache.items() if "cross_attn" not in k),
+        default=0,
+    )
     bound = model.dims.n_text_ctx + cfg.max_tokens
-    if cache_len > bound:
+    if self_cache_len > bound:
         raise RuntimeError(
-            f"KV cache grew to {cache_len} steps, above the {bound} bound implied "
+            f"KV cache grew to {self_cache_len} steps, above the {bound} bound implied "
             f"by n_text_ctx={model.dims.n_text_ctx} and max_tokens={cfg.max_tokens}"
         )
 
