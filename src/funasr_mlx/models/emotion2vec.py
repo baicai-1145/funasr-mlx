@@ -183,7 +183,15 @@ class OrderedModules(nn.Module):
     def __len__(self) -> int:
         return len(self._order)
 
-    def __getitem__(self, index: int) -> nn.Module:
+    def __getitem__(self, index: int | str) -> nn.Module:
+        """Fetch by Sequential position (``self[0]``) **or** by raw key (``self["0"]``).
+
+        Both spellings are used: ``__call__`` walks ``_order`` positionally while
+        :class:`PositionalBlock` needs named access so it can reorder the
+        transposes around the channel-last conv.
+        """
+        if isinstance(index, str):
+            return getattr(self, index)
         return getattr(self, self._order[index])
 
 
@@ -332,7 +340,7 @@ def conv_feature_output_length(samples: int, layers: Sequence[tuple[int, int, in
     return length
 
 
-class ConvFeatureBlock(nn.Module):
+class ConvFeatureBlock(OrderedModules):
     """``wav2vec2.py:839-860`` ``block(...)`` for ``is_layer_norm=True``.
 
     ``Conv1d -> Dropout -> Sequential(TransposeLast, Fp32LayerNorm(affine=True),
@@ -375,6 +383,12 @@ class ConvFeatureBlock(nn.Module):
         so the checkpoint keys are exactly ``conv_layers.<i>.0.weight`` and
         ``conv_layers.<i>.2.1.weight`` / ``.bias``.  An intermediate attribute
         would insert a spurious ``.block`` namespace level.
+
+        The chain runs entirely in channels-last: the conv gets the ``NTC`` layout
+        ``mx.nn.Conv1d`` requires, and the affine LayerNorm reduces the last axis,
+        which is the channel axis (the 512 of ``emotion2vec_plus_large``).  The
+        reference reaches the same reduction with ``TransposeLast`` around a torch
+        LayerNorm running on ``NCT``; here the transposes are implicit.
         """
         y = mx.swapaxes(x, 1, 2)  # NCT -> NTC
         y = super().__call__(y)  # NTC -> NTC
@@ -423,9 +437,9 @@ class SamePad(OrderedModules):
     ``k`` drops the **last** time element.  Combined with the conv's
     ``padding = k // 2`` the time axis is preserved exactly.
 
-    The reference slice indexes the last axis, which in the ``NCT`` view used
-    inside :class:`PositionalBlock` is time; that is why the contract here is
-    documented as NTC-in / NCT-conv / NTC-out.
+    The reference slice indexes the last axis; :class:`PositionalBlock` therefore
+    presents the tensor as ``NCT`` across this call, because MLX's ``Conv1d``
+    needs channels-last while the crop needs time-last.
     """
 
     def __init__(self, kernel_size: int) -> None:
@@ -461,13 +475,36 @@ class PositionalBlock(OrderedModules):
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``NTC`` (channels-last); returns ``NTC``.
 
-        Children are registered **directly** under their Sequential indices, so
-        the checkpoint keys are ``relative_positional_encoder.<i>.0.weight`` and
-        ``.bias`` with no extra namespace level.
+        **Layout contract.** MLX's ``Conv1d`` is channels-*last* while the
+        reference works in channels-*first* ``NCT``, so the two cannot literally
+        be fed the same axes:
+
+        ==============  ==========================  ==========================
+        source step     what it needs               what this port feeds it
+        ==============  ==========================  ==========================
+        ``0`` conv      ``NCT`` (N, C, T)           ``NTC`` -- swapped in
+                                                     before the call and back
+        ``1`` SamePad   last axis must be **time**  ``NCT``, so the reference's
+                                                     ``x[:, :, :-remove]``
+                                                     crop applies to T
+        ``3`` LayerNorm last axis must be **C**    ``NTC``, swapped in and back
+        ==============  ==========================  ==========================
+
+        Handing the raw conv an ``NCT`` tensor makes MLX read the channel count
+        as the *length*, which fails loudly whenever the channel count is not
+        divisible by ``groups``.
         """
-        y = mx.swapaxes(x, 1, 2)  # NTC -> NCT (time is now the last axis)
-        y = super().__call__(y)  # keeps NCT inside the Sequential
-        return mx.swapaxes(y, 1, 2)  # NCT -> NTC
+        # ``0`` conv -- channels-last in, channels-last out.
+        nct = mx.swapaxes(x, 1, 2)  # NTC -> NCT
+        nct = self["0"](mx.swapaxes(nct, 1, 2))  # NTC through the conv -> NCT
+        # ``1`` SamePad -- the reference slices the last axis, which is T here.
+        nct = self["1"](nct)
+        # ``2`` TransposeLast marker: NTC in the source, identity in MLX.
+        nct = self["2"](nct)
+        # ``3`` LayerNorm -- reduce the last axis, so it must be the channel axis.
+        ntc = self["3"](mx.swapaxes(nct, 1, 2))
+        # ``4`` TransposeLast marker, then ``5`` GELU (elementwise).
+        return self["5"](self["4"](ntc))
 
 
 class PositionalEncoder(nn.Module):

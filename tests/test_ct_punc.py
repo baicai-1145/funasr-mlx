@@ -279,10 +279,18 @@ def test_sanm_fsmn_tap_zero_reads_exactly_one_left_pad_frame():
 
     base = mx.arange(channels * length, dtype=mx.float32).reshape(1, length, channels)
     memory = attn.forward_fsmn(base, None)
-    # out[t] = x[t - 1] with x[-1] = 0 -> the shift is [0, x0, x1, x2]
-    expected = base + mx.pad(base[:, :-2, :], [(0, 0), (2, 0), (0, 0)])
+    # tap 0 reads x[t - 1] with x[-1] = 0, so the shift is exactly one left
+    # frame: [0, x0, x1, x2].  That is base[:, :-1] padded by ONE on the left.
+    expected = base + mx.pad(base[:, :-1, :], [(0, 0), (1, 0), (0, 0)])
     mx.eval(memory, expected)
     assert_allclose(memory, expected)
+
+    # Independent numpy derivation straight from the index formula, so a
+    # wrong shift cannot be reproduced by a wrong construction of ``expected``.
+    row = np.arange(channels * length, dtype=np.float64).reshape(length, channels)
+    np_expected = np.stack([row[t] + (row[t - 1] if t >= 1 else 0.0) for t in range(length)])
+    assert_allclose(np.asarray(memory[0]), np_expected)
+
     # pin the literal values so a flipped shift cannot pass by symmetry
     assert memory[0, 0].tolist() == [0.0, 1.0]
     assert memory[0, 1].tolist() == [2.0, 4.0]

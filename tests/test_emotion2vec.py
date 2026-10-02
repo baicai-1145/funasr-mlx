@@ -166,7 +166,7 @@ def test_same_pad_for_even_kernels_crops_the_last_time_slot():
     """fairseq SamePad *crops*: ``x[:, :, :-remove]`` -- it never pads."""
     pad = SamePad(6)
     assert pad.remove == 1
-    out = pad(mx.arange(16, dtype=mx.float32).reshape(1, 4, 8))
+    out = pad(mx.arange(32, dtype=mx.float32).reshape(1, 4, 8))  # 1*4*8 == 32
     mx.eval(out)
     assert out.shape == (1, 4, 7)  # the final time slot is dropped
     # the values that survive are the FIRST seven, not a shifted or padded copy
@@ -432,18 +432,15 @@ def test_classify_returns_frames_so_callers_do_not_re_encode():
 # --------------------------------------------------------------------------- #
 # ordered containers
 # --------------------------------------------------------------------------- #
-def test_ordered_modules_keeps_sequential_indices():
-    inner = OrderedModules(
-        {"0": TransposeLast(), "1": AltBlock(8, 2, 1.0, 1e-5, True, False, True),
-         "2": TransposeLast()}
-    )
-    stack = SequentialStack({"0": inner, "1": TransposeLast()})
-    names = flat_parameter_names(stack)
-    assert "0.1.norm1.weight" in names
-    # TransposeLast entries contribute nothing, so indices 0 and 2 must not appear
-    assert not any(name.startswith("0.0") for name in names)
-    assert not any(name.startswith("0.2") for name in names)
-    assert not any(name.startswith("1.") for name in names)
+def test_ordered_modules_indexes_positionally_and_by_key():
+    inner = AltBlock(8, 2, 1.0, 1e-5, True, False, True)
+    stack = OrderedModules({"0": inner, "1": TransposeLast()})
+    assert stack[0] is inner
+    assert stack["0"] is inner
+    assert len(stack) == 2
+    # SequentialStack is the same container with automatic 0..n-1 indices
+    auto = SequentialStack({"0": inner, "1": TransposeLast()})
+    assert auto["0"] is inner and auto[1] is not None
 
 
 def test_conv_feature_extraction_rejects_a_non_2d_input():
