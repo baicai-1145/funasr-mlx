@@ -469,7 +469,14 @@ def _cif_wo_hidden_v1_impl(alphas: mx.array) -> tuple[mx.array, mx.array]:
     computation; a nested or partially applied context would let an
     intermediate land on the default device.
     """
-    prefix_sum = mx.cumsum(alphas.astype(mx.float32), axis=1)
+    # The reference accumulates in float64 and only then narrows:
+    #   torch.cumsum(prefix_sum, dim=1, dtype=torch.float64).to(torch.float32)
+    # ``mx.cumsum(..., dtype=...)`` casts the input to that type before summing,
+    # so this is the same operation, not an approximation of it.  The narrowing
+    # cast matters: a running sum that lands just below an integer in float64
+    # can round up to exactly that integer in float32 and fire a token the
+    # reference would not.
+    prefix_sum = mx.cumsum(alphas, axis=1, dtype=mx.float64).astype(mx.float32)
     prefix_sum_floor = mx.floor(prefix_sum)
     dislocation_prefix_sum = mx.roll(prefix_sum, shift=1, axis=1)
     dislocation_prefix_sum_floor = mx.floor(dislocation_prefix_sum)
@@ -501,10 +508,9 @@ def cif_wo_hidden_v1(
     Evaluated on :data:`CIF_DEVICE` unless ``device`` overrides it; the whole
     subtree is forced inside that stream so no intermediate escapes.
 
-    Precision note: FunASR accumulates the prefix sum in ``float64`` before
-    casting back to ``float32`` ("cumsum precision degradation cause wrong
-    result in extreme").  This port accumulates in ``float32``; see the module
-    notes for why the float64 path is not adopted here.
+    The prefix sum accumulates in ``float64`` and is narrowed to ``float32``
+    afterwards, exactly like the reference's
+    ``torch.cumsum(..., dtype=torch.float64).to(torch.float32)``.
     """
     with mx.stream(_cif_stream(device)):
         fires, fire_idxs = _cif_wo_hidden_v1_impl(alphas)

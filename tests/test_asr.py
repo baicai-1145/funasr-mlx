@@ -518,6 +518,32 @@ def test_cif_predictor_defaults_to_the_deterministic_cpu_device():
         assert function.__kwdefaults__["device"] is None
 
 
+def test_cif_wo_hidden_accumulates_the_prefix_sum_in_float64():
+    """Non-dyadic alphas whose running sum reaches 1.0 only in float32.
+
+    The reference is ``torch.cumsum(..., dtype=torch.float64).to(float32)``, so
+    the final partial sum stays *below* 1.0 and no integration boundary fires.
+    Accumulating in float32 instead rounds it up to exactly 1.0, which would
+    emit a token the reference never emits -- so this fixture fails outright on
+    the float32 accumulation and passes only with the float64 one.
+    """
+    # float32 running sums: [0.08405613, 0.4631718, 1.0]           -> fires at t=2
+    # float64 running sums: [0.08405613, 0.4631718, 0.99999994]    -> never fires
+    alphas = mx.array([[0.08405613154172897, 0.37911567091941833, 0.5368281602859497]], mx.float32)
+    fires, fire_idxs = cif_wo_hidden_v1(alphas, 1.0, return_fire_idxs=True)
+    mx.eval(fires, fire_idxs)
+    assert not bool(mx.any(fire_idxs).item()), "float32 accumulation would fire here"
+    assert bool(mx.all(fires < 1.0).item())
+
+    # The predictor agrees: no boundary means no emitted frame, and the
+    # zero-fire path still reserves round(sum(alphas)) == 1 column of zeros.
+    hidden = mx.arange(1 * 3 * 2, dtype=mx.float32).reshape(1, 3, 2)
+    frames, _ = cif_v1(hidden, alphas, 1.0)
+    mx.eval(frames)
+    assert frames.shape == (1, 1, 2)
+    assert bool(mx.all(frames == 0).item())
+
+
 def test_cif_v1_device_override_is_honoured():
     """Passing the device explicitly must take the same path as the default."""
     hidden, alphas = _cold_probe_case(3)
