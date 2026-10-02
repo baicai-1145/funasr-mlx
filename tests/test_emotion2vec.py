@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
+import mlx.nn as mxnn
 import numpy as np
 import pytest
 
@@ -476,17 +477,39 @@ def test_alt_block_rejects_a_mismatched_alibi_bias():
 # --------------------------------------------------------------------------- #
 # checkpoint conversion / strict loading
 # --------------------------------------------------------------------------- #
-def _fake_pytorch_state(model: Emotion2VecModel) -> dict[str, mx.array]:
-    """A PyTorch-shaped state dict for the same key set.
+def _conv_parameter_keys(module, prefix: str = "") -> set[str]:
+    """Every parameter key owned by an ``mx.nn.Conv1d``, found by **module type**.
 
-    The predicate here is deliberately **independent** of the production
-    ``is_conv_weight``: it is a rank check (``(out, in//g, K)`` has a trailing
-    extent equal to an odd kernel and is not square in the naive sense) so the
-    round-trip test cannot confirm a wrong namespace by construction.
+    Deliberately introspects the tree instead of matching names.  A name
+    predicate silently missed ``relative_positional_encoder.<i>.0.weight`` --
+    there is no "conv" in that name -- and so handed an already-MLX kernel to the
+    converter, which then transposed it a second time.  ``nn.Module`` is a
+    ``dict`` subclass and plain dicts are stored on modules too, so both are
+    walked.
     """
+    keys: set[str] = set()
+    for key, value in dict.items(module):
+        name = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, mxnn.Module):
+            if isinstance(value, mxnn.Conv1d):
+                keys.update(f"{name}.{leaf}" for leaf in dict.items(value))
+            keys |= _conv_parameter_keys(value, name)
+        elif isinstance(value, dict):
+            keys |= _conv_parameter_keys(value, name)
+    return keys
+
+
+def _fake_pytorch_state(model: Emotion2VecModel) -> dict[str, mx.array]:
+    """A PyTorch-shaped state dict: **every** conv weight in ``(out, in//g, K)``.
+
+    The key set is selected by walking the module tree for ``mx.nn.Conv1d``, so
+    this is independent of the production ``is_conv_weight`` regex and cannot
+    confirm a wrong namespace or a missed conv by construction.
+    """
+    conv_keys = _conv_parameter_keys(model)
     state: dict[str, mx.array] = {}
     for name, value in flat_parameter_names(model).items():
-        if name.endswith(".0.weight") and value.ndim == 3 and "conv" in name:
+        if name in conv_keys and value.ndim == 3:
             state[name] = mx.transpose(value, (0, 2, 1))  # MLX -> PyTorch
         else:
             state[name] = value
