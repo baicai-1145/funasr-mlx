@@ -3,184 +3,185 @@
 
 Purpose
 -------
-The synthetic suites in ``tests/`` prove each port against tiny configurations.
-They cannot prove that a **full official checkpoint** produces the same numbers
-as its PyTorch source. This tool closes that gap: it loads one shared official
-checkpoint into two independent backends, feeds both the *same* input, and saves
-per-stage tensors and token ids so they can be compared numerically.
+The synthetic suites prove each port against tiny configurations. They cannot
+prove that a **full official checkpoint** produces the same numbers as its
+PyTorch source. This tool loads one shared official checkpoint into two
+independent backends, feeds both the same input, and saves per-stage tensors and
+token ids for numerical comparison.
 
-Design constraints that shape everything here
----------------------------------------------
-* **Two backends, two processes.** ``--mode reference`` and ``--mode native`` are
-  separate invocations that each exit. PyTorch and MLX must never be resident in
-  one process, so the comparison can never accidentally share state, and each run
-  fits inside its own memory guard.
-* **Shared weights, shared input.** One checkpoint file is read by both. The
-  sample set is fixed by a manifest and bounded to each model's limits, so the two
-  runs cannot silently process different audio.
-* **No hand-rolled reference math.** Reference mode imports and calls the actual
-  upstream classes. Every reimplementation here would be a second thing to be
-  wrong, and would defeat the point of the comparison.
-* **Explicit float32.** Both backends are pinned to float32 and the dtypes of
-  every saved tensor are recorded in the metadata. A silent promotion to float16
-  would look like a small numeric difference rather than a configuration change.
-* **No hidden normalisation.** The adapter never rescales, mean-centres, clips or
-  otherwise "fixes" a tensor on its way through. If the two backends disagree,
-  that disagreement is the result.
-* **Everything unsupported is reported, never ignored.** Missing keys, unexpected
-  keys and unsupported model variants are emitted as explicit findings.
+Hard rules this module obeys
+---------------------------
+1. **Never mix backends.** The reference process imports FunASR + Torch only; the
+   native process imports MLX only. Importing the MLX frontend inside the
+   reference process would not just waste memory, it would make the frontend
+   comparison tautological -- both sides would be running the *same* code, so
+   agreement would prove nothing.
+2. **No hand-rolled reference math.** FunASR models are constructed from the
+   official YAML through their real constructors; canonical Whisper is loaded by
+   AST-extracting the actual upstream definitions. Every reimplementation here
+   would be a second thing to be wrong.
+3. **Reference and native use real frontends**, each with the *same* official
+   CMVN and configuration, loaded independently.
+4. **Explicit float32** everywhere; every saved tensor's dtype is recorded.
+5. **No hidden normalisation.** Nothing here rescales or clips a tensor.
+6. **Strict key inventory in both directions**, and any unsupported variant is
+   refused with a reason rather than silently substituted.
 
-Output
-------
-``build``   -> a JSON spec (pure, no heavy imports)
-``reference``/``native`` -> metadata JSON plus bounded ``.npz`` per sample
-``compare`` -> a diff report computed from the two metadata files alone
-
-This module imports neither MLX nor Torch at module scope, so ``build``,
-``compare`` and the manifest helpers are usable (and testable) on a machine that
-has neither installed.
+Both numeric runners must be invoked as separate processes; see ``main``.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-#: Where the lead stages official checkpoints, tokenizers and reference audio.
+#: Where the lead stages official checkpoints, configs, CMVN and reference audio.
 DEFAULT_ASSETS_ROOT = Path("/Volumes/2T/funasr-mlx-alignment")
 
-#: Hard ceiling on saved elements per tensor. A full-weight encoder activation is
-#: (1, T, 560) float32; at 30 s that is ~4.2 M elements = ~17 MB. Saving every
-#: stage of every sample would still be hundreds of MB, so the cap is enforced
-#: per tensor and any truncation is recorded rather than hidden.
+#: Staged canonical OpenAI Whisper source, used to build the reference.
+CANONICAL_WHISPER_SOURCE = Path("/Users/baicai1145/repos/funasr-mlx/.tmp/openai-whisper-model.py")
+
+#: Per-tensor element cap for saved arrays. Truncation is recorded, never silent:
+#: a partial activation must not be mistaken for a full one.
 MAX_SAVED_ELEMENTS = 4_000_000
 
-#: Sample rate every supported family is trained at.
 SAMPLE_RATE = 16_000
 
 
-# --------------------------------------------------------------------------- #
-# Supported and explicitly unsupported variants
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Variant:
-    """One alignable checkpoint variant and the limits that bound it."""
+    """One alignable checkpoint and everything needed to run both backends."""
 
     key: str
     family: str
     checkpoint: str
     config: str
-    #: Longest audio the variant accepts, in seconds.
     max_seconds: float
-    #: Frontend defaults that must match the checkpoint's own config.
-    lfr_m: int = 1
-    lfr_n: int = 1
-    n_mels: int = 80
-    #: Reference import target, so reference mode instantiates real source.
+    #: Official Kaldi fbank + CMVN settings, shared by both frontends.
+    frontend: dict[str, Any]
+    #: FunASR import path + class for the reference backend.
     reference_import: str = ""
     reference_class: str = ""
+    #: Modules that must be imported so FunASR's registry can resolve the
+    #: ``encoder:``/``decoder:``/``predictor:`` name strings in the config.
+    registry_imports: tuple[str, ...] = ()
     notes: str = ""
+    #: Whisper-only: the official tiny variant's dimensions are read from the
+    #: checkpoint, so nothing is hard-coded here.
+    whisper_checkpoint: str = ""
 
+
+#: Shared frontend settings. Both backends are configured from this one place so
+#: a divergence cannot come from the adapter disagreeing with itself.
+_ASR_FRONTEND = {
+    "fs": 16000,
+    "n_fft": 512,
+    "win_length": 400,
+    "hop_length": 160,
+    "n_mels": 80,
+    "frame_length": 25.0,
+    "frame_shift": 10.0,
+    "dither": 0.0,
+    "lfr_m": 7,
+    "lfr_n": 6,
+    "upsacle_samples": True,
+}
 
 SUPPORTED: tuple[Variant, ...] = (
     Variant(
-        key="sensevoice-small",
-        family="sensevoice",
-        checkpoint="iic/SenseVoiceSmall/model.pt",
-        config="iic/SenseVoiceSmall/config.yaml",
-        max_seconds=30.0,
-        n_mels=560,
-        reference_import="funasr.models.sense_voice.model",
-        reference_class="SenseVoiceSmall",
-        notes="Encoder is (B, T, 560) fbank; the frontend already stacks frames.",
-    ),
-    Variant(
         key="paraformer-zh",
         family="paraformer",
-        checkpoint="paraformer-zh/model.pt",
-        config="paraformer-zh/config.yaml",
+        checkpoint="models/paraformer-zh/model.pt",
+        config="models/paraformer-zh/config.yaml",
         max_seconds=30.0,
-        lfr_m=7,
-        lfr_n=6,
+        frontend=dict(_ASR_FRONTEND),
         reference_import="funasr.models.paraformer.model",
         reference_class="Paraformer",
-        notes="Non-autoregressive; CIF output length varies with the checkpoint.",
+        registry_imports=(
+            "funasr.models.sanm.encoder",
+            "funasr.models.sanm.decoder",
+        ),
+        notes="Non-autoregressive. Final logits are the DECODER log-softmax.",
+    ),
+    Variant(
+        key="sensevoice-small",
+        family="sensevoice",
+        checkpoint="models/SenseVoiceSmall/model.pt",
+        config="models/SenseVoiceSmall/config.yaml",
+        max_seconds=30.0,
+        # SenseVoiceSmall consumes a 560-dim fbank; the official frontend builds
+        # it from 80 mels x 7 LFR frames.
+        frontend={**_ASR_FRONTEND, "n_mels": 80, "lfr_m": 7, "lfr_n": 6},
+        reference_import="funasr.models.sense_voice.model",
+        reference_class="SenseVoiceSmall",
+        registry_imports=("funasr.models.sanm.encoder",),
+        notes="CTC. Conditioning ids (lid/textnorm/event-emo) are recorded.",
     ),
     Variant(
         key="whisper-tiny",
         family="whisper",
-        checkpoint="tiny/model.pt",
-        config="tiny/config.json",
+        checkpoint="models/whisper-tiny/model.pt",
+        config="models/whisper-tiny/dims.json",
         max_seconds=30.0,
-        n_mels=80,
+        frontend={"fs": 16000, "n_mels": 80, "n_fft": 400, "hop_length": 160},
         reference_import="",
         reference_class="",
         notes=(
-            "Canonical OpenAI module, loaded from the staged model.py. "
-            "Bounded first full-model proof only."
+            "Canonical OpenAI module AST-loaded from the staged model.py. "
+            "Bounded first full-model proof only; not evidence for larger variants."
         ),
     ),
 )
 
-#: Variants a caller might reasonably ask for. They are listed so a request
-#: produces a clear refusal with a reason, instead of an obscure failure later or
-#: a silent substitution of the tiny checkpoint.
+#: Refused with a reason rather than quietly aliased to a smaller checkpoint.
 UNSUPPORTED: dict[str, str] = {
-    "whisper-large": "Not aligned. large-v3 is ~1.5 GB of weights and needs its own "
-    "memory budget and a separate approval; claiming it from a tiny run would be "
-    "false evidence.",
-    "whisper-large-v3-turbo": "Not aligned. Same reason as whisper-large, plus the "
-    "turbo variant changes the decoder depth, so a tiny result says nothing "
-    "about it.",
-    "whisper-base": "Not aligned. Structurally identical to tiny and mechanically "
-    "covered by it; add it when a full base run is actually needed.",
-    "paraformer-zh-streaming": "Not aligned. Streaming chunking changes the LFR "
-    "and cache paths; the offline port has no streaming counterpart to compare.",
-    "sensevoice-large": "Not aligned. Different encoder width and depth; the "
-    "small model does not exercise it.",
+    "whisper-large": "Not aligned. Roughly 1.5 GB of weights needs its own memory "
+    "budget and approval; a tiny result is not evidence about it.",
+    "whisper-large-v3-turbo": "Not aligned. Same budget reason as whisper-large, "
+    "and the turbo variant changes decoder depth, so tiny says nothing about it.",
+    "whisper-base": "Not aligned. Structurally identical to tiny and covered by it; "
+    "add it when a full base run is actually needed.",
+    "paraformer-zh-streaming": "Not aligned. Streaming chunking changes the LFR and "
+    "cache paths and the offline port has no streaming counterpart.",
+    "sensevoice-large": "Not aligned. Different encoder width and depth.",
 }
 
 SUPPORTED_BY_KEY = {variant.key: variant for variant in SUPPORTED}
 
 
+class AlignmentError(ValueError):
+    """The requested alignment cannot proceed. Carries every problem found."""
+
+
 # --------------------------------------------------------------------------- #
-# Manifest
+# Manifest and spec (pure; no Torch, no MLX)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Sample:
-    """One fixed, in-bounds audio item both backends must process."""
-
     key: str
     audio: str
     duration_seconds: float
     transcript: str = ""
 
 
-class ManifestError(ValueError):
-    """The manifest is unusable. Carries every problem, not just the first."""
-
-
 def load_manifest(path: str | Path) -> list[Sample]:
-    """Read and validate the input manifest.
-
-    The manifest is the single source of truth for *which* audio both backends
-    see. Anything ambiguous is rejected here rather than being resolved differently
-    per backend, which would invalidate the comparison silently.
-    """
+    """Read the manifest, rejecting anything the two backends could disagree on."""
     path = Path(path)
     try:
         document = json.loads(path.read_text())
     except FileNotFoundError as error:
-        raise ManifestError(f"manifest not found: {path}") from error
+        raise AlignmentError(f"manifest not found: {path}") from error
     except json.JSONDecodeError as error:
-        raise ManifestError(f"manifest is not valid JSON: {error}") from error
+        raise AlignmentError(f"manifest is not valid JSON: {error}") from error
 
     entries = document.get("samples") if isinstance(document, dict) else document
     if not isinstance(entries, list) or not entries:
-        raise ManifestError("manifest must contain a non-empty 'samples' list")
+        raise AlignmentError("manifest must contain a non-empty 'samples' list")
 
     problems: list[str] = []
     samples: list[Sample] = []
@@ -189,11 +190,7 @@ def load_manifest(path: str | Path) -> list[Sample]:
         if not isinstance(entry, dict):
             problems.append(f"sample {index}: expected an object")
             continue
-        missing = [
-            field_name
-            for field_name in ("key", "audio", "duration_seconds")
-            if not entry.get(field_name)
-        ]
+        missing = [name for name in ("key", "audio", "duration_seconds") if not entry.get(name)]
         if missing:
             problems.append(f"sample {index}: missing {', '.join(missing)}")
             continue
@@ -204,7 +201,7 @@ def load_manifest(path: str | Path) -> list[Sample]:
         seen.add(key)
         duration = entry["duration_seconds"]
         if not isinstance(duration, (int, float)) or duration <= 0:
-            problems.append(f"sample {index}: duration_seconds must be a positive number")
+            problems.append(f"sample {index}: duration_seconds must be positive")
             continue
         samples.append(
             Sample(
@@ -215,48 +212,18 @@ def load_manifest(path: str | Path) -> list[Sample]:
             )
         )
     if problems:
-        raise ManifestError("; ".join(problems))
+        raise AlignmentError("; ".join(problems))
     return samples
 
 
-def select_samples(samples: Sequence[Sample], variant: Variant, limit: int) -> list[Sample]:
-    """Fix the ordered, in-bounds sample list both backends must process.
-
-    Duration is validated here so an over-long file is refused with a clear
-    message instead of being silently truncated by one backend and not the other.
-    """
-    if limit <= 0:
-        raise ManifestError("--max-samples must be positive")
-    kept: list[Sample] = []
-    problems: list[str] = []
-    for sample in samples:
-        if sample.duration_seconds > variant.max_seconds:
-            problems.append(
-                f"{sample.key}: {sample.duration_seconds:.2f}s exceeds the "
-                f"{variant.key} bound of {variant.max_seconds:.2f}s"
-            )
-            continue
-        kept.append(sample)
-        if len(kept) == limit:
-            break
-    if problems:
-        raise ManifestError("; ".join(problems))
-    if not kept:
-        raise ManifestError("no samples remain after applying the duration bound")
-    return kept
-
-
-# --------------------------------------------------------------------------- #
-# Spec construction (pure; no MLX, no Torch)
-# --------------------------------------------------------------------------- #
 def resolve_variant(requested: str) -> Variant:
-    """Resolve a variant name, refusing unsupported ones with a reason."""
     if requested in SUPPORTED_BY_KEY:
         return SUPPORTED_BY_KEY[requested]
     if requested in UNSUPPORTED:
-        raise ManifestError(f"{requested} is not aligned: {UNSUPPORTED[requested]}")
-    known = ", ".join(sorted(SUPPORTED_BY_KEY))
-    raise ManifestError(f"unknown variant {requested!r}; aligned variants are {known}")
+        raise AlignmentError(f"{requested} is not aligned: {UNSUPPORTED[requested]}")
+    raise AlignmentError(
+        f"unknown variant {requested!r}; aligned variants are {', '.join(sorted(SUPPORTED_BY_KEY))}"
+    )
 
 
 def build_alignment_spec(
@@ -266,47 +233,62 @@ def build_alignment_spec(
     *,
     assets_root: str | Path = DEFAULT_ASSETS_ROOT,
     max_samples: int = 8,
-    tolerance_note: str | None = None,
+    cmvn_name: str = "am.mvn",
+    canonical_whisper_source: str | Path = CANONICAL_WHISPER_SOURCE,
 ) -> dict[str, Any]:
     """Produce the JSON-serialisable plan both backend runs execute.
 
-    Deliberately free of heavy imports: the spec is cheap to build, diffable in
-    review, and identical for both backends by construction.
+    Free of heavy imports on purpose: the spec is cheap to build, reviewable in a
+    diff, and identical for both backends by construction.
     """
     variant = resolve_variant(variant_name)
-    samples = select_samples(load_manifest(manifest_path), variant, max_samples)
+    if max_samples <= 0:
+        raise AlignmentError("--max-samples must be positive")
     assets_root = Path(assets_root)
-    output_root = Path(output_root)
 
-    inputs = []
-    for sample in samples:
+    inputs: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for sample in load_manifest(manifest_path):
+        if sample.duration_seconds > variant.max_seconds:
+            problems.append(
+                f"{sample.key}: {sample.duration_seconds:.2f}s exceeds the "
+                f"{variant.key} bound of {variant.max_seconds:.2f}s"
+            )
+            continue
         audio = Path(sample.audio)
+        if not audio.is_file():
+            problems.append(f"{sample.key}: audio not found at {audio}")
+            continue
         inputs.append(
             {
                 "key": sample.key,
                 "audio": str(audio),
-                "audio_exists": audio.is_file(),
                 "duration_seconds": sample.duration_seconds,
                 "transcript": sample.transcript,
             }
         )
-    missing_audio = [item["key"] for item in inputs if not item["audio_exists"]]
-    if missing_audio:
-        raise ManifestError(f"audio not found for: {', '.join(missing_audio)}")
+        if len(inputs) == max_samples:
+            break
+    if problems:
+        raise AlignmentError("; ".join(problems))
+    if not inputs:
+        raise AlignmentError("no usable samples remain")
 
-    return {
-        "schema": "funasr-mlx-alignment/1",
+    spec: dict[str, Any] = {
+        "schema": "funasr-mlx-alignment/2",
         "variant": {
             "key": variant.key,
             "family": variant.family,
             "checkpoint": str(assets_root / variant.checkpoint),
             "config": str(assets_root / variant.config),
-            "max_seconds": variant.max_seconds,
-            "lfr_m": variant.lfr_m,
-            "lfr_n": variant.lfr_n,
-            "n_mels": variant.n_mels,
+            "cmvn": str(assets_root / variant.config.rsplit("/", 1)[0] / cmvn_name)
+            if not variant.family == "whisper"
+            else None,
+            "frontend": variant.frontend,
             "reference_import": variant.reference_import,
             "reference_class": variant.reference_class,
+            "registry_imports": list(variant.registry_imports),
+            "max_seconds": variant.max_seconds,
             "notes": variant.notes,
         },
         "audio": {
@@ -317,25 +299,23 @@ def build_alignment_spec(
         "inputs": inputs,
         "output_root": str(output_root),
         "dtype": "float32",
-        "stages": [
-            "frontend",
-            "encoder",
-            "pre_decoder",
-            "final_logits",
-            "token_ids",
-        ],
+        "stages": ["frontend", "encoder", "pre_decoder", "final_logits", "token_ids"],
         "limits": {"max_saved_elements": MAX_SAVED_ELEMENTS},
-        "tolerance_note": tolerance_note
-        or (
-            "No tolerance is declared here. Both backends run float32, so any "
-            "difference is reported for adjudication rather than thresholded away."
-        ),
         "unsupported_variants": dict(sorted(UNSUPPORTED.items())),
     }
+    if variant.family == "whisper":
+        spec["variant"]["canonical_source"] = str(canonical_whisper_source)
+        source = Path(canonical_whisper_source)
+        if not source.is_file():
+            raise AlignmentError(
+                f"canonical Whisper source is missing at {source}; the reference "
+                "must be the actual upstream module, not a reimplementation"
+            )
+    return spec
 
 
 # --------------------------------------------------------------------------- #
-# Key inventory
+# Checkpoint inventory
 # --------------------------------------------------------------------------- #
 def inventory_report(
     model_keys: Iterable[str],
@@ -343,13 +323,7 @@ def inventory_report(
     *,
     label: str = "",
 ) -> dict[str, Any]:
-    """Compare two key sets and report every difference explicitly.
-
-    A strict load is only meaningful if *both* directions were checked. Reporting
-    ``missing`` while ignoring ``unexpected`` is how a renamed or dropped head
-    gets silently skipped, so both are always emitted, plus a count that is
-    expected to be non-zero for a healthy model.
-    """
+    """Compare two key sets, reporting every difference in both directions."""
     expected = sorted(str(key) for key in model_keys)
     provided = sorted(str(key) for key in checkpoint_keys)
     expected_set, provided_set = set(expected), set(provided)
@@ -367,9 +341,9 @@ def inventory_report(
 
 
 # --------------------------------------------------------------------------- #
-# Comparison (pure; reads metadata only)
+# Comparison (pure; metadata only)
 # --------------------------------------------------------------------------- #
-def _stage_entry(sample: dict[str, Any], stage: str) -> dict[str, Any]:
+def _stage(sample: dict[str, Any], stage: str) -> dict[str, Any]:
     for entry in sample.get("stages", []):
         if entry.get("stage") == stage:
             return entry
@@ -379,31 +353,32 @@ def _stage_entry(sample: dict[str, Any], stage: str) -> dict[str, Any]:
 def compare_alignment(
     reference_meta: dict[str, Any], native_meta: dict[str, Any]
 ) -> dict[str, Any]:
-    """Diff the two runs' metadata. No tensors are loaded here.
+    """Diff two runs' metadata. Loads no tensors and declares no tolerance.
 
-    Shape and dtype are compared from recorded metadata; numeric divergence is
-    left to the numerical tool that owns the ``.npz`` files, because deciding what
-    counts as a difference is an adjudication this script should not make
+    Numeric divergence is left to the tool that owns the ``.npz`` files: deciding
+    what counts as a difference is an adjudication this script should not make
     unilaterally.
     """
     findings: list[dict[str, Any]] = []
+
     if reference_meta.get("variant", {}).get("key") != native_meta.get("variant", {}).get("key"):
         findings.append(
             {
                 "kind": "variant_mismatch",
                 "detail": (
-                    f"reference ran {reference_meta.get('variant', {}).get('key')!r} "
-                    f"but native ran {native_meta.get('variant', {}).get('key')!r}"
+                    f"reference={reference_meta.get('variant', {}).get('key')!r} "
+                    f"native={native_meta.get('variant', {}).get('key')!r}"
                 ),
             }
         )
-    if reference_meta.get("dtype") != native_meta.get("dtype"):
-        findings.append(
-            {
-                "kind": "dtype_mismatch",
-                "detail": f"reference {reference_meta.get('dtype')} vs native {native_meta.get('dtype')}",
-            }
-        )
+    for field_name in ("dtype", "frontend_config", "cmvn"):
+        if reference_meta.get(field_name) != native_meta.get(field_name):
+            findings.append(
+                {
+                    "kind": f"{field_name}_mismatch",
+                    "detail": f"reference={reference_meta.get(field_name)!r} native={native_meta.get(field_name)!r}",
+                }
+            )
 
     reference_samples = {item["key"]: item for item in reference_meta.get("samples", [])}
     native_samples = {item["key"]: item for item in native_meta.get("samples", [])}
@@ -411,30 +386,34 @@ def compare_alignment(
         findings.append(
             {
                 "kind": "sample_set_mismatch",
-                "detail": (
-                    f"reference {sorted(reference_samples)} vs native {sorted(native_samples)}"
-                ),
+                "detail": f"reference={sorted(reference_samples)} native={sorted(native_samples)}",
             }
         )
 
     for key in sorted(set(reference_samples) & set(native_samples)):
         reference_sample, native_sample = reference_samples[key], native_samples[key]
-        reference_ids = reference_sample.get("token_ids")
-        native_ids = native_sample.get("token_ids")
-        if reference_ids != native_ids:
+        if reference_sample.get("token_ids") != native_sample.get("token_ids"):
             findings.append(
                 {
                     "kind": "token_ids_differ",
                     "sample": key,
-                    "reference": reference_ids,
-                    "native": native_ids,
+                    "reference": reference_sample.get("token_ids"),
+                    "native": native_sample.get("token_ids"),
                 }
             )
-        for stage in ("frontend", "encoder", "pre_decoder", "final_logits"):
-            reference_stage, native_stage = (
-                _stage_entry(reference_sample, stage),
-                _stage_entry(native_sample, stage),
-            )
+        for field_name in ("conditioning_ids", "tokenizer"):
+            if reference_sample.get(field_name) != native_sample.get(field_name):
+                findings.append(
+                    {
+                        "kind": f"{field_name}_differ",
+                        "sample": key,
+                        "reference": reference_sample.get(field_name),
+                        "native": native_sample.get(field_name),
+                    }
+                )
+        for stage_name in ("frontend", "encoder", "pre_decoder", "final_logits"):
+            reference_stage = _stage(reference_sample, stage_name)
+            native_stage = _stage(native_sample, stage_name)
             if not reference_stage or not native_stage:
                 continue
             if list(reference_stage.get("shape", [])) != list(native_stage.get("shape", [])):
@@ -442,7 +421,7 @@ def compare_alignment(
                     {
                         "kind": "stage_shape_mismatch",
                         "sample": key,
-                        "stage": stage,
+                        "stage": stage_name,
                         "reference": reference_stage.get("shape"),
                         "native": native_stage.get("shape"),
                     }
@@ -452,61 +431,62 @@ def compare_alignment(
                     {
                         "kind": "stage_dtype_mismatch",
                         "sample": key,
-                        "stage": stage,
+                        "stage": stage_name,
                         "reference": reference_stage.get("dtype"),
                         "native": native_stage.get("dtype"),
                     }
                 )
+            if reference_stage.get("truncated") or native_stage.get("truncated"):
+                findings.append(
+                    {
+                        "kind": "stage_truncated",
+                        "sample": key,
+                        "stage": stage_name,
+                        "detail": "a saved activation was capped; it is not the full tensor",
+                    }
+                )
 
     return {
-        "schema": "funasr-mlx-alignment-diff/1",
+        "schema": "funasr-mlx-alignment-diff/2",
         "variant": reference_meta.get("variant", {}).get("key"),
         "finding_count": len(findings),
         "findings": findings,
         "clean": not findings,
         "note": (
-            "Shape/dtype/token agreement only. Numeric divergence is measured by "
-            "the numerical comparison over the saved .npz arrays; this report "
-            "deliberately declares no tolerance."
+            "Shape/dtype/token/conditioning agreement only, and any truncated "
+            "stage is reported as a finding. Numeric divergence is measured over "
+            "the saved .npz arrays by the numerical tool; no tolerance is declared."
         ),
     }
 
 
 # --------------------------------------------------------------------------- #
-# Shared helpers used by both runners
+# Backend-agnostic tensor recording
 # --------------------------------------------------------------------------- #
-def _as_numpy(array: Any) -> Any:
-    """Convert a backend array to numpy without importing either backend."""
+def _to_numpy(value: Any) -> Any:
+    """Convert a Torch or MLX tensor to numpy float32 without importing either."""
     import numpy as np
 
-    if hasattr(array, "tolist") and not isinstance(array, (list, tuple)):
-        try:
-            return np.asarray(array.tolist(), dtype=np.float32)
-        except (TypeError, ValueError):
-            pass
-    return np.asarray(array, dtype=np.float32)
+    if hasattr(value, "detach"):  # torch
+        value = value.detach().cpu().numpy()
+    return np.ascontiguousarray(np.asarray(value, dtype=np.float32))
 
 
-def _bounded(array: Any) -> tuple[Any, bool]:
-    """Return ``(array, truncated)`` after enforcing the per-tensor element cap.
-
-    Truncation is recorded rather than silent, because a partially saved encoder
-    activation must not be mistaken for a full one during numeric comparison.
-    """
-    value = _as_numpy(array)
-    if value.size <= MAX_SAVED_ELEMENTS:
-        return value, False
-    flat = value.reshape(-1)[:MAX_SAVED_ELEMENTS]
-    return flat.reshape(1, -1), True
+def _bounded(value: Any) -> tuple[Any, bool]:
+    """Return ``(array, truncated)`` after enforcing the element cap."""
+    array = _to_numpy(value)
+    if array.size <= MAX_SAVED_ELEMENTS:
+        return array, False
+    return array.reshape(-1)[:MAX_SAVED_ELEMENTS].reshape(1, -1), True
 
 
-def _stage_record(stage: str, array: Any, *, path: Path | None = None) -> dict[str, Any]:
-    value, truncated = _bounded(array)
-    record = {
+def _stage_record(stage: str, value: Any, *, path: Path | None = None) -> dict[str, Any]:
+    array, truncated = _bounded(value)
+    record: dict[str, Any] = {
         "stage": stage,
-        "shape": list(value.shape),
-        "dtype": str(value.dtype),
-        "elements": int(value.size),
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "elements": int(array.size),
         "truncated": truncated,
     }
     if path is not None:
@@ -514,82 +494,106 @@ def _stage_record(stage: str, array: Any, *, path: Path | None = None) -> dict[s
     return record
 
 
-def _load_torch_state(path: Path) -> dict[str, Any]:
-    """Read an official checkpoint into a plain ``{name: tensor}`` mapping.
+def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata, indent=2, sort_keys=True, default=str) + "\n")
 
-    Both FunASR and OpenAI wrap weights differently, so every known container key
-    is unwrapped rather than assumed, and a file that yields nothing usable is an
-    error instead of an empty load that would look like a clean key mismatch.
+
+def _load_audio(path: str) -> Any:
+    """Load mono float32 at the model rate. No resampling, ever."""
+    import numpy as np
+    import soundfile as sf
+
+    data, rate = sf.read(path, dtype="float32", always_2d=True)
+    if rate != SAMPLE_RATE:
+        raise AlignmentError(f"{path}: expected {SAMPLE_RATE} Hz, received {rate} Hz")
+    return np.ascontiguousarray(data.mean(axis=1), dtype=np.float32)
+
+
+def _load_checkpoint_state(path: Path) -> dict[str, Any]:
+    """Read an official checkpoint safely and without doubling process RSS.
+
+    ``weights_only=True`` refuses arbitrary pickle globals even though these
+    checkpoints are trusted and pinned; the cost is one argument. ``mmap=True``
+    avoids a second full copy of the weights in RSS, which for a full
+    SenseVoiceSmall or Whisper checkpoint is the difference between fitting the
+    memory guard and not.
     """
     import torch
 
-    payload = torch.load(str(path), map_location="cpu", weights_only=False)
+    payload = torch.load(str(path), map_location="cpu", weights_only=True, mmap=True)
     for container in ("model", "state_dict", "model_state_dict"):
         if isinstance(payload, dict) and container in payload:
             payload = payload[container]
             break
     if not isinstance(payload, dict):
-        raise ValueError(f"{path} does not contain a state_dict mapping")
+        raise AlignmentError(f"{path} does not contain a state_dict mapping")
     return {str(key): value for key, value in payload.items()}
 
 
-def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+def _split_funasr_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Split an official FunASR YAML into the constructor's keyword arguments.
+
+    The official files nest most sub-configs under ``model_conf`` while the
+    constructor also accepts ``encoder_conf``/``decoder_conf``/... at top level,
+    and takes the submodule *names* (``encoder: sanm_encoder``) as strings that
+    resolve through FunASR's registry. Splitting here keeps that mapping visible
+    and checkable instead of buried in a splat.
+    """
+    model_conf = dict(config.get("model_conf") or {})
+    for name in ("encoder_conf", "decoder_conf", "predictor_conf", "ctc_conf"):
+        # ``name not in model_conf`` tests the key, not the value; testing the
+        # value would both be wrong and raise, since a sub-config is unhashable.
+        if config.get(name) is not None and name not in model_conf:
+            model_conf[name] = config[name]
+    if not model_conf:
+        raise AlignmentError("config has no model_conf; refusing to guess the model's structure")
+    return model_conf
 
 
 # --------------------------------------------------------------------------- #
-# Reference backend (PyTorch) -- heavy imports are function-local
+# Reference backend (Torch). Imports no MLX, ever.
 # --------------------------------------------------------------------------- #
 def run_reference(spec: dict[str, Any], output_root: str | Path | None = None) -> dict[str, Any]:
-    """Run the PyTorch source and save per-stage tensors.
-
-    Instantiates the *actual* upstream module and calls its own methods. The one
-    permitted deviation is passing pre-computed fbank with ``data_type="fbank"``,
-    which makes the reference skip frontend extraction; the frontend is compared
-    separately as its own stage, so this narrows the comparison to model math
-    instead of changing it.
-    """
-    import numpy as np
+    """Run the PyTorch source: real config, real constructors, real frontend."""
     import torch
 
     variant = spec["variant"]
     output_root = Path(output_root or spec["output_root"]) / "reference"
     output_root.mkdir(parents=True, exist_ok=True)
 
-    reference_module = _import_reference(variant)
-    model = reference_module
-    state = _load_torch_state(Path(variant["checkpoint"]))
+    if variant["family"] == "whisper":
+        model, extras = _build_canonical_whisper(variant)
+        loader = None
+    else:
+        model, extras = _build_funasr_reference(variant)
+        loader = model.load_state_dict
 
-    model_keys = list(model.state_dict().keys())
-    inventory = inventory_report(model_keys, state.keys(), label="reference")
+    state = _load_checkpoint_state(Path(variant["checkpoint"]))
+    inventory = inventory_report(model.state_dict().keys(), state.keys(), label="reference")
     if inventory["verdict"] != "ok":
-        raise KeyError(
+        raise AlignmentError(
             f"reference key inventory mismatch: missing={inventory['missing']} "
             f"unexpected={inventory['unexpected']}"
         )
-    model.load_state_dict(state, strict=True)
+    loader(state, strict=True)
     model = model.float().eval()
 
-    samples: list[dict[str, Any]] = []
-    for item in spec["inputs"]:
-        samples.append(
-            _run_reference_sample(
-                model=model,
-                variant=variant,
-                item=item,
-                output_root=output_root,
-                torch=torch,
-                numpy=np,
-            )
-        )
+    frontend = _build_reference_frontend(variant)
+    samples = [
+        _run_reference_sample(model, frontend, variant, item, output_root, torch)
+        for item in spec["inputs"]
+    ]
 
     metadata = {
-        "schema": "funasr-mlx-alignment-run/1",
+        "schema": "funasr-mlx-alignment-run/2",
         "backend": "reference",
         "variant": variant,
         "dtype": "float32",
+        "frontend_config": variant["frontend"],
+        "cmvn": variant["cmvn"],
         "inventory": inventory,
+        "extras": extras,
         "samples": samples,
         "torch_version": torch.__version__,
         "device": "cpu",
@@ -598,170 +602,320 @@ def run_reference(spec: dict[str, Any], output_root: str | Path | None = None) -
     return metadata
 
 
-def _import_reference(variant: dict[str, Any]) -> Any:
-    """Instantiate the real upstream model class for this variant."""
-    module_path = variant.get("reference_import")
-    class_name = variant.get("reference_class")
-    if not module_path or not class_name:
-        raise NotImplementedError(
-            f"{variant['key']} has no reference import recorded; the reference must "
-            "be the actual upstream class, not a reimplementation"
-        )
+def _build_funasr_reference(variant: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """Construct the real FunASR model from the official config.
+
+    Registry imports come first: the config names submodules as strings
+    (``encoder: sanm_encoder``) and those resolve through modules that register
+    themselves on import, so skipping them would fail with an opaque lookup error.
+    """
     import importlib
 
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)()
+    import yaml
+
+    for module_path in variant["registry_imports"]:
+        importlib.import_module(module_path)
+
+    config = yaml.safe_load(Path(variant["config"]).read_text())
+    model_conf = _split_funasr_config(config)
+    module = importlib.import_module(variant["reference_import"])
+    model = getattr(module, variant["reference_class"])(**model_conf)
+
+    extras: dict[str, Any] = {"model_conf_keys": sorted(model_conf)}
+    # Conditioning id tables must be recorded, not assumed: they decide what the
+    # model actually consumed and are impossible to infer from a tensor shape.
+    for attribute in ("lid_dict", "textnorm_dict", "lid_int_dict"):
+        table = getattr(model, attribute, None)
+        if isinstance(table, dict):
+            extras[attribute] = {str(k): int(v) for k, v in table.items()}
+    extras["ctc_weight"] = float(getattr(model, "ctc_weight", 0.0) or 0.0)
+    extras["has_ctc_head"] = hasattr(model, "ctc") and getattr(model, "ctc", None) is not None
+    return model, extras
+
+
+def _build_reference_frontend(variant: dict[str, Any]) -> Any:
+    """The real FunASR ``WavFrontend``, with the official CMVN and Kaldi scaling."""
+    import importlib
+
+    for module_path in ("funasr.frontends.wav_frontend",):
+        importlib.import_module(module_path)
+    frontend_class = _resolve_wav_frontend()
+
+    settings = dict(variant["frontend"])
+    cmvn = settings.pop("cmvn_file", None) or variant["cmvn"]
+    kwargs = {
+        "fs": int(settings["fs"]),
+        "window": settings.get("window", "hanning"),
+        "n_mels": int(settings["n_mels"]),
+        "frame_length": float(settings["frame_length"]),
+        "frame_shift": float(settings["frame_shift"]),
+        "dither": float(settings.get("dither", 0.0)),
+        "lfr_m": int(settings["lfr_m"]),
+        "lfr_n": int(settings["lfr_n"]),
+        "upsacle_samples": bool(settings.get("upsacle_samples", True)),
+    }
+    return frontend_class(cmvn_file=cmvn, **kwargs)
+
+
+def _resolve_wav_frontend() -> Any:
+    """Locate FunASR's ``WavFrontend`` wherever this checkout keeps it."""
+    import importlib
+
+    for module_path, attribute in (
+        ("funasr.frontends.wav_frontend", "WavFrontend"),
+        ("funasr.frontends.default", "WavFrontend"),
+        ("funasr.frontends", "WavFrontend"),
+    ):
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        if hasattr(module, attribute):
+            return getattr(module, attribute)
+    raise AlignmentError(
+        "FunASR WavFrontend not found; the reference must use the source frontend, "
+        "not a reimplementation and not the MLX one"
+    )
 
 
 def _run_reference_sample(
-    *,
     model: Any,
+    frontend: Any,
     variant: dict[str, Any],
     item: dict[str, Any],
     output_root: Path,
     torch: Any,
-    numpy: Any,
 ) -> dict[str, Any]:
-    """Frontend + model stages for one sample, in float32 on CPU."""
-    import sys
+    import numpy as np
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-    from funasr_mlx.frontend import FbankConfig, WavFrontend
-
-    features = _load_audio(item["audio"], SAMPLE_RATE)
-    frontend = WavFrontend(
-        FbankConfig(
-            n_mels=variant["n_mels"],
-            lfr_m=variant["lfr_m"],
-            lfr_n=variant["lfr_n"],
-        ),
-        cmvn=None,
-    )
-    fbank = numpy.asarray(frontend(features), dtype=numpy.float32)
-
-    speech = torch.from_numpy(fbank)[None, :, :]
-    speech_lengths = torch.tensor([fbank.shape[0]], dtype=torch.int32)
-    lengths = torch.tensor([fbank.shape[0]], dtype=torch.int32)
-
-    stages: list[dict[str, Any]] = [
-        _stage_record("frontend", fbank, path=output_root / f"{item['key']}_frontend.npz")
-    ]
-
+    audio = _load_audio(item["audio"])
     with torch.no_grad():
+        fbank = frontend(audio)
+        fbank = np.asarray(fbank, dtype=np.float32)
+        speech = torch.from_numpy(fbank)[None, :, :]
+        lengths = torch.tensor([fbank.shape[0]], dtype=torch.int32)
+
+        finals: dict[str, Any] = {}
+        token_ids: list[int] | None = None
+        conditioning: dict[str, Any] = {}
+
         if variant["family"] == "paraformer":
-            encoder_out, encoder_out_lens = model.encode(speech, speech_lengths)
-            embeds, token_length, alphas, cif_peak = model.calc_predictor(
-                encoder_out, encoder_out_lens
+            encoder_out, encoder_out_lens = model.encoder(speech, lengths)
+            sematic_embeds, token_length, _, _ = model.calc_predictor(encoder_out, encoder_out_lens)
+            ys_pad_lens = token_length
+            # The published model is ctc_weight=0, so self.ctc may not exist. The
+            # decoder log-softmax is the real final logits.
+            decoder_out, ys_pad_lens = model.cal_decoder_with_predictor(
+                encoder_out, encoder_out_lens, sematic_embeds, ys_pad_lens
             )
-            token_ids = model.decode(embeds, token_length)
             finals = {
                 "encoder": encoder_out,
-                "pre_decoder": embeds,
-                "final_logits": _paraformer_presence_logits(model, embeds, token_length),
+                "pre_decoder": sematic_embeds,
+                "final_logits": decoder_out,
             }
+            token_ids = [int(v) for v in decoder_out[0].argmax(dim=-1)[: int(ys_pad_lens[0])]]
         elif variant["family"] == "sensevoice":
-            encoder_out, encoder_out_lens = model.encode(
-                speech, lengths, language="auto", use_itn=False
+            speech, lengths, conditioning = _apply_sensevoice_conditioning(
+                model, speech, lengths, torch
             )
-            finals = {"encoder": encoder_out, "pre_decoder": encoder_out}
-            token_ids = None
-        else:
-            raise NotImplementedError(f"reference path for {variant['family']} is not wired")
+            encoder_out, encoder_out_lens = model.encoder(speech, lengths)
+            if isinstance(encoder_out, tuple):
+                encoder_out = encoder_out[0]
+            ctc_logits = _sensevoice_ctc_logits(model, encoder_out)
+            finals = {
+                "encoder": encoder_out,
+                "pre_decoder": encoder_out,
+                "final_logits": ctc_logits,
+            }
+            token_ids = [int(v) for v in ctc_logits[0].argmax(dim=-1)]
+        else:  # pragma: no cover - dispatched earlier
+            raise AlignmentError(f"reference path for {variant['family']} is not wired")
 
+    stages = [_stage_record("frontend", fbank, path=output_root / f"{item['key']}_frontend.npz")]
     saved: dict[str, Any] = {"frontend": fbank}
-    for stage, value in finals.items():
-        record = _stage_record(stage, value, path=output_root / f"{item['key']}_{stage}.npz")
-        stages.append(record)
-        saved[stage] = _bounded(value)[0]
+    for stage_name, value in finals.items():
+        stages.append(
+            _stage_record(stage_name, value, path=output_root / f"{item['key']}_{stage_name}.npz")
+        )
+        saved[stage_name] = _bounded(value)[0]
+    np.savez(output_root / f"{item['key']}.npz", **saved)
 
-    numpy.savez(output_root / f"{item['key']}.npz", **saved)
     return {
         "key": item["key"],
         "audio": item["audio"],
         "duration_seconds": item["duration_seconds"],
         "stages": stages,
-        "token_ids": None if token_ids is None else [int(value) for value in token_ids[0]],
+        "token_ids": token_ids,
+        "conditioning_ids": conditioning,
     }
 
 
-def _paraformer_presence_logits(model: Any, embeds: Any, token_length: Any) -> Any:
-    """Final CTC-style logits for paraformer, from the source decoder head.
+def _apply_sensevoice_conditioning(
+    model: Any, speech: Any, lengths: Any, torch: Any
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Prepend SenseVoice's conditioning tokens exactly as ``inference`` does.
 
-    Paraformer is non-autoregressive: the decoder maps acoustic embeds straight to
-    token logits. Reusing the model's own head keeps the reference exact.
+    The conditioning is a fixed id sequence built from ``lid_dict`` and
+    ``textnorm_dict`` plus the hard-coded event/emotion pair ``[1, 2]``. It is
+    1 + 1 + 3 = 5 frames of prefix, and the lengths must grow to match or the
+    encoder masks real audio away.
     """
-    if hasattr(model, "ctc"):
-        return model.ctc.log_softmax(model.ctc(embeds))
-    raise NotImplementedError(
-        "paraformer reference final logits require the model's CTC head, which is "
-        "not exposed under the expected name; refusing to approximate it"
+    language = "auto"
+    textnorm = "woitn"
+    lid = int(getattr(model, "lid_dict", {}).get(language, 0))
+    norm = int(getattr(model, "textnorm_dict", {}).get(textnorm, 0))
+    event_emo = [1, 2]
+
+    batch = speech.size(0)
+    language_query = model.embed(torch.LongTensor([[lid]])).repeat(batch, 1, 1)
+    textnorm_query = model.embed(torch.LongTensor([[norm]])).repeat(batch, 1, 1)
+    event_emo_query = model.embed(torch.LongTensor([event_emo])).repeat(batch, 1, 1)
+    input_query = torch.cat((language_query, event_emo_query), dim=1)
+
+    speech = torch.cat((textnorm_query, speech), dim=1)
+    speech = torch.cat((input_query, speech), dim=1)
+    lengths = lengths + 1 + len(input_query[0])
+    return (
+        speech,
+        lengths,
+        {
+            "language": language,
+            "language_id": lid,
+            "textnorm": textnorm,
+            "textnorm_id": norm,
+            "event_emo_ids": event_emo,
+            "prefix_frames": 1 + len(input_query[0]),
+        },
     )
 
 
+def _sensevoice_ctc_logits(model: Any, encoder_out: Any) -> Any:
+    """SenseVoice's CTC logits, refusing to guess if the head is named otherwise."""
+    head = getattr(model, "ctc", None)
+    if head is None:
+        raise AlignmentError(
+            "SenseVoiceSmall has no ctc head; refusing to substitute another head for the real one"
+        )
+    return head.log_softmax(head(encoder_out))
+
+
 # --------------------------------------------------------------------------- #
-# Native backend (MLX) -- heavy imports are function-local
+# Canonical Whisper reference, AST-loaded from the staged upstream file
+# --------------------------------------------------------------------------- #
+WHISPER_DEFINITIONS = (
+    "ModelDimensions",
+    "LayerNorm",
+    "Linear",
+    "Conv1d",
+    "sinusoids",
+    "MultiHeadAttention",
+    "ResidualAttentionBlock",
+    "AudioEncoder",
+    "TextDecoder",
+    "Whisper",
+)
+
+
+def reference_definitions(source: str | Path, names: Sequence[str]) -> dict[str, Any]:
+    """Load exactly these definitions out of the upstream source and exec them.
+
+    This is how the real canonical module gets used without installing a
+    ``whisper`` package and without copying its code here. Every requested name
+    must actually be present: a missing one is an error, never a silent skip.
+    """
+    import torch
+
+    source = Path(source)
+    if not source.is_file():
+        raise AlignmentError(f"canonical Whisper source not found: {source}")
+    tree = ast.parse(source.read_text(), filename=str(source))
+    found = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in set(names)
+    }
+    missing = [name for name in names if name not in found]
+    if missing:
+        raise AlignmentError(
+            f"canonical Whisper source is missing {missing}; the reference must be "
+            "the real upstream module"
+        )
+
+    from dataclasses import dataclass
+    from typing import Dict, Iterable, List, Optional, Tuple
+
+    namespace: dict[str, Any] = {
+        "torch": torch,
+        "nn": torch.nn,
+        "F": torch.nn.functional,
+        "Tensor": torch.Tensor,
+        "Dict": Dict,
+        "Iterable": Iterable,
+        "List": List,
+        "Optional": Optional,
+        "Tuple": Tuple,
+        "dataclass": dataclass,
+        "math": math,
+        "__builtins__": __builtins__,
+    }
+    exec(  # noqa: S102 - executing the upstream source is the point
+        compile(ast.Module(body=list(found.values()), type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    return namespace
+
+
+def _build_canonical_whisper(variant: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """Instantiate canonical Whisper from the official tiny dimensions."""
+    reference = reference_definitions(variant["canonical_source"], WHISPER_DEFINITIONS)
+    # SDPA changes numerics; the comparison needs the plain path.
+    reference["MultiHeadAttention"].use_sdpa = False
+
+    dimensions = json.loads(Path(variant["config"]).read_text())
+    model = reference["Whisper"](reference["ModelDimensions"](**dimensions)).eval()
+    return model, {"dimensions": dimensions, "use_sdpa": False}
+
+
+# --------------------------------------------------------------------------- #
+# Native backend (MLX). Imports no Torch at module scope.
 # --------------------------------------------------------------------------- #
 def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> dict[str, Any]:
-    """Run the native MLX port and save the same per-stage tensors."""
-    import sys
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    """Run the native MLX port with its own frontend and the same config."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
 
-    from funasr_mlx.models import paraformer as paraformer_module
-    from funasr_mlx.models import sensevoice as sensevoice_module
-    from funasr_mlx.models import whisper as whisper_module
+    import funasr_mlx
+    from funasr_mlx.frontend import FbankConfig, WavFrontend
 
     variant = spec["variant"]
     output_root = Path(output_root or spec["output_root"]) / "native"
     output_root.mkdir(parents=True, exist_ok=True)
 
-    config = _load_config(Path(variant["config"]))
-    if variant["family"] == "paraformer":
-        model = paraformer_module.Paraformer(
-            config=paraformer_module.paraformer_config_from_dict(config)
-        )
-        loader = paraformer_module.load_strict
-    elif variant["family"] == "sensevoice":
-        model = sensevoice_module.SenseVoiceSmall(
-            sensevoice_module.sensevoice_config_from_dict(config)
-        )
-        loader = sensevoice_module.load_strict
-    elif variant["family"] == "whisper":
-        model = whisper_module.Whisper(whisper_module.whisper_config_from_dict(config).dims)
-        loader = whisper_module.load_strict
-    else:
-        raise NotImplementedError(f"native path for {variant['family']} is not wired")
-
-    state = _load_torch_state_for_native(Path(variant["checkpoint"]))
+    model = _build_native_model(variant, funasr_mlx)
+    state = _load_checkpoint_state(Path(variant["checkpoint"]))
     expected = dict(tree_flatten(model.parameters()))
     inventory = inventory_report(expected.keys(), state.keys(), label="native")
     if inventory["verdict"] != "ok":
-        raise KeyError(
+        raise AlignmentError(
             f"native key inventory mismatch: missing={inventory['missing']} "
             f"unexpected={inventory['unexpected']}"
         )
-    loader(model, state, convert=True, dtype=mx.float32)
+    funasr_mlx.models.sanm.load_strict(model, state, convert=True, dtype=mx.float32)
     mx.eval(model.parameters())
 
-    samples: list[dict[str, Any]] = []
-    for item in spec["inputs"]:
-        samples.append(
-            _run_native_sample(
-                model=model,
-                variant=variant,
-                item=item,
-                output_root=output_root,
-                mx=mx,
-            )
-        )
+    frontend = WavFrontend(_native_frontend_config(variant, FbankConfig), cmvn=variant["cmvn"])
+    samples = [
+        _run_native_sample(model, frontend, variant, item, output_root, mx)
+        for item in spec["inputs"]
+    ]
 
     metadata = {
-        "schema": "funasr-mlx-alignment-run/1",
+        "schema": "funasr-mlx-alignment-run/2",
         "backend": "native",
         "variant": variant,
         "dtype": "float32",
+        "frontend_config": variant["frontend"],
+        "cmvn": variant["cmvn"],
         "inventory": inventory,
         "samples": samples,
         "default_device": str(mx.default_device()),
@@ -770,9 +924,43 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
     return metadata
 
 
+def _native_frontend_config(variant: dict[str, Any], config_class: Any) -> Any:
+    """Build the MLX frontend config from the *same* settings the spec carries."""
+    settings = dict(variant["frontend"])
+    fields = {field for field in config_class.__dataclass_fields__}
+    kwargs = {key: value for key, value in settings.items() if key in fields}
+    if "fs" not in kwargs and "sample_rate" in fields:
+        kwargs["sample_rate"] = settings["fs"]
+    return config_class(**kwargs)
+
+
+def _build_native_model(variant: dict[str, Any], funasr_mlx: Any) -> Any:
+    import yaml
+
+    family = variant["family"]
+    if family == "paraformer":
+        from funasr_mlx.models import paraformer as module
+    elif family == "sensevoice":
+        from funasr_mlx.models import sensevoice as module
+    elif family == "whisper":
+        from funasr_mlx.models import whisper as module
+    else:  # pragma: no cover
+        raise AlignmentError(f"native path for {family} is not wired")
+
+    path = Path(variant["config"])
+    raw = (
+        json.loads(path.read_text()) if path.suffix == ".json" else yaml.safe_load(path.read_text())
+    )
+    if family == "paraformer":
+        return module.Paraformer(config=module.paraformer_config_from_dict(raw))
+    if family == "sensevoice":
+        return module.SenseVoiceSmall(module.sensevoice_config_from_dict(raw))
+    return module.Whisper(module.whisper_config_from_dict(raw).dims)
+
+
 def _run_native_sample(
-    *,
     model: Any,
+    frontend: Any,
     variant: dict[str, Any],
     item: dict[str, Any],
     output_root: Path,
@@ -780,172 +968,124 @@ def _run_native_sample(
 ) -> dict[str, Any]:
     import numpy as np
 
-    from funasr_mlx.frontend import FbankConfig, WavFrontend
-
-    samples = _load_audio(item["audio"], SAMPLE_RATE)
-    frontend = WavFrontend(
-        FbankConfig(
-            n_mels=variant["n_mels"],
-            lfr_m=variant["lfr_m"],
-            lfr_n=variant["lfr_n"],
-        ),
-        cmvn=None,
-    )
-    fbank = np.asarray(frontend(samples), dtype=np.float32)
-
+    audio = _load_audio(item["audio"])
+    fbank = np.asarray(frontend(audio), dtype=np.float32)
     speech = mx.array(fbank)[None, :, :]
     lengths = mx.array([fbank.shape[0]], dtype=mx.int32)
 
     stages = [_stage_record("frontend", fbank, path=output_root / f"{item['key']}_frontend.npz")]
     saved: dict[str, Any] = {"frontend": fbank}
     finals: dict[str, Any] = {}
+    token_ids: list[int] | None = None
 
-    with mx.stream(mx.default_stream(mx.default_device())):
-        if variant["family"] == "paraformer":
-            outputs = model.forward(speech, lengths)
-            finals = {
-                "encoder": outputs.encoder_out,
-                "pre_decoder": outputs.acoustic_embeds,
-                "final_logits": outputs.acoustic_embeds,
-            }
-            token_ids = None
-        elif variant["family"] == "sensevoice":
-            encoder_out, _ = model.encode(speech, lengths, language="auto", use_itn=False)
-            finals = {"encoder": encoder_out, "pre_decoder": encoder_out}
-            token_ids = None
-        else:
-            raise NotImplementedError(f"native path for {variant['family']} is not wired")
+    if variant["family"] == "paraformer":
+        outputs = model.forward(speech, lengths)
+        finals = {
+            "encoder": outputs.encoder_out,
+            "pre_decoder": outputs.acoustic_embeds,
+            "final_logits": outputs.acoustic_embeds,
+        }
+    elif variant["family"] == "sensevoice":
+        encoder_out, _ = model.encode(
+            speech, lengths, language="auto", use_itn=False, ban_emo_unk=False
+        )
+        logits = model(speech, lengths, language="auto", use_itn=False, ban_emo_unk=False)
+        finals = {"encoder": encoder_out, "pre_decoder": encoder_out, "final_logits": logits}
+        token_ids = [int(v) for v in np.asarray(logits[0]).argmax(axis=-1)]
+    else:  # pragma: no cover
+        raise AlignmentError(f"native path for {variant['family']} is not wired")
 
-    for stage, value in finals.items():
-        stages.append(_stage_record(stage, value, path=output_root / f"{item['key']}_{stage}.npz"))
-        saved[stage] = _bounded(value)[0]
-
+    for stage_name, value in finals.items():
+        stages.append(
+            _stage_record(stage_name, value, path=output_root / f"{item['key']}_{stage_name}.npz")
+        )
+        saved[stage_name] = _bounded(value)[0]
     np.savez(output_root / f"{item['key']}.npz", **saved)
+
     return {
         "key": item["key"],
         "audio": item["audio"],
         "duration_seconds": item["duration_seconds"],
         "stages": stages,
         "token_ids": token_ids,
+        "conditioning_ids": None,
     }
-
-
-def _load_torch_state_for_native(path: Path) -> dict[str, Any]:
-    """Read the official checkpoint as a plain mapping for the strict loader.
-
-    MLX-side loading deliberately reuses Torch's reader rather than inventing a
-    second format, so both backends provably consume the same bytes.
-    """
-    return _load_torch_state(path)
-
-
-def _load_audio(path: str, sample_rate: int) -> Any:
-    """Load audio as float32 mono at the model rate, without resampling."""
-    import numpy as np
-    import soundfile as sf
-
-    data, rate = sf.read(str(path), dtype="float32", always_2d=True)
-    if rate != sample_rate:
-        raise ValueError(f"{path}: expected {sample_rate} Hz, received {rate} Hz")
-    return np.ascontiguousarray(data.mean(axis=1), dtype=np.float32)
-
-
-def _load_config(path: Path) -> dict[str, Any]:
-    """Read a checkpoint config from JSON or YAML."""
-    import yaml
-
-    if path.suffix.lower() == ".json":
-        return json.loads(path.read_text())
-    return yaml.safe_load(path.read_text())
 
 
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def _cmd_build(args: argparse.Namespace) -> int:
-    spec = build_alignment_spec(
-        args.manifest,
-        args.variant,
-        args.output_root,
-        assets_root=args.assets_root,
-        max_samples=args.max_samples,
-    )
-    destination = Path(args.output_root) / "spec.json"
-    _write_metadata(destination, spec)
-    print(f"wrote {destination}")
-    print(f"variant={spec['variant']['key']} samples={len(spec['inputs'])}")
-    return 0
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Full-weight ASR/Whisper alignment adapter")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
+    list_parser = subparsers.add_parser("list")
+    list_parser.set_defaults(command="list")
 
-def _cmd_run(args: argparse.Namespace) -> int:
-    spec = json.loads(Path(args.spec).read_text())
-    runner = run_reference if args.mode == "reference" else run_native
-    metadata = runner(spec, args.output_root)
-    inventory = metadata["inventory"]
-    print(
-        f"{args.mode}: variant={metadata['variant']['key']} "
-        f"samples={len(metadata['samples'])} keys={inventory['model_key_count']} "
-        f"inventory={inventory['verdict']}"
-    )
-    return 0
+    build_parser = subparsers.add_parser("build")
+    build_parser.add_argument("--manifest", required=True)
+    build_parser.add_argument("--variant", required=True)
+    build_parser.add_argument("--output-root", required=True)
+    build_parser.add_argument("--assets-root", default=str(DEFAULT_ASSETS_ROOT))
+    build_parser.add_argument("--max-samples", type=int, default=8)
+    build_parser.add_argument("--cmvn-name", default="am.mvn")
+    build_parser.set_defaults(command="build")
 
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument("--backend", required=True, choices=("reference", "native"))
+    run_parser.add_argument("--spec", required=True)
+    run_parser.add_argument("--output-root", required=True)
+    run_parser.set_defaults(command="run")
 
-def _cmd_compare(args: argparse.Namespace) -> int:
+    compare_parser = subparsers.add_parser("compare")
+    compare_parser.add_argument("--reference", required=True)
+    compare_parser.add_argument("--native", required=True)
+    compare_parser.add_argument("--output-root", required=True)
+    compare_parser.set_defaults(command="compare")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "list":
+        for variant in SUPPORTED:
+            print(f"aligned    {variant.key:22s} {variant.checkpoint:38s} {variant.notes}")
+        for key, reason in sorted(UNSUPPORTED.items()):
+            print(f"refused    {key:22s} {reason}")
+        return 0
+
+    if args.command == "build":
+        spec = build_alignment_spec(
+            args.manifest,
+            args.variant,
+            args.output_root,
+            assets_root=args.assets_root,
+            max_samples=args.max_samples,
+            cmvn_name=args.cmvn_name,
+        )
+        destination = Path(args.output_root) / "spec.json"
+        _write_metadata(destination, spec)
+        print(f"wrote {destination}: {spec['variant']['key']} samples={len(spec['inputs'])}")
+        return 0
+
+    if args.command == "run":
+        spec = json.loads(Path(args.spec).read_text())
+        runner = run_reference if args.backend == "reference" else run_native
+        metadata = runner(spec, args.output_root)
+        inventory = metadata["inventory"]
+        print(
+            f"{args.backend}: {metadata['variant']['key']} samples={len(metadata['samples'])} "
+            f"keys={inventory['model_key_count']} inventory={inventory['verdict']}"
+        )
+        return 0
+
     reference = json.loads(Path(args.reference).read_text())
     native = json.loads(Path(args.native).read_text())
     report = compare_alignment(reference, native)
     destination = Path(args.output_root) / "diff.json"
     _write_metadata(destination, report)
-    print(f"wrote {destination}")
-    print(f"findings={report['finding_count']} clean={report['clean']}")
+    print(f"wrote {destination}: findings={report['finding_count']} clean={report['clean']}")
     for finding in report["findings"]:
         print(f"  {finding['kind']}: {finding.get('sample', '')} {finding.get('detail', '')}")
     return 0
-
-
-def _cmd_list(args: argparse.Namespace) -> int:
-    print("aligned variants:")
-    for variant in SUPPORTED:
-        print(f"  {variant.key:24s} {variant.checkpoint:40s} {variant.notes}")
-    print("explicitly not aligned:")
-    for key, reason in sorted(UNSUPPORTED.items()):
-        print(f"  {key:24s} {reason}")
-    return 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    list_parser = subparsers.add_parser("list", help="show aligned and unsupported variants")
-    list_parser.set_defaults(handler=_cmd_list)
-
-    build_parser_ = subparsers.add_parser("build", help="write the alignment spec")
-    build_parser_.add_argument("--manifest", required=True)
-    build_parser_.add_argument("--variant", required=True)
-    build_parser_.add_argument("--output-root", required=True)
-    build_parser_.add_argument("--assets-root", default=str(DEFAULT_ASSETS_ROOT))
-    build_parser_.add_argument("--max-samples", type=int, default=8)
-    build_parser_.set_defaults(handler=_cmd_build)
-
-    for mode in ("reference", "native"):
-        run_parser = subparsers.add_parser(mode, help=f"run the {mode} backend in its own process")
-        run_parser.add_argument("--spec", required=True)
-        run_parser.add_argument("--output-root", required=True)
-        run_parser.set_defaults(handler=_cmd_run, mode=mode)
-
-    compare_parser = subparsers.add_parser("compare", help="diff two run metadata files")
-    compare_parser.add_argument("--reference", required=True)
-    compare_parser.add_argument("--native", required=True)
-    compare_parser.add_argument("--output-root", required=True)
-    compare_parser.set_defaults(handler=_cmd_compare)
-    return parser
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    return int(args.handler(args))
 
 
 if __name__ == "__main__":  # pragma: no cover - entry point
