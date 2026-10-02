@@ -11,3 +11,4 @@ dist/
 checkpoints/
 *.safetensors
 *.npz
+.DS_Store
