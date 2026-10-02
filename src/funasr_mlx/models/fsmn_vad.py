@@ -356,37 +356,28 @@ class ModuleLayerList(nn.Module):
         return self[str(index)] if isinstance(index, int) else dict.__getitem__(self, index)
 
 
-class LinearTransform(nn.Linear):
-    """``LinearTransform``: a bias-free linear.
+class LinearTransform(nn.Module):
+    """Bias-free wrapper retaining the reference's named ``linear`` child.
 
-    The reference is::
-
-        class LinearTransform(torch.nn.Module):
-            def __init__(self, input_dim, output_dim):
-                self.input_dim = input_dim
-                self.output_dim = output_dim
-                self.linear = torch.nn.Linear(input_dim, output_dim, bias=False)
-
-    ``BasicBlock.linear`` is the ``LinearTransform`` and ``torch.nn.Linear``'s own
-    parameter is called ``weight``, so the checkpoint path is
-    ``fsmn.<i>.linear.weight`` -- i.e. the ``LinearTransform`` *is* the
-    ``nn.Linear``.  Subclassing ``nn.Linear`` reproduces that exactly; wrapping a
-    ``nn.Linear`` in another module would shift the key to
-    ``fsmn.<i>.linear.linear.weight``.
+    ``BasicBlock.linear`` owns this wrapper, so its child adds the second
+    ``linear`` in ``fsmn.<i>.linear.linear.weight``.
     """
 
     def __init__(self, input_dim: int, output_dim: int) -> None:
-        super().__init__(input_dim, output_dim, bias=False)
+        super().__init__()
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
+        self.linear = nn.Linear(input_dim, output_dim, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.linear(x)
 
 
 class AffineTransform(nn.Module):
     """``AffineTransform``: ``self.linear = nn.Linear(input_dim, output_dim)``.
 
-    Unlike :class:`LinearTransform` the reference keeps a named ``linear``
-    submodule here, so the checkpoint keys are ``…affine.linear.weight`` and
-    ``…affine.linear.bias``.
+    Like :class:`LinearTransform`, this retains the named ``linear`` submodule;
+    unlike it, the affine transform also has a bias.
     """
 
     def __init__(self, input_dim: int, output_dim: int) -> None:

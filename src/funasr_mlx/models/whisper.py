@@ -825,6 +825,8 @@ class TextDecoder(mxnn.Module):
         kv_cache: dict[str, mx.array] | None = None,
     ) -> mx.array:
         offset = self.offset(kv_cache)
+        if mask is None:
+            mask = self.mask
         if x.ndim == 1:
             x = mx.expand_dims(x, 0)
         emb = self.token_embedding(x)

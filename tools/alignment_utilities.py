@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import wraps
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -112,8 +113,20 @@ FAMILIES = ("fsmn-vad", "ct-punc", "campplus", "emotion2vec")
 
 
 # --------------------------------------------------------------------------- #
-# private output helpers (this module deliberately exposes no shared API)
+# private output helpers
 # --------------------------------------------------------------------------- #
+def guarded_alignment(function):
+    """Require authenticated supervision before importing numerical backends."""
+    @wraps(function)
+    def run(*args, **kwargs):
+        from funasr_mlx.memory import guarded_child_active
+
+        if not guarded_child_active():
+            raise RuntimeError("Alignment execution requires the guarded launcher")
+        return function(*args, **kwargs)
+    return run
+
+
 def _write_npz(out_dir: Path, key: str, mode: str, arrays: Mapping[str, Any]) -> Path:
     import numpy as np
 
@@ -177,7 +190,13 @@ def _load_reference(assets: Mapping[str, Any]) -> Any:
     """An ``AutoModel`` on CPU with the official frontend and tokenizer."""
     from funasr.auto.auto_model import AutoModel
 
-    return AutoModel(model=_reference_model_dir(assets), device="cpu", disable_pbar=True)
+    return AutoModel(
+        model=_reference_model_dir(assets),
+        device="cpu",
+        disable_pbar=True,
+        disable_update=True,
+        ncpu=1,
+    )
 
 
 def _reference_frontend(auto: Any) -> Any:
@@ -213,8 +232,10 @@ def _check_audio(entry: Mapping[str, Any], samples: Any) -> None:
 # --------------------------------------------------------------------------- #
 # fsmn-vad
 # --------------------------------------------------------------------------- #
-def run_fsmn_vad_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                           out_dir: Path) -> None:
+@guarded_alignment
+def run_fsmn_vad_reference(
+    entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
+) -> None:
     """Official ``FsmnVADStreaming`` forward: frame posterior + segment endpoints."""
     import numpy as np
     import torch
@@ -225,39 +246,69 @@ def run_fsmn_vad_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
 
     samples = _reference_waveform(entry["audio"])
     _check_audio(entry, samples)
-    feats = frontend(torch.from_numpy(samples[None, :])).squeeze(0)
-    waveform = torch.from_numpy(samples)
+    frontend_cache: dict[str, Any] = {}
+    feats, feat_lengths = frontend(
+        torch.from_numpy(samples[None, :]),
+        torch.tensor([samples.size], dtype=torch.int64),
+        cache=frontend_cache,
+        is_final=True,
+        return_waveform=True,
+    )
+    waveform = frontend_cache.get("aligned_waveforms")
+    if waveform is None or waveform.numel() == 0:
+        raise ValueError("Official online frontend emitted no aligned waveform")
 
     cache: dict[str, Any] = {}
     module.init_cache(cache)
+    # Final segment cleanup drops stats.scores; evaluate the identical fresh encoder
+    # call separately so posterior measurements cannot become empty.
+    with torch.no_grad():
+        posterior = module.encoder(feats, cache={})
     # The official fsmn-vad config.yaml ships ``output_frame_probs: False``; the
     # frame stage is required for this comparison, so it is overridden here
     # explicitly rather than left to the config.
     result = module.forward(
-        feats, waveform, cache=cache, is_final=True, is_streaming_input=False,
+        feats,
+        waveform,
+        cache=cache,
+        is_final=True,
+        is_streaming_input=False,
         output_frame_probs=True,
     )
-    segments, frame_probs, scores = _vad_stages(result, cache)
+    segments, frame_probs, _ = _vad_stages(result, cache)
+    scores = posterior
 
-    _write_npz(out_dir, entry["key"], "reference", {
-        # raw encoder posterior -- the numeric stage the two sides can actually
-        # be compared on, ahead of any thresholded state
-        "scores": _numpy(scores).reshape(-1, _numpy(scores).shape[-1]).astype(np.float32),
-        "frame_prob": np.asarray(
-            [[p.noise_prob, p.speech_prob, p.score] for p in frame_probs],
-            dtype=np.float32,
-        ).reshape(-1, 3),
-        "frame_state": np.asarray([p.frm_state for p in frame_probs], dtype=np.int32),
-        "segment_bounds": np.asarray(segments, dtype=np.int32).reshape(-1, 2),
-    })
-    _write_json(out_dir, entry["key"], "reference", {
-        "family": "fsmn-vad",
-        "segments_ms": [[int(pair[0]), int(pair[1])] for pair in segments],
-        "n_frames": int(_numpy(scores).reshape(-1, _numpy(scores).shape[-1]).shape[0]),
-        "n_frame_probs": len(frame_probs),
-        "duration_seconds": samples.size / SAMPLE_RATE,
-        "frontend": type(frontend).__name__,
-    })
+    _write_npz(
+        out_dir,
+        entry["key"],
+        "reference",
+        {
+            # raw encoder posterior -- the numeric stage the two sides can actually
+            # be compared on, ahead of any thresholded state
+            "frontend": _numpy(feats).astype(np.float32),
+            "scores": _numpy(scores).reshape(-1, _numpy(scores).shape[-1]).astype(np.float32),
+            "frame_prob": np.asarray(
+                [[p.noise_prob, p.speech_prob, p.score] for p in frame_probs],
+                dtype=np.float32,
+            ).reshape(-1, 3),
+            "frame_state": np.asarray([p.frm_state for p in frame_probs], dtype=np.int32),
+            "segment_bounds": np.asarray(segments, dtype=np.int32).reshape(-1, 2),
+        },
+    )
+    _write_json(
+        out_dir,
+        entry["key"],
+        "reference",
+        {
+            "family": "fsmn-vad",
+            "segments_ms": [[int(pair[0]), int(pair[1])] for pair in segments],
+            "n_frames": int(_numpy(scores).reshape(-1, _numpy(scores).shape[-1]).shape[0]),
+            "scores_source": "fresh_encoder_call_with_empty_fsmn_cache",
+            "n_frame_probs": len(frame_probs),
+            "duration_seconds": samples.size / SAMPLE_RATE,
+            "frontend": type(frontend).__name__,
+        },
+    )
 
 
 def _numpy(value: Any) -> Any:
@@ -315,6 +366,7 @@ def _required_attr(obj: Any, name: str) -> Any:
     return getattr(obj, name)
 
 
+@guarded_alignment
 def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
                         out_dir: Path) -> None:
     """Native ``funasr_mlx.models.fsmn_vad.FsmnVadModel`` forward.
@@ -353,7 +405,7 @@ def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     options.pop("cmvn_file", None)
     options.setdefault("lfr_m", input_dim // n_mels)
     options.setdefault("lfr_n", 1)
-    features = WavFrontend(FbankConfig.from_dict(options))(samples)  # (T, input_dim)
+    features = WavFrontend(FbankConfig.from_dict(options), cmvn=assets.get("cmvn"))(samples)
     if features.shape[0] == 0:
         raise ValueError(f"{entry['key']}: frontend produced no frames")
 
@@ -365,32 +417,37 @@ def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     waveform = mx.array(samples[:needed])[None, ...]  # (1, needed)
 
     cache = model.init_cache()
-    result = model(
-        features[None, ...], waveform, cache, is_final=True, is_streaming_input=False
-    )
-    segments, frame_probs, scores = _vad_stages(result, cache)
-    posterior = np.asarray(scores).reshape(-1, np.asarray(scores).shape[-1])
+    encoder_scores = model.encoder(features[None, ...], cache={})
+    mx.eval(encoder_scores)
+    result = model(features[None, ...], waveform, cache, is_final=True, is_streaming_input=False)
+    segments, frame_probs, _ = _vad_stages(result, cache)
+    posterior = np.asarray(encoder_scores).reshape(-1, encoder_scores.shape[-1])
 
     arrays: dict[str, Any] = {
+        "frontend": np.asarray(features[None], dtype=np.float32),
         "scores": posterior.astype(np.float32),
         "segment_bounds": np.asarray(segments, dtype=np.int32).reshape(-1, 2),
     }
-    if frame_probs:
-        arrays["frame_prob"] = np.asarray(
-            [[p.noise_prob, p.speech_prob, p.score] for p in frame_probs], dtype=np.float32
-        ).reshape(-1, 3)
-        arrays["frame_state"] = np.asarray([p.frm_state for p in frame_probs],
-                                           dtype=np.int32)
+    arrays["frame_prob"] = np.asarray(
+        [[p.noise_prob, p.speech_prob, p.score] for p in frame_probs], dtype=np.float32
+    ).reshape(-1, 3)
+    arrays["frame_state"] = np.asarray([p.frm_state for p in frame_probs], dtype=np.int32)
     _write_npz(out_dir, entry["key"], "native", arrays)
-    _write_json(out_dir, entry["key"], "native", {
-        "family": "fsmn-vad",
-        "segments_ms": [[int(pair[0]), int(pair[1])] for pair in segments],
-        "n_frames": int(posterior.shape[0]),
-        "n_frame_probs": len(frame_probs),
-        "duration_seconds": samples.size / SAMPLE_RATE,
-        "lfr_m": input_dim // n_mels,
-        "waveform_samples": int(needed),
-    })
+    _write_json(
+        out_dir,
+        entry["key"],
+        "native",
+        {
+            "family": "fsmn-vad",
+            "segments_ms": [[int(pair[0]), int(pair[1])] for pair in segments],
+            "n_frames": int(posterior.shape[0]),
+            "scores_source": "fresh_encoder_call_with_empty_fsmn_cache",
+            "n_frame_probs": len(frame_probs),
+            "duration_seconds": samples.size / SAMPLE_RATE,
+            "lfr_m": input_dim // n_mels,
+            "waveform_samples": int(needed),
+        },
+    )
 
 
 def _vad_input_dim(config: Any) -> int:
@@ -407,6 +464,7 @@ def _vad_input_dim(config: Any) -> int:
 # --------------------------------------------------------------------------- #
 # ct-punc
 # --------------------------------------------------------------------------- #
+@guarded_alignment
 def run_ct_punc_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
                           out_dir: Path) -> None:
     """Official ``CTTransformer.punc_forward`` over jieba-split mini-sentences.
@@ -459,6 +517,7 @@ def run_ct_punc_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
     })
 
 
+@guarded_alignment
 def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
                        out_dir: Path) -> None:
     """Native ``funasr_mlx.models.ct_punc.CtPuncModel.punc_forward``."""
@@ -494,8 +553,10 @@ def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
 # --------------------------------------------------------------------------- #
 # campplus
 # --------------------------------------------------------------------------- #
-def run_campplus_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
-                           out_dir: Path) -> None:
+@guarded_alignment
+def run_campplus_reference(
+    entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
+) -> None:
     """Official ``CAMPPlus.forward`` plus the reference's own ``extract_feature``.
 
     ``extract_feature`` applies ``num_mel_bins=80`` fbank and then **subtracts the
@@ -522,6 +583,7 @@ def run_campplus_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
         embedding = module.forward(speech.to(torch.float32))
 
     arrays: dict[str, Any] = {
+        "frontend": speech.detach().cpu().numpy().astype(np.float32),
         "embedding": np.asarray(embedding[0].detach().cpu().numpy(), dtype=np.float32),
     }
     other = assets.get("speaker_b")
@@ -530,23 +592,24 @@ def run_campplus_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
         second_speech, _l, _t = extract_feature([torch.from_numpy(other_samples)])
         with torch.no_grad():
             second = module.forward(second_speech.to(torch.float32))
-        arrays["embedding_b"] = np.asarray(
-            second[0].detach().cpu().numpy(), dtype=np.float32
-        )
-        arrays["cosine"] = np.asarray(
-            [_cosine(embedding[0], second[0])], dtype=np.float32
-        )
+        arrays["embedding_b"] = np.asarray(second[0].detach().cpu().numpy(), dtype=np.float32)
+        arrays["cosine"] = np.asarray([_cosine(embedding[0], second[0])], dtype=np.float32)
     _write_npz(out_dir, entry["key"], "reference", arrays)
-    _write_json(out_dir, entry["key"], "reference", {
-        "family": "campplus",
-        "backend": backend,
-        "utterance": utterance,
-        "output_level": getattr(module, "output_level", None),
-        "feature_frames": int(speech.shape[1]),
-        "cosine_source": "explicit dot/norm; funasr.models.campplus.utils has no "
-                         "cosine helper, so this is plain arithmetic on the two "
-                         "official embeddings rather than a reimplementation",
-    })
+    _write_json(
+        out_dir,
+        entry["key"],
+        "reference",
+        {
+            "family": "campplus",
+            "backend": backend,
+            "utterance": utterance,
+            "output_level": getattr(module, "output_level", None),
+            "feature_frames": int(speech.shape[1]),
+            "cosine_source": "explicit dot/norm; funasr.models.campplus.utils has no "
+            "cosine helper, so this is plain arithmetic on the two "
+            "official embeddings rather than a reimplementation",
+        },
+    )
 
 
 def _build_campplus(assets: Mapping[str, Any], raw: Mapping[str, Any]) -> tuple[Any, str]:
@@ -562,6 +625,7 @@ def _build_campplus(assets: Mapping[str, Any], raw: Mapping[str, Any]) -> tuple[
     module = CAMPPlus(**raw["model_conf"])
     state = _load_state_dict(_require(assets, "weights"))
     module.load_state_dict(state, strict=True)
+    module.float().eval()
     return module, f"CAMPPlus(**model_conf) + weights_only load of {Path(str(weights)).name}"
 
 
@@ -577,6 +641,7 @@ def _cosine(first: Any, second: Any) -> float:
     return float((a * b).sum() / denominator)
 
 
+@guarded_alignment
 def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
                         out_dir: Path) -> None:
     """Native ``CAMPPlus.embed`` with the reference's mean-subtracted features."""
@@ -588,9 +653,12 @@ def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     model, config = load_model(
         _require(assets, "checkpoint"), family="campplus", config=assets.get("config")
     )
-    frontend = WavFrontend(
-        FbankConfig.from_dict(config) if isinstance(config, Mapping) else FbankConfig()
-    )
+    options = dict(config.get("frontend_conf") or {}) if isinstance(config, Mapping) else {}
+    from funasr_mlx.models.campplus import CAMPPLUS_FRONTEND_DEFAULTS
+
+    for key, value in CAMPPLUS_FRONTEND_DEFAULTS.items():
+        options.setdefault(key, value)
+    frontend = WavFrontend(FbankConfig.from_dict(options))
     utterance = str(assets.get("speaker_a") or entry["audio"])
     samples = np.asarray(read_audio(utterance), dtype=np.float32)
     _check_audio(entry, samples)
@@ -602,6 +670,7 @@ def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     embedding = model(features[None, ...])
 
     arrays: dict[str, Any] = {
+        "frontend": np.asarray(features[None], dtype=np.float32),
         "embedding": np.asarray(embedding[0]).astype(np.float32),
     }
     other = assets.get("speaker_b")
@@ -610,19 +679,25 @@ def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
         other_features = other_features - mx.mean(other_features, axis=0, keepdims=True)
         second = model(other_features[None, ...])
         arrays["embedding_b"] = np.asarray(second[0]).astype(np.float32)
-        arrays["cosine"] = np.asarray([_cosine(embedding[0], second[0])],
-                                      dtype=np.float32)
+        arrays["cosine"] = np.asarray([_cosine(embedding[0], second[0])], dtype=np.float32)
     _write_npz(out_dir, entry["key"], "native", arrays)
-    _write_json(out_dir, entry["key"], "native", {
-        "family": "campplus",
-        "utterance": utterance,
-        "output_level": getattr(model, "output_level", None),
-    })
+    _write_json(
+        out_dir,
+        entry["key"],
+        "native",
+        {
+            "family": "campplus",
+            "ignored_buffers": list(getattr(model, "_checkpoint_ignored_buffers", ())),
+            "utterance": utterance,
+            "output_level": getattr(model, "output_level", None),
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
 # emotion2vec
 # --------------------------------------------------------------------------- #
+@guarded_alignment
 def run_emotion2vec_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
                               out_dir: Path) -> None:
     """Official ``Emotion2vec``: frame features, pooled embedding, logits, probs.
@@ -919,6 +994,7 @@ def _emotion_consistency_checks(raw: Mapping[str, Any], report: dict[str, Any]) 
     report["consistency"] = checks
 
 
+@guarded_alignment
 def run_emotion2vec_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
                            out_dir: Path) -> None:
     """Native emotion forward via the shipping loader, with the disposition report.

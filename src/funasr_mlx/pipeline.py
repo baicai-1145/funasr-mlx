@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import warnings
 from pathlib import Path
 
 from .checkpoints import checkpoint_files, inspect_checkpoint, safetensor_header
@@ -103,7 +104,22 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
 
     model = create_model(family, config_dict)
     expected = dict(tree_flatten(model.parameters()))
-    missing, unexpected = sorted(set(expected) - set(headers)), sorted(set(headers) - set(expected))
+    ignored = set()
+    if family == "campplus":
+        from .models.campplus import TORCH_ONLY_BUFFERS, BatchNorm
+
+        ignored = {
+            f"{name}.{buffer}"
+            for name, child in model.named_modules()
+            if isinstance(child, BatchNorm)
+            for buffer in TORCH_ONLY_BUFFERS
+            if f"{name}.{buffer}" in headers
+        }
+        for name in ignored:
+            if headers[name]["shape"] != [] or headers[name]["dtype"] != "I64":
+                raise ValueError(f"Invalid BatchNorm training counter: {name}")
+    missing = sorted(set(expected) - set(headers))
+    unexpected = sorted(set(headers) - set(expected) - ignored)
     if missing or unexpected:
         raise KeyError(f"Checkpoint keys differ: missing={missing}, unexpected={unexpected}")
     for name, tensor in expected.items():
@@ -119,12 +135,18 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
             raise ValueError("Expected a named safetensors shard")
         if applied.intersection(tensors):
             raise ValueError("Duplicate tensors while loading")
+        for name in ignored.intersection(tensors):
+            del tensors[name]
         model.update(tree_unflatten(list(tensors.items())))
         applied.update(tensors)
         del tensors
-    if applied != set(headers):
+    if applied != set(headers) - ignored:
         raise KeyError("Incomplete checkpoint loading")
     model.eval()
     mx.eval(model.parameters())
     mx.clear_cache()
+    if ignored:
+        model._checkpoint_ignored_buffers = tuple(sorted(ignored))
+        warnings.warn(f"Ignored {len(ignored)} CAM++ BatchNorm training counters; "
+                      "names recorded in model._checkpoint_ignored_buffers", stacklevel=2)
     return model, config_dict

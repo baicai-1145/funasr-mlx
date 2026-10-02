@@ -134,9 +134,7 @@ def test_native_process_never_touches_torch_or_funasr():
 def test_both_frontends_are_built_independently_from_one_config():
     """Each backend gets a real frontend, configured from the same spec values."""
     assert "WavFrontend" in _dump("_resolve_wav_frontend")
-    assert "FbankConfig" in _dump("_run_native") or "FbankConfig" in _dump(
-        "_native_frontend_config"
-    )
+    assert "FbankConfig" in _dump("run_native") or "FbankConfig" in _dump("_native_frontend_config")
     # The native config is derived from the spec's shared settings.
     assert "variant" in _dump("_native_frontend_config")
     # CMVN must be applied on both sides or the features cannot be compared.
@@ -149,9 +147,10 @@ def test_both_frontends_are_built_independently_from_one_config():
 # --------------------------------------------------------------------------- #
 def test_reference_uses_real_upstream_constructors():
     """FunASR models come from their real constructors, not zero-arg guesses."""
-    assert "model_conf" in _dump("_split_funasr_config")
+    assert "model_conf" in _dump("build_model_conf")
     for name in ("encoder_conf", "decoder_conf", "predictor_conf", "ctc_conf"):
-        assert name in _dump("_split_funasr_config"), f"{name} must be forwarded"
+        configuration = {"model_conf": {"ctc_weight": 0.0}, name: {"size": 4}}
+        assert alignment.build_model_conf(configuration)[name] == {"size": 4}
     assert "importlib" in _dump("_build_funasr_reference")
     # Registry imports are required: configs name submodules as strings.
     for variant in alignment.SUPPORTED:
@@ -259,6 +258,18 @@ def test_only_bounded_whisper_is_offered():
 # Spec and comparison
 # --------------------------------------------------------------------------- #
 def test_spec_is_json_serialisable_and_carries_shared_frontend_config(tmp_path):
+    directory = tmp_path / "models" / "paraformer"
+    directory.mkdir(parents=True)
+    (directory / "configuration.json").write_text(
+        json.dumps(
+            {
+                "file_path_metas": {
+                    "init_param": "model.pt",
+                    "frontend_conf": {"cmvn_file": "am.mvn"},
+                }
+            }
+        )
+    )
     spec = alignment.build_alignment_spec(
         _manifest(tmp_path), "paraformer-zh", tmp_path, assets_root=tmp_path
     )

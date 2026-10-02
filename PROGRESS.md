@@ -1,6 +1,24 @@
 # Development Progress
 
-All seven native MLX prototypes are integrated into main. This is unfinished: no official checkpoint or real-audio acceptance has been completed.
+All seven native MLX prototypes are integrated into main. Official assets have now been acquired, and full-weight real-audio diagnosis has started. Seven-model acceptance and corpus-wide validation remain unfinished.
+
+## Official Assets And Diagnostic Evidence
+
+- All 39 selected files downloaded with pinned revisions and checksums; 6,661,591,343 bytes at `/Volumes/2T/funasr-mlx-alignment`. Source records: `catalog.json` and `downloaded.json`.
+- Prepared complete acquired corpora: LibriSpeech test-clean 2,620 clips (CC BY 4.0), AISHELL-derived mirror 6,920 clips (not the canonical 7,176-clip split), and RAVDESS speech 1,440 clips (CC BY-NC-SA 4.0). The AISHELL mirror does not declare a license; redistribution and commercial use remain unverified. Five RAVDESS stereo clips are explicitly downmixed. All selected waveform inputs are shared between backends. Coverage, archive/shard hashes, revisions, language and license status survive partial reruns; numerical parity does not resolve legal limitations.
+- Initial diagnostic manifests select 8 English, 8 Chinese and 8 emotional clips, each no longer than 8 seconds. These are not full-corpus acceptance results.
+- Safe official weight inventories read all seven checkpoints. Paraformer uses legacy serialization, which cannot mmap. ct-punc has a 972,282,288-byte embedding tensor: the bounded converter must not silently reduce this vocabulary. Emotion2vec inference tensors total 648,560,740 bytes despite its larger training-checkpoint file.
+- Converted complete FSMN-VAD, CAM++ and Whisper tiny native artifacts in FP32. Converting Whisper FP16 storage to FP32 does not recreate information absent from the original weights.
+- FSMN-VAD: official PyTorch CPU and native MLX/Metal ran separately and serially on all 16 diagnostic speech clips. All 16 segment endpoint arrays match exactly. Maximum posterior absolute difference is `9.179115295410156e-06`; maximum relative L2 error is `3.718324821923118e-06`. Frontend maximum absolute difference is `2.816915512084961e-04`, relative L2 maximum `3.5863460108421554e-06`. These are measurements, not an implicit acceptance tolerance. Detailed report: `/Volumes/2T/funasr-mlx-alignment/results/fsmn-vad/comparison.json`. Frame probability/state diagnostics were not measured because the official configuration disables them.
+- Real VAD loading exposed an incorrect bias-free wrapper namespace. Restored `fsmn.<i>.linear.linear.weight`, corrected the previously misleading test expectations, and added an actual-source regression that failed before the fix and passes after it. Focused VAD/source/pipeline suite: 66 passed.
+- CAM++: complete official FP32 weights were run separately on PyTorch CPU and MLX/Metal for all 16 selected speech clips. Embedding maximum absolute difference is `4.887580871582031e-05`, relative L2 maximum `7.275810778835532e-06`. Frontend maximum absolute difference is `0.0016393661499023438`, relative L2 maximum `5.713358277099895e-06`. Final post-review rerun and required-stage comparison completed. Report: `/Volumes/2T/funasr-mlx-alignment/results/campplus/comparison.json`.
+- CAM++ real loading exposed numeric nonlinear names instead of reference names and a converter that widened scalar training counters to shape `[1]`. Named BatchNorm/PReLU modules now match the source. Only owned scalar int64 BatchNorm training counters may be ignored, with names reported. The converter retains zero-dimensional integers. CAM++ frontends now share model-owned povey/no-waveform-upscaling defaults, preserving explicit overrides; this resolved a large real-audio mismatch.
+- Whisper tiny: all 16 selected speech clips completed full encoder and prompt-conditioned decoder forward on pinned `openai-whisper==20250625` FP32 CPU and native FP32 MLX/Metal in separate processes. Frontend maximum absolute difference `4.6253204345703125e-05`; encoder `0.0034027099609375` with relative L2 maximum `1.2471155891987754e-05`; decoder logits `0.0002512931823730469` with relative L2 maximum `1.4754031243654753e-05`. All 16 next-token argmaxes agree. This does not measure transcription accuracy or full autoregressive decoding. Report: `/Volumes/2T/funasr-mlx-alignment/results/whisper/comparison.json`.
+- Whisper diagnosis isolated two adapter errors: mel axes and bypassing the causal `model.logits()` entry point. With identical stored reference encoder output, a missing mask produced max absolute error `26.4568`; using the canonical mask reduced it to `2.9564e-05`. The adapter uses public logits, and direct native decoder calls now default to the canonical causal mask. B=1/B=2 actual-source regressions failed before that core fix and pass after it.
+- Comparisons require family-specific stages and matching case keys. Empty VAD diagnostics are distinct from measured agreement; empty segment arrays are legitimate no-speech outputs. Missing/structurally mismatched stages invalidate reports and return a nonzero exit. Shared prompt IDs are marked `shared_input`, never numerical agreement. Reports include schema `funasr-mlx-measurements/2`, comparator SHA256 and an integrity verdict, not an acceptance tolerance.
+- Final guarded repository suite: **457 passed**, zero failures/skips; sampled child peak RSS `384,581,632` bytes, project peak `735,035,392`, lowest available `3,902,930,944`, no violation. JUnit `.tmp/official-alignment-complete.xml`; memory `.tmp/official-alignment-complete-memory.json`. These tests use synthetic models, not full-corpus acceptance.
+- Independent read-only reviews: `review-alignment-pending-changes.md` and `review-alignment-fix-pass.md` in the team reports directory. No backend imports/numerics were performed by the reviewer. High findings and follow-up integrity/provenance findings were addressed and regression-tested; numerical evidence is from lead executions only.
+- The evaluation venv is `/Volumes/2T/funasr-mlx-alignment/env`; it explicitly reuses existing base framework packages. An initial supervision invocation installed small optional dependencies into the base venv unintentionally; subsequent jobs launch the supervisor from the evaluation venv. Torch and MLX were not upgraded.
 
 ## Boundaries
 
@@ -8,11 +26,13 @@ All seven native MLX prototypes are integrated into main. This is unfinished: no
 - Hard project ceiling: 10,000,000,000 bytes; stop threshold 8 GB; default job budget 2 GB; host reserve 3 GB.
 - Maximum two implementation agents; workers are static-only, and the lead serializes numerical verification under the canonical git-common-dir lock.
 - MLX memory limits are guidelines. Bounded input/shards, admission and external RSS monitoring are required.
-- No full model weights downloaded or loaded; all model numerical work uses tiny dimensions.
+- Full-model allocation needs its own memory admission. Asset I/O budgets never authorize full-model inference. The 3 GB host reserve and project ceilings remain unchanged.
+- Small-model launcher `tools/run_small_alignment.py` uses 1.6 GB model jobs; native Whisper tiny has a separately calibrated 1.2 GB model job / 800 MB MLX guideline (151 MB full weights; measured native peak about 227 MB). The original 1.6 GB tiny-native reservation was denied at 4.44 GB available, before allocation. The calibrated public native command then completed all 16 cases and comparison, with sampled peak `214,614,016` bytes, lowest available `3,595,665,408`, no violation. This is fixed full-model inference admission, not an asset-I/O budget.
+- Resume one backend explicitly, without waiting/polling: `tools/run_small_alignment.py --root /Volumes/2T/funasr-mlx-alignment --families whisper --mode native`. Run it with the evaluation Python and `PYTHONPATH` containing the native `src` and reference repository. The default runs all three small families serially. Reference-only mode does not compare against a potentially stale native capture.
 
-## Latest Verified Main
+## Prototype Baseline Before Official Alignment
 
-Fresh guarded complete suite: **350 passed**, zero failures and skips, in 1.43 seconds. Report: .tmp/final-main-memory.json; JUnit: .tmp/final-main.xml.
+Previously verified guarded complete suite: **350 passed**, zero failures and skips, in 1.43 seconds. Report: .tmp/final-main-memory.json; JUnit: .tmp/final-main.xml.
 
 Sampled child peak RSS: 318,111,744 bytes. Sampled project peak RSS: 1,115,897,856 bytes. Lowest available host memory: 6,449,119,232 bytes. No memory-policy violation. These measurements apply to synthetic tests, not real models.
 
@@ -25,9 +45,9 @@ Core infrastructure has 64 focused tests. Numerical frontend evidence includes s
 | SenseVoiceSmall | Architecture, strict loader, source SANM attention and synthetic audio CLI |
 | Paraformer | Exact-source attention/CIF, strict loader and synthetic CLI; CPU CIF default |
 | ct-punc | All tiny regressions, actual PyTorch convolution taps and local text CLI |
-| fsmn-vad | All tiny regressions, exact source/cache and local audio CLI |
-| CAM++ | Architecture/layout regressions, all-parameter native loading and embedding CLI |
-| Whisper | Canonical OpenAI v20250625 full forward and weight transfer for B=1/B=2; raw greedy IDs only |
+| fsmn-vad | Complete official FP32 weights, 16 real clips; exact endpoints, measured frontend and offline encoder posteriors; frame diagnostics not captured |
+| CAM++ | Complete official FP32 weights, 16 real clips; measured frontends and 192-dimensional embeddings; no speaker EER acceptance |
+| Whisper | Complete official tiny weights, 16 real clips; full encoder and prompt-conditioned decoder parity, 16 next tokens exact; no transcription acceptance |
 | emotion2vec+large | Official fairseq CNN and positional construction goldens, strict namespace and synthetic head CLI |
 
 CPU CIF encloses the entire private mathematical subtree in one MLX CPU stream and evaluates its result before returning. Alpha accumulation uses float64 then narrows to float32 exactly as the reference. The installed Metal path remains unverified after reproducible corruption; no warmup workaround or GPU correctness claim is accepted.
@@ -46,4 +66,6 @@ Differential tests: tests/test_reference_parity.py, tests/test_model_reference.p
 
 ## Remaining Acceptance
 
-Official checkpoint conversion/loading for every model, canonical tokenizer and label assets, full-model real-audio accuracy, streaming workflow acceptance, quantization quality, then measured steady-state latency, real-time factor and memory. CAM++ full-source model parity and emotion full-encoder parity remain broader checks than the validated components. Small tests do not establish production support, fastest inference or lowest memory.
+Seven-model acceptance remains incomplete. Remaining families: SenseVoiceSmall, Paraformer, ct-punc and emotion2vec+large. Full-weight numerical inference has not been executed for those four. Paraformer needs bounded legacy-serialization handling; ct-punc needs a bounded solution for its 972 MB embedding without reducing vocabulary; emotion needs safe inference-state extraction from its larger training payload and explicit namespace disposition. Larger models require fresh admission under the unchanged project limits. Repeated model construction per utility entry and original-versus-derived conversion config provenance/resumption remain recorded tooling limitations.
+
+Next acceptance stages are complete canonical checkpoints/tokenizers/labels for every model, full-model and multi-batch accuracy, streaming workflow tests, full-corpus WER/CER or task metrics, quantization quality, then steady-state latency, real-time factor and memory. VAD offline posterior parity does not prove streaming-cache equivalence; Whisper next-token agreement is not a transcript result; small numerical errors do not establish classifier accuracy. No quantization, speedup, fastest-inference or lowest-memory acceptance is claimed.

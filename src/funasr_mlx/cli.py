@@ -111,6 +111,11 @@ def _infer(args):
     cmvn = options.pop("cmvn_file", None)
     options.setdefault("lfr_m", m)
     options.setdefault("lfr_n", n)
+    if args.model == "campplus":
+        from .models.campplus import CAMPPLUS_FRONTEND_DEFAULTS
+
+        for key, value in CAMPPLUS_FRONTEND_DEFAULTS.items():
+            options.setdefault(key, value)
     if cmvn and not Path(cmvn).is_absolute():
         base = args.checkpoint if args.checkpoint.is_dir() else args.checkpoint.parent
         cmvn = base / cmvn

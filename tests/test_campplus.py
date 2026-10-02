@@ -86,6 +86,15 @@ def test_flatten_state_dict_reads_the_mapping_storage_not_dunder_dict():
     assert "xvector.dense.linear.weight" in state
 
 
+def test_strict_loader_rejects_unowned_and_malformed_training_counters():
+    model = _campplus()
+    state = dict(flatten_state_dict(model))
+    with pytest.raises(CheckpointKeyError, match="unexpected"):
+        load_strict(model, {**state, "unrelated.num_batches_tracked": mx.array(0, dtype=mx.int64)})
+    with pytest.raises(ValueError, match="training counter"):
+        load_strict(model, {**state, "head.bn1.num_batches_tracked": mx.array([1], dtype=mx.int64)})
+
+
 def test_no_one_dimensional_tensor_carries_a_conv_layout_rule():
     """Invariant: only kernels may carry a conv rule.
 
@@ -125,11 +134,11 @@ def test_state_dict_keys_carry_the_xvector_prefix():
     assert "xvector.block1.tdnnd1.linear1.weight" in keys
     assert "xvector.block1.tdnnd2.cam_layer.linear_local.weight" in keys
     assert "xvector.transit1.linear.weight" in keys
-    assert "xvector.out_nonlinear.0.weight" in keys  # BN weight, affine
+    assert "xvector.out_nonlinear.batchnorm.weight" in keys  # BN weight, affine
     assert "xvector.dense.linear.weight" in keys
     # batchnorm_ is non-affine, so it contributes only the running buffers.
-    assert "xvector.dense.nonlinear.0.weight" not in keys
-    assert "xvector.dense.nonlinear.0.running_mean" in keys
+    assert "xvector.dense.nonlinear.batchnorm.weight" not in keys
+    assert "xvector.dense.nonlinear.batchnorm.running_mean" in keys
     assert not any(key.startswith("_") for key in keys)
 
 
@@ -159,7 +168,7 @@ def test_convert_checkpoint_tensor_requires_an_explicit_rule():
     assert rules["head.conv1.weight"] == CONV2D_LAYOUT
     assert rules["xvector.tdnn.linear.weight"] == CONV1D_LAYOUT
     assert rules["xvector.dense.linear.weight"] == CONV1D_LAYOUT
-    assert rules["xvector.out_nonlinear.0.weight"] == IDENTITY_LAYOUT
+    assert rules["xvector.out_nonlinear.batchnorm.weight"] == IDENTITY_LAYOUT
 
 
 def test_load_strict_round_trips_and_reports_torch_only_buffers():
@@ -176,7 +185,7 @@ def test_load_strict_round_trips_and_reports_torch_only_buffers():
     # A raw torch state_dict carries BatchNorm's num_batches_tracked, which MLX
     # does not model; it must be reported rather than silently swallowed.
     torch_state = {k: v for k, v in state.items()}
-    torch_state["head.bn1.num_batches_tracked"] = mx.array(0.0)
+    torch_state["head.bn1.num_batches_tracked"] = mx.array(0, dtype=mx.int64)
     report = load_strict(_campplus(), torch_state)
     assert isinstance(report, LoadReport)
     assert report.dropped == ["head.bn1.num_batches_tracked"]

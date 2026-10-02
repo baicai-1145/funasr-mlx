@@ -144,9 +144,7 @@ def test_vad_options_validation():
     with pytest.raises(ValueError, match="sil_pdf_ids"):
         VadOptions(**{**TINY_OPTS, "silence_pdf_num": 2, "sil_pdf_ids": [0]})
     with pytest.raises(ValueError, match="max_end_silence_time"):
-        VadOptions(
-            **{**TINY_OPTS, "max_end_silence_time": 100, "speech_to_sil_time_thres": 150}
-        )
+        VadOptions(**{**TINY_OPTS, "max_end_silence_time": 100, "speech_to_sil_time_thres": 150})
     with pytest.raises(ValueError, match="frame_length_ms"):
         VadOptions(**{**TINY_OPTS, "frame_in_ms": 30, "frame_length_ms": 25})
 
@@ -203,16 +201,10 @@ def test_flat_parameter_names_sees_every_tensor():
     assert "encoder.in_linear1.linear.weight" in params
 
 
-def test_linear_transform_is_the_nn_linear_itself():
-    """``BasicBlock.linear`` is a ``LinearTransform`` whose own parameter is ``weight``.
-
-    The reference ``LinearTransform`` holds ``self.linear = nn.Linear(..., bias=False)``
-    and ``BasicBlock`` registers it under ``linear``, so the checkpoint path is
-    ``fsmn.<i>.linear.weight`` -- not ``fsmn.<i>.linear.linear.weight``.
-    """
+def test_linear_transform_preserves_reference_nested_linear():
     params = flat_parameter_names(LinearTransform(6, 4))
-    assert set(params) == {"weight"}
-    assert params["weight"].shape == (4, 6)
+    assert set(params) == {"linear.weight"}
+    assert params["linear.weight"].shape == (4, 6)
 
 
 def test_fsmn_block_only_owns_its_depthwise_conv():
@@ -226,11 +218,11 @@ def test_parameter_names_match_funasr_checkpoint_layout():
         "encoder.in_linear1.linear.weight",
         "encoder.in_linear1.linear.bias",
         "encoder.in_linear2.linear.weight",
-        "encoder.fsmn.0.linear.weight",
+        "encoder.fsmn.0.linear.linear.weight",
         "encoder.fsmn.0.fsmn_block.conv_left.weight",
         "encoder.fsmn.0.affine.linear.weight",
         "encoder.fsmn.0.affine.linear.bias",
-        "encoder.fsmn.1.linear.weight",
+        "encoder.fsmn.1.linear.linear.weight",
         "encoder.fsmn.1.fsmn_block.conv_left.weight",
         "encoder.out_linear1.linear.weight",
         "encoder.out_linear2.linear.bias",
@@ -238,7 +230,7 @@ def test_parameter_names_match_funasr_checkpoint_layout():
     assert expected_subset <= names
     assert not any(".layers." in name for name in names)
     # LinearTransform has no bias; the depthwise conv has no bias either.
-    assert "encoder.fsmn.0.linear.bias" not in names
+    assert "encoder.fsmn.0.linear.linear.bias" not in names
     assert "encoder.fsmn.0.fsmn_block.conv_left.bias" not in names
     # rorder=0 means FunASR does not create conv_right at all.
     assert "encoder.fsmn.0.fsmn_block.conv_right.weight" not in names
@@ -247,7 +239,7 @@ def test_parameter_names_match_funasr_checkpoint_layout():
 def test_parameter_shapes_match_pytorch_convention():
     params = flat_parameter_names(make_model())
     assert params["encoder.in_linear1.linear.weight"].shape == (4, 6)
-    assert params["encoder.fsmn.0.linear.weight"].shape == (4, 6)
+    assert params["encoder.fsmn.0.linear.linear.weight"].shape == (4, 6)
     assert params["encoder.fsmn.0.fsmn_block.conv_left.weight"].shape == (4, 5, 1)
     assert params["encoder.out_linear2.linear.weight"].shape == (3, 4)
     assert params["encoder.out_linear2.linear.bias"].shape == (3,)

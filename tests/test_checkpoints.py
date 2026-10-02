@@ -31,6 +31,19 @@ def test_layout_rules(model, name, shape, expected):
     assert convert_tensor(name, np.zeros(shape), model).shape == expected
 
 
+def test_conversion_preserves_scalar_training_counter_shape(tmp_path):
+    import torch
+    from funasr_mlx.checkpoints import convert_checkpoint, safetensor_header
+
+    source = tmp_path / "source.pt"
+    torch.save({"head.bn1.num_batches_tracked": torch.tensor(7, dtype=torch.int64)}, source)
+    destination = tmp_path / "native"
+    convert_checkpoint(source, destination, model="campplus", dtype="float32")
+    header = safetensor_header(next(destination.glob("*.safetensors")))
+    assert header["head.bn1.num_batches_tracked"]["shape"] == []
+    assert header["head.bn1.num_batches_tracked"]["dtype"] == "I64"
+
+
 def test_invalid_fsmn_layout_is_rejected():
     with pytest.raises(ValueError, match="D,1,K,1"):
         convert_tensor("x.conv_left.weight", np.zeros((4, 2, 3, 1)), "fsmn-vad")

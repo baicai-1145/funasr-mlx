@@ -8,6 +8,33 @@ import pytest
 from test_reference_parity import reference_definitions
 
 
+def test_vad_linear_parameter_names_match_actual_source():
+    import torch
+    from funasr_mlx.models.fsmn_vad import LinearTransform, flat_parameter_names
+
+    path = (
+        Path(__file__).resolve().parents[2] / "funasr/funasr/models/fsmn_vad_streaming/encoder.py"
+    )
+    source = reference_definitions(path, {"LinearTransform"}, {"torch": torch, "nn": torch.nn})
+    expected = source["LinearTransform"](6, 4).state_dict()
+    actual = flat_parameter_names(LinearTransform(6, 4))
+    assert set(actual) == set(expected)
+
+
+@pytest.mark.parametrize("configuration", ["batchnorm-relu", "batchnorm_", "prelu"])
+def test_campplus_nonlinear_parameter_names_match_actual_source(configuration):
+    from funasr_mlx.models.campplus import flatten_state_dict, get_nonlinear
+
+    source = reference_definitions("funasr/models/campplus/components.py", {"get_nonlinear"})
+    expected = source["get_nonlinear"](configuration, 4).state_dict()
+    expected = {k: v for k, v in expected.items() if not k.endswith("num_batches_tracked")}
+    actual = flatten_state_dict(get_nonlinear(configuration, 4))
+    assert set(actual) == set(expected)
+    assert {k: tuple(v.shape) for k, v in actual.items()} == {
+        k: tuple(v.shape) for k, v in expected.items()
+    }
+
+
 @pytest.mark.parametrize("tap", [0, 1, 2])
 def test_punctuation_memory_matches_actual_torch_convolution(tap):
     import mlx.core as mx
@@ -135,3 +162,6 @@ def test_whisper_full_forward_matches_canonical_openai_source(batch):
         np.asarray(actual_audio), expected_audio.numpy(), rtol=1e-4, atol=1e-5
     )
     np.testing.assert_allclose(np.asarray(actual), expected.numpy(), rtol=1e-4, atol=1e-5)
+    direct = native.decoder(mx.array(tokens.astype(np.int32)), actual_audio)
+    mx.eval(direct)
+    np.testing.assert_allclose(np.asarray(direct), expected.numpy(), rtol=1e-4, atol=1e-5)

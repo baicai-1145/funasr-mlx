@@ -12,6 +12,7 @@ lead runs in a guarded child.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,8 +31,23 @@ import alignment_utilities as au  # noqa: E402
 # --------------------------------------------------------------------------- #
 def test_module_imports_no_ml_or_torch():
     """Importing the adapter must not drag in a numerical runtime."""
-    for banned in ("mlx", "mlx.core", "torch", "funasr", "funasr.auto"):
-        assert banned not in sys.modules, banned
+    program = (
+        "import sys; "
+        f"sys.path.insert(0, {str(_TOOLS)!r}); "
+        "import alignment_utilities; "
+        "banned = ('mlx', 'mlx.core', 'torch', 'funasr', 'funasr.auto'); "
+        "assert not set(banned).intersection(sys.modules), set(banned).intersection(sys.modules)"
+    )
+    subprocess.run([sys.executable, "-I", "-c", program], check=True, timeout=10)
+
+
+@pytest.mark.parametrize("family", ["fsmn-vad", "ct-punc", "campplus", "emotion2vec"])
+def test_reference_rejects_execution_without_guard_before_backend_import(family, monkeypatch):
+    from funasr_mlx import memory
+
+    monkeypatch.setattr(memory, "guarded_child_active", lambda: False)
+    with pytest.raises(RuntimeError, match="guarded launcher"):
+        au._DISPATCH[(family, "reference")]({}, {}, Path("unused"))
 
 
 def test_every_family_has_both_sides():

@@ -147,6 +147,37 @@ def test_factory_loads_every_real_native_parameter(family, tmp_path):
     assert configuration == CONFIGS[family]
 
 
+def test_campplus_accepts_only_owned_batchnorm_training_counters(tmp_path):
+    from safetensors.numpy import save_file
+
+    directory, arrays = tiny_checkpoint(tmp_path, "campplus")
+    counters = {name.removesuffix("running_mean") + "num_batches_tracked": np.array(7, np.int64)
+                for name in arrays if name.endswith("running_mean")}
+    arrays.update(counters)
+    save_file(arrays, str(directory / "weights.safetensors"),
+              metadata={"format": "funasr-mlx", "model": "campplus"})
+    with pytest.warns(UserWarning, match="BatchNorm training counters"):
+        loaded, _ = load_model(directory, family="campplus")
+    assert loaded._checkpoint_ignored_buffers == tuple(sorted(counters))
+
+    arrays["unrelated.num_batches_tracked"] = np.array(0, np.int64)
+    save_file(arrays, str(directory / "weights.safetensors"),
+              metadata={"format": "funasr-mlx", "model": "campplus"})
+    with pytest.raises(KeyError, match="unexpected"):
+        load_model(directory, family="campplus")
+
+
+def test_campplus_rejects_malformed_training_counter(tmp_path):
+    from safetensors.numpy import save_file
+
+    directory, arrays = tiny_checkpoint(tmp_path, "campplus")
+    arrays["head.bn1.num_batches_tracked"] = np.array([1, 2], np.int64)
+    save_file(arrays, str(directory / "weights.safetensors"),
+              metadata={"format": "funasr-mlx", "model": "campplus"})
+    with pytest.raises(ValueError, match="training counter"):
+        load_model(directory, family="campplus")
+
+
 @pytest.mark.parametrize("family", list(CONFIGS))
 def test_cli_runs_every_model_with_local_weights(family, tmp_path, capsys):
     import soundfile as sf
@@ -179,6 +210,31 @@ def test_cli_runs_every_model_with_local_weights(family, tmp_path, capsys):
         if family == "emotion2vec":
             assert result["labels"] == ["angry", "neutral"]
             np.testing.assert_allclose(sum(result["scores"]), 1.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_campplus_cli_uses_official_fbank_defaults(tmp_path, monkeypatch, capsys, explicit):
+    import soundfile as sf
+    from funasr_mlx import frontend
+
+    configuration = copy.deepcopy(CONFIGS["campplus"])
+    if explicit:
+        configuration["frontend_conf"].update(window="hamming", upsacle_samples=True)
+    directory, _ = tiny_checkpoint(tmp_path, "campplus", configuration)
+    observed = []
+    original = frontend.WavFrontend
+
+    def capture(config, **kwargs):
+        observed.append(config)
+        return original(config, **kwargs)
+
+    monkeypatch.setattr(frontend, "WavFrontend", capture)
+    audio = tmp_path / "audio.wav"
+    sf.write(audio, np.zeros(1600), 16000)
+    assert main(["infer", str(directory), "--model", "campplus", "--audio", str(audio)]) == 0
+    capsys.readouterr()
+    assert observed[0].window == ("hamming" if explicit else "povey")
+    assert observed[0].upsacle_samples is explicit
 
 
 def test_vad_cli_preserves_frame_cadence_with_default_lfr_window(tmp_path, capsys):

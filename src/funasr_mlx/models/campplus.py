@@ -72,6 +72,7 @@ __all__ = [
 
 #: Buffer names that exist in a PyTorch BatchNorm but have no MLX counterpart.
 TORCH_ONLY_BUFFERS = ("num_batches_tracked",)
+CAMPPLUS_FRONTEND_DEFAULTS = {"window": "povey", "upsacle_samples": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -402,11 +403,18 @@ def load_strict(
 
     dropped: list[str] = []
     if allow_torch_only_buffers:
-        for key in list(incoming):
-            short = key.rsplit(".", 1)[-1]
-            if short in TORCH_ONLY_BUFFERS and key not in expected:
-                dropped.append(key)
-                del incoming[key]
+        allowed = {
+            f"{prefix}{path}.{buffer}" if path else f"{prefix}{buffer}"
+            for path, child in module.named_modules()
+            if isinstance(child, BatchNorm)
+            for buffer in TORCH_ONLY_BUFFERS
+        }
+        for key in sorted(allowed.intersection(incoming)):
+            counter = mx.asarray(incoming[key])
+            if counter.shape != () or counter.dtype != mx.int64:
+                raise ValueError(f"Invalid BatchNorm training counter: {key}")
+            dropped.append(key)
+            del incoming[key]
 
     missing = sorted(set(expected) - set(incoming))
     unexpected = sorted(set(incoming) - set(expected))
@@ -556,27 +564,26 @@ class BatchNorm2d(BatchNorm):
     """``torch.nn.BatchNorm2d`` (channels-last input ``(B, H, W, C)``)."""
 
 
-def get_nonlinear(config_str: str, channels: int) -> ModuleStack:
-    """Port of ``components.get_nonlinear``.
-
-    ``"batchnorm-relu"`` -> ``[BatchNorm1d(C), ReLU]``; ``"batchnorm_"`` uses
-    ``affine=False`` and therefore contributes no parameters; ``"prelu"`` maps to
-    ``mxnn.PReLU`` (a single learnable slope, matching ``nn.PReLU``'s default
-    ``num_parameters=1``).
-    """
-    blocks: list[mxnn.Module] = []
+def get_nonlinear(config_str: str, channels: int) -> NamedModuleDict:
+    """Retain the reference Sequential's named children and per-channel PReLU."""
+    blocks = NamedModuleDict()
     for name in config_str.split("-"):
         if name == "relu":
-            blocks.append(mxnn.ReLU())
+            child = mxnn.ReLU()
         elif name == "prelu":
-            blocks.append(mxnn.PReLU())
+            child = mxnn.PReLU(channels)
         elif name == "batchnorm":
-            blocks.append(BatchNorm1d(channels))
+            child = BatchNorm1d(channels)
         elif name == "batchnorm_":
-            blocks.append(BatchNorm1d(channels, affine=False))
+            child = BatchNorm1d(channels, affine=False)
         else:
             raise ValueError(f"Unexpected module ({name}).")
-    return ModuleStack(blocks)
+        key = "batchnorm" if name == "batchnorm_" else name
+        if key in blocks.names():
+            setattr(blocks, key, child)
+        else:
+            blocks.add(key, child)
+    return blocks
 
 
 # --------------------------------------------------------------------------- #

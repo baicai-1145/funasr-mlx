@@ -237,7 +237,7 @@ def convert_checkpoint(
         size = array.size * np.dtype(output_dtype).itemsize
         if buffered and buffered + size > shard_bytes:
             flush()
-        array = np.ascontiguousarray(array, dtype=output_dtype)
+        array = np.asarray(array, dtype=output_dtype, order="C")
         pending[name] = array
         buffered += array.nbytes
         if buffered >= shard_bytes:
