@@ -13,12 +13,21 @@ from .memory import MB, MemoryBudgetExceeded, MemoryPolicy, guarded_child_active
 
 
 def read_config(path: str | Path) -> dict:
+    import json
+
     import yaml
 
     path = Path(path)
     if path.stat().st_size > 1_000_000:
         raise ValueError("Model configuration exceeds the metadata bound")
-    config = yaml.safe_load(path.read_text())
+    text = path.read_text()
+    # YAML 1.1 reads bare exponent forms like 1e-05 as strings, silently
+    # corrupting numeric config fields. JSON is the artifact format, so parse
+    # it as JSON first and only fall back to YAML for hand-written configs.
+    try:
+        config = json.loads(text)
+    except ValueError:
+        config = yaml.safe_load(text)
     if not isinstance(config, dict):
         raise ValueError("Model configuration must be a mapping")
     return config
@@ -147,6 +156,9 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     mx.clear_cache()
     if ignored:
         model._checkpoint_ignored_buffers = tuple(sorted(ignored))
-        warnings.warn(f"Ignored {len(ignored)} CAM++ BatchNorm training counters; "
-                      "names recorded in model._checkpoint_ignored_buffers", stacklevel=2)
+        warnings.warn(
+            f"Ignored {len(ignored)} CAM++ BatchNorm training counters; "
+            "names recorded in model._checkpoint_ignored_buffers",
+            stacklevel=2,
+        )
     return model, config_dict

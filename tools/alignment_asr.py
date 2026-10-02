@@ -1759,12 +1759,22 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
             f"native key inventory mismatch: missing={inventory['missing']} "
             f"unexpected={inventory['unexpected']} shapes={len(inventory['shape_mismatch'])}"
         )
-    inexact = sorted(name for name, array in parameters.items() if array.dtype != mx.float32)
+    # The reference is always FP32. The native artifact may be FP32 (port
+    # validation) or FP16 (precision-drift measurement); the index metadata
+    # declares which, and mixing them up silently is what this gate prevents.
+    index = json.loads((Path(native_checkpoint) / "model.safetensors.index.json").read_text())
+    artifact_dtype = index.get("metadata", {}).get("dtype")
+    if artifact_dtype not in {"float32", "float16"}:
+        raise AlignmentError(f"converted artifact declares unsupported dtype {artifact_dtype!r}")
+    inexact = sorted(
+        name
+        for name, array in parameters.items()
+        if str(array.dtype).replace("mlx.core.", "") != artifact_dtype
+    )
     if inexact:
         raise AlignmentError(
-            f"{len(inexact)} native parameters are not float32 (for example {inexact[:5]}); "
-            "reconvert with dtype='float32' rather than comparing a float16 run against a "
-            "float32 reference and reading the difference as a port defect"
+            f"{len(inexact)} native parameters are not {artifact_dtype} (for example {inexact[:5]}); "
+            "the loaded arrays must match the artifact's declared dtype exactly"
         )
     mx.eval(parameters)
 

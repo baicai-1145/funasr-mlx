@@ -19,6 +19,7 @@ def main():
         "--family", choices=("sensevoice", "paraformer", "ct-punc", "emotion2vec"), required=True
     )
     parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--dtype", choices=("float32", "float16"), default="float32")
     args = parser.parse_args()
     model_dir = args.root / "models" / args.family
     raw = yaml.safe_load((model_dir / "config.yaml").read_text())
@@ -60,7 +61,7 @@ def main():
         model_dir / "model.pt",
         args.destination,
         model=args.family,
-        dtype="float32",
+        dtype=args.dtype,
         shard_bytes=32_000_000,
         allow_legacy=args.family == "paraformer",
         stream_large_tensors=True,
