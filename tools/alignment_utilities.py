@@ -49,30 +49,48 @@ Assets
 ------
 A JSON object of filesystem paths supplied by the lead.  Nothing is downloaded
 and no model is fetched implicitly: every path must already exist on disk, and a
-missing one is a hard error.
+missing one is a hard error.  The names below are the ones the published
+FunASR repositories actually use, so they are not guesses:
+
+============================  ===========================================
+field                         published artefact
+============================  ===========================================
+``model_dir``                 FunASR model dir: ``config.yaml`` (+ weights)
+``weights``                   campplus only: ``campplus_cn_common.bin``
+``checkpoint``                **converted native** safetensors (native side)
+``config``                    the family's ``config.yaml`` (always needed)
+``labels``                    emotion2vec ``tokens.txt`` (8 lines)
+``tokens``                    ct-punc ``tokens.json`` (a **JSON list**)
+``frontend_conf``             optional per-family frontend overrides
+``speaker_a`` / ``speaker_b`` two utterances for a campplus cosine pair
+============================  ===========================================
 
 ``model_dir``
-    The **original** FunASR model directory (``config.yaml`` plus the ``.pt``
-    weights), used only by ``--mode reference``.  ``AutoModel`` expects the
-    standard directory layout; synthesising one by copying weights would be
-    worse than asking for it.
+    The **original** FunASR model directory, used only by ``--mode reference``.
+    ``AutoModel`` expects the standard directory layout; synthesising one by
+    copying weights would be worse than asking for it.
+``weights``
+    campplus only.  The published checkpoint is ``campplus_cn_common.bin``,
+    which ``AutoModel`` does not look for, so that family is built directly from
+    ``model_conf`` and this file is read with ``weights_only=True``.
 ``checkpoint``
     The **converted native** checkpoint (safetensors) consumed by
     ``funasr_mlx.pipeline.load_model``, used only by ``--mode native``.  This is
     a different artefact from ``model_dir``, not an alias for it.
 ``config``
-    Optional per-family native config path for ``load_model``; when absent the
-    checkpoint's own config is used.
+    The family's ``config.yaml``.  Always read: the emotion2vec native dataclass
+    cannot accept the official fairseq schema, so the mapping is explicit.
 ``labels``
-    Label list, one per line, read verbatim and in order (emotion2vec).
+    emotion2vec ``tokens.txt``, read verbatim and in order -- the list is
+    positional against the classifier's output rows.
 ``tokens``
-    ct-punc character vocabulary, only needed by the native side.
-``speaker_a`` / ``speaker_b``
-    Two utterances for a campplus cosine pair.
+    ct-punc ``tokens.json``.  It is a **JSON list** of 471067 entries, not a
+    newline-separated file; reading it line by line would silently produce a
+    garbage vocabulary.
 ``frontend_conf``
-    Optional per-family frontend overrides.  FSMN-VAD needs the LFR stack
-    factors; they default to the official ``(lfr_m=5, lfr_n=1)`` over an 80-bin
-    mel, derived from ``input_dim`` where the config exposes it.
+    FSMN-VAD's official ``frontend_conf`` already carries ``lfr_m: 5`` and
+    ``lfr_n: 1`` alongside ``n_mels: 80`` and ``dither: 0.0``; those are used
+    as given and only defaulted from ``input_dim`` when absent.
 """
 from __future__ import annotations
 
@@ -212,6 +230,9 @@ def run_fsmn_vad_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
 
     cache: dict[str, Any] = {}
     module.init_cache(cache)
+    # The official fsmn-vad config.yaml ships ``output_frame_probs: False``; the
+    # frame stage is required for this comparison, so it is overridden here
+    # explicitly rather than left to the config.
     result = module.forward(
         feats, waveform, cache=cache, is_final=True, is_streaming_input=False,
         output_frame_probs=True,
@@ -453,7 +474,7 @@ def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
     _reject_overlong(entry, float(len(text)), "limit_chars",
                      float(entry.get("limit_chars", 0.0)), "chars")
 
-    token_ids = list(CharVocab.from_file(_require(assets, "tokens")).encode(
+    token_ids = list(CharVocab(_load_ct_punc_tokens(_require(assets, "tokens"))).encode(
         list(split_words(text))
     ))
     logits = model.punc_forward(mx.array([token_ids], dtype=mx.int32))
@@ -480,13 +501,18 @@ def run_campplus_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
     ``extract_feature`` applies ``num_mel_bins=80`` fbank and then **subtracts the
     per-utterance mean**.  That subtraction is part of the reference frontend, so
     it is reproduced on the native side too rather than delegated.
+
+    The published campplus checkpoint is ``campplus_cn_common.bin``, not
+    ``model.pt``, so ``AutoModel`` -- which looks for the conventional name --
+    cannot load it.  When a ``weights`` asset is given the module is built
+    directly from ``model_conf`` and that file is loaded with ``weights_only``.
     """
     import numpy as np
     import torch
     from funasr.models.campplus.utils import extract_feature
 
-    auto = _load_reference(assets)
-    module = auto.model
+    raw = _load_yaml(_require(assets, "config"))
+    module, backend = _build_campplus(assets, raw)
     utterance = str(assets.get("speaker_a") or entry["audio"])
     samples = _reference_waveform(utterance)
     _check_audio(entry, samples)
@@ -513,6 +539,7 @@ def run_campplus_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
     _write_npz(out_dir, entry["key"], "reference", arrays)
     _write_json(out_dir, entry["key"], "reference", {
         "family": "campplus",
+        "backend": backend,
         "utterance": utterance,
         "output_level": getattr(module, "output_level", None),
         "feature_frames": int(speech.shape[1]),
@@ -520,6 +547,22 @@ def run_campplus_reference(entry: Mapping[str, Any], assets: Mapping[str, Any],
                          "cosine helper, so this is plain arithmetic on the two "
                          "official embeddings rather than a reimplementation",
     })
+
+
+def _build_campplus(assets: Mapping[str, Any], raw: Mapping[str, Any]) -> tuple[Any, str]:
+    """The official ``CAMPPlus``, loaded from an explicitly named weights file."""
+    from funasr.models.campplus.model import CAMPPlus
+
+    weights = assets.get("weights")
+    if not weights:
+        raise ValueError(
+            "campplus reference needs a 'weights' asset: the published checkpoint is "
+            "campplus_cn_common.bin, which AutoModel does not look for"
+        )
+    module = CAMPPlus(**raw["model_conf"])
+    state = _load_state_dict(_require(assets, "weights"))
+    module.load_state_dict(state, strict=True)
+    return module, f"CAMPPlus(**model_conf) + weights_only load of {Path(str(weights)).name}"
 
 
 def _cosine(first: Any, second: Any) -> float:
@@ -653,20 +696,253 @@ def _read_labels(path: str) -> list[str]:
     return [line.rstrip("\n") for line in Path(path).read_text().splitlines() if line]
 
 
+# --------------------------------------------------------------------------- #
+# official YAML -> native config mapping
+# --------------------------------------------------------------------------- #
+#: ``official yaml path`` -> ``native Emotion2VecConfig field``.  Written out in
+#: full rather than splatted with ``**`` because the two schemas share almost no
+#: names: the official file is a fairseq/dat2v2 config nested under
+#: ``model_conf``/``modalities.*`` and carries dozens of training-only keys the
+#: native dataclass would reject outright.
+_EMOTION_FIELD_MAP: Mapping[str, str] = {
+    "model_conf.embed_dim": "embed_dim",
+    "model_conf.depth": "depth",
+    "model_conf.num_heads": "num_heads",
+    "model_conf.mlp_ratio": "mlp_ratio",
+    "model_conf.norm_eps": "norm_eps",
+    "model_conf.norm_affine": "norm_affine",
+    "model_conf.layer_norm_first": "layer_norm_first",
+    "model_conf.end_of_block_targets": "end_of_block_targets",
+    "model_conf.normalize": "normalize",
+    "model_conf.modalities.audio.extractor_mode": "extractor_mode",
+    "model_conf.modalities.audio.feature_encoder_spec": "feature_encoder_spec",
+    "model_conf.modalities.audio.conv_pos_depth": "conv_pos_depth",
+    "model_conf.modalities.audio.conv_pos_width": "conv_pos_width",
+    "model_conf.modalities.audio.conv_pos_groups": "conv_pos_groups",
+    "model_conf.modalities.audio.conv_pos_pre_ln": "conv_pos_pre_ln",
+    "model_conf.modalities.audio.prenet_depth": "prenet_depth",
+    "model_conf.modalities.audio.num_extra_tokens": "num_extra_tokens",
+    "model_conf.modalities.audio.init_extra_token_zero": "init_extra_token_zero",
+    "model_conf.modalities.audio.use_alibi_encoder": "use_alibi_encoder",
+    "model_conf.modalities.audio.num_alibi_heads": "num_alibi_heads",
+    # the only name that differs while meaning the same thing
+    "model_conf.modalities.audio.alibi_scale": "alibi_scale_init",
+    "model_conf.modalities.audio.alibi_max_pos": "alibi_max_pos",
+    "model_conf.modalities.audio.learned_alibi": "learned_alibi",
+    "model_conf.modalities.audio.learned_alibi_scale": "learned_alibi_scale",
+    "model_conf.modalities.audio.learned_alibi_scale_per_head": "learned_alibi_scale_per_head",
+    "model_conf.modalities.audio.learned_alibi_scale_per_layer": "learned_alibi_scale_per_layer",
+}
+
+#: Top-level yaml sections that are legitimately not architecture.
+_EMOTION_SECTIONS = {"model", "tokenizer", "tokenizer_conf", "scope_map", "model_conf"}
+
+#: Keys the official config leaves to the native default.  Reported, not silent.
+_EMOTION_DEFAULTED = {
+    "model_conf.modalities.audio.conv_bias": False,
+}
+
+
+def _dig(mapping: Mapping[str, Any], dotted: str) -> Any:
+    node: Any = mapping
+    for part in dotted.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            raise KeyError(dotted)
+        node = node[part]
+    return node
+
+
+def emotion_native_config(raw: Mapping[str, Any], labels: Sequence[str]) -> tuple[
+    dict[str, Any], dict[str, Any]
+]:
+    """Map the official ``Emotion2vec`` yaml onto native config kwargs.
+
+    Returns ``(kwargs, report)``.  Every official key is placed in exactly one
+    of ``mapped``/``defaulted``/``unmapped``/``ignored_sections`` -- **nothing is
+    dropped silently**, because a config key that quietly goes nowhere is how a
+    model ends up comparing against different weights than anyone thinks.
+    """
+    kwargs: dict[str, Any] = {}
+    mapped: list[str] = []
+    for source, target in _EMOTION_FIELD_MAP.items():
+        try:
+            kwargs[target] = _dig(raw, source)
+        except KeyError:
+            continue
+        mapped.append(source)
+
+    defaulted = {source: value for source, value in _EMOTION_DEFAULTED.items()
+                 if _dig_or_none(raw, source) is None}
+    for source, value in defaulted.items():
+        kwargs[_EMOTION_FIELD_MAP.get(source, source.rsplit(".", 1)[-1])] = value
+
+    kwargs["labels"] = tuple(labels)
+    kwargs["vocab_size"] = int(len(labels))
+
+    consumed = {source.split(".")[0] for source in mapped}
+    consumed |= {source.split(".")[1] for source in mapped if source.startswith("model_conf.")}
+    ignored_sections = sorted(set(raw) & _EMOTION_SECTIONS - {"model_conf"})
+
+    unmapped = _emotion_unmapped_keys(raw, mapped, defaulted)
+
+    report = {
+        "mapped": sorted(mapped),
+        "defaulted": sorted(defaulted),
+        "unmapped": unmapped,
+        "ignored_sections": ignored_sections,
+        "scope_map": list(raw.get("scope_map") or []),
+        "n_native_fields_set": len(kwargs),
+    }
+    _emotion_consistency_checks(raw, report)
+    return kwargs, report
+
+
+def _dig_or_none(mapping: Mapping[str, Any], dotted: str) -> Any:
+    try:
+        return _dig(mapping, dotted)
+    except KeyError:
+        return None
+
+
+def _emotion_unmapped_keys(raw: Mapping[str, Any], mapped: Sequence[str],
+                           defaulted: Mapping[str, Any]) -> dict[str, Any]:
+    """Official leaf keys that reach no native field, grouped by why.
+
+    They are not an error -- most are fairseq training knobs -- but an
+    unclassified leftover would be indistinguishable from a bug, so each is
+    bucketed.
+    """
+    covered = set(mapped) | set(defaulted)
+    audio = (raw.get("model_conf") or {}).get("modalities", {}).get("audio") or {}
+    top = raw.get("model_conf") or {}
+
+    ema, objective, optimisation, other_modalities, audio_unmapped = [], [], [], [], []
+    for key, value in top.items():
+        if key == "modalities" or key in {
+            "embed_dim", "depth", "num_heads", "mlp_ratio", "norm_eps", "norm_affine",
+            "layer_norm_first", "end_of_block_targets", "normalize", "_name",
+        }:
+            continue
+        if key.startswith("ema") or key in {"skip_ema", "max_update", "log_norms"}:
+            ema.append(key)
+        elif key.startswith("loss_") or key in {
+            "d2v_loss", "recon_loss", "cls_loss", "cls_type", "shared_decoder",
+            "adversarial_training", "adversarial_hidden_dim", "adversarial_weight",
+            "decoder_group", "min_target_var", "min_pred_var", "mae_init",
+            "layer_norm_target_layer", "batch_norm_target_layer",
+            "instance_norm_target_layer", "instance_norm_targets", "layer_norm_targets",
+        }:
+            objective.append(key)
+        elif "dropout" in key or "drop_path" in key or key == "layerdrop":
+            optimisation.append(key)
+        else:
+            other_modalities.append(key)
+    for modality in sorted((raw.get("model_conf") or {}).get("modalities", {})):
+        if modality not in {"audio", "_name"}:
+            other_modalities.append(f"modalities.{modality}")
+    for key in sorted(audio):
+        if f"model_conf.modalities.audio.{key}" not in covered:
+            audio_unmapped.append(key)
+
+    return {
+        "ema_and_optimizer": sorted(ema),
+        "pretraining_objectives": sorted(objective),
+        "regularisation": sorted(optimisation),
+        "other_modalities_and_top_level": sorted(other_modalities),
+        "audio_modality_not_mapped": audio_unmapped,
+    }
+
+
+def _load_yaml(path: str) -> dict[str, Any]:
+    import yaml
+
+    data = yaml.safe_load(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: expected a yaml mapping, got {type(data).__name__}")
+    return data
+
+
+def _load_state_dict(path: str) -> dict[str, Any]:
+    """Safe torch state-dict read.
+
+    ``weights_only=True`` blocks arbitrary unpickling and ``mmap=True`` keeps a
+    multi-GB checkpoint off the heap.  ``mmap`` is only available on recent
+    torch builds for zip-serialised files, so its absence degrades to a normal
+    load rather than failing the run.
+    """
+    import torch
+
+    try:
+        return dict(torch.load(path, map_location="cpu", weights_only=True, mmap=True))
+    except TypeError:  # older torch without mmap
+        return dict(torch.load(path, map_location="cpu", weights_only=True))
+
+
+def _load_ct_punc_tokens(path: str) -> list[str]:
+    """The ct-punc character vocabulary.
+
+    The published ``tokens.json`` is a **JSON list** (471067 entries), not a
+    newline-separated text file.  Reading it line by line would silently produce
+    a garbage vocabulary with commas and quotes as tokens, so the format is
+    detected rather than assumed.
+    """
+    import json
+
+    text = Path(path).read_text()
+    stripped = text.lstrip()
+    if stripped.startswith("["):
+        data = json.loads(text)
+        if not isinstance(data, list) or not all(isinstance(v, str) for v in data):
+            raise ValueError(f"{path}: expected a JSON list of strings")
+        return data
+    return [line.rstrip("\n") for line in text.splitlines() if line]
+
+
+def _emotion_consistency_checks(raw: Mapping[str, Any], report: dict[str, Any]) -> None:
+    """Cross-check redundant official fields and record any disagreement."""
+    audio = (raw.get("model_conf") or {}).get("modalities", {}).get("audio") or {}
+    checks: dict[str, Any] = {}
+    model_depth = audio.get("model_depth")
+    depth = (raw.get("model_conf") or {}).get("depth")
+    if model_depth is not None and depth is not None:
+        checks["model_depth_vs_depth"] = {"model_depth": model_depth, "depth": depth,
+                                          "agree": model_depth == depth}
+    declared = (raw.get("model_conf") or {}).get("supported_modality")
+    if declared is not None:
+        checks["supported_modality"] = declared
+        present = sorted(
+            m for m in (raw.get("model_conf") or {}).get("modalities", {})
+            if m not in {"_name"}
+        )
+        checks["modalities_present"] = present
+        checks["modalities_beyond_declared"] = [m for m in present if m != declared.lower()]
+    report["consistency"] = checks
+
+
 def run_emotion2vec_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
                            out_dir: Path) -> None:
-    """Native emotion forward via the shipping loader, with the disposition report."""
+    """Native emotion forward via the shipping loader, with the disposition report.
+
+    The official yaml is mapped field by field rather than splatted into the
+    native dataclass: it is a fairseq/dat2v2 config whose ``model_conf`` holds
+    dozens of training-only keys (ema, losses, mask probabilities) and whose
+    ``modalities`` section carries unused ``image`` and ``text`` branches.
+    ``Emotion2VecConfig(**model_conf)`` would reject all of them, and silently
+    filtering them first would hide a key that should have mapped.
+    """
     import mlx.core as mx
     import numpy as np
     from funasr_mlx.frontend import read_audio
     from funasr_mlx.models.emotion2vec import flat_parameter_names, preprocess_waveform
     from funasr_mlx.pipeline import load_model
 
+    raw = _load_yaml(_require(assets, "config"))
+    labels = _read_labels(_require(assets, "labels"))
+    kwargs, config_report = emotion_native_config(raw, labels)
+
     model, config = load_model(
-        _require(assets, "checkpoint"), family="emotion2vec",
-        config=assets.get("config"),
+        _require(assets, "checkpoint"), family="emotion2vec", config=kwargs
     )
-    labels = list(getattr(config, "labels", ()) or ())
 
     samples = np.asarray(read_audio(entry["audio"]), dtype=np.float32)
     _check_audio(entry, samples)
@@ -690,6 +966,7 @@ def run_emotion2vec_native(entry: Mapping[str, Any], assets: Mapping[str, Any],
         "labels": labels,
         "selected_labels": [labels[i] for i in keep],
         "selected_scores": [float(probabilities[0, i]) for i in keep],
+        "config_map": config_report,
         "disposition": _native_parameter_disposition(flat_parameter_names(model)),
     })
 

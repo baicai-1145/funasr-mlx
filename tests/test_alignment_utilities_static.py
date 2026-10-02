@@ -200,6 +200,168 @@ def test_required_attr_does_not_invent_a_default():
         au._required_attr(Empty(), "missing")
 
 
+# --------------------------------------------------------------------------- #
+# official YAML -> native emotion config
+# --------------------------------------------------------------------------- #
+def _official_emotion_yaml() -> dict:
+    """The real emotion2vec_plus_large shape, trimmed to what the mapper reads."""
+    return {
+        "model": "Emotion2vec",
+        "tokenizer": "CharTokenizer",
+        "tokenizer_conf": {"unk_symbol": "<unk>", "split_with_space": True},
+        "scope_map": ["d2v_model.", "none"],
+        "model_conf": {
+            "_name": "data2vec_multi",
+            "embed_dim": 1024,
+            "depth": 8,
+            "num_heads": 16,
+            "mlp_ratio": 4.0,
+            "norm_eps": 1.0e-05,
+            "norm_affine": True,
+            "layer_norm_first": False,
+            "normalize": True,
+            "end_of_block_targets": False,
+            "average_top_k_layers": 16,
+            "ema_decay": 0.9997,
+            "skip_ema": False,
+            "d2v_loss": 1.0,
+            "cls_loss": 1.0,
+            "adversarial_training": False,
+            "encoder_dropout": 0.1,
+            "attention_dropout": 0.1,
+            "activation_dropout": 0.0,
+            "layerdrop": 0.0,
+            "supported_modality": "AUDIO",
+            "modalities": {
+                "_name": None,
+                "audio": {
+                    "type": "AUDIO",
+                    "extractor_mode": "layer_norm",
+                    "feature_encoder_spec":
+                        "[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512,2,2)] + [(512,2,2)]",
+                    "conv_pos_depth": 5,
+                    "conv_pos_width": 95,
+                    "conv_pos_groups": 16,
+                    "conv_pos_pre_ln": False,
+                    "prenet_depth": 4,
+                    "num_extra_tokens": 10,
+                    "init_extra_token_zero": True,
+                    "use_alibi_encoder": True,
+                    "num_alibi_heads": 16,
+                    "alibi_scale": 1.0,
+                    "alibi_max_pos": None,
+                    "learned_alibi": False,
+                    "learned_alibi_scale": True,
+                    "learned_alibi_scale_per_head": True,
+                    "learned_alibi_scale_per_layer": False,
+                    "model_depth": 8,
+                    "mask_prob": 0.55,
+                    "prenet_dropout": 0.1,
+                    "decoder": {"decoder_dim": 768, "decoder_groups": 16},
+                },
+                "image": {"type": "IMAGE", "embed_dim": 768},
+                "text": {"type": "TEXT", "max_source_positions": 512},
+            },
+        },
+    }
+
+
+def test_emotion_config_maps_the_official_fields():
+    kwargs, report = au.emotion_native_config(_official_emotion_yaml(), ["a", "b", "c"])
+    assert kwargs["embed_dim"] == 1024
+    assert kwargs["depth"] == 8
+    assert kwargs["num_heads"] == 16
+    assert kwargs["norm_eps"] == pytest.approx(1.0e-05)
+    assert kwargs["feature_encoder_spec"].startswith("[(512, 10, 5)]")
+    assert kwargs["conv_pos_depth"] == 5 and kwargs["conv_pos_width"] == 95
+    assert kwargs["conv_pos_groups"] == 16
+    assert kwargs["prenet_depth"] == 4 and kwargs["num_extra_tokens"] == 10
+    assert kwargs["use_alibi_encoder"] is True and kwargs["num_alibi_heads"] == 16
+    assert kwargs["vocab_size"] == 3 and kwargs["labels"] == ("a", "b", "c")
+    # keys that do not exist natively must never be passed
+    assert "d2v_loss" not in kwargs and "modalities" not in kwargs
+    assert "_name" not in kwargs and "supported_modality" not in kwargs
+
+
+def test_emotion_config_renames_alibi_scale_to_alibi_scale_init():
+    """The one place where the same value has a different name."""
+    raw = _official_emotion_yaml()
+    raw["model_conf"]["modalities"]["audio"]["alibi_scale"] = 3.5
+    kwargs, _report = au.emotion_native_config(raw, ["a"])
+    assert kwargs["alibi_scale_init"] == 3.5
+    assert "alibi_scale" not in kwargs
+
+
+def test_emotion_config_reports_every_unmapped_key_rather_than_dropping_it():
+    _kwargs, report = au.emotion_native_config(_official_emotion_yaml(), ["a"])
+    unmapped = report["unmapped"]
+    assert "ema_decay" in unmapped["ema_and_optimizer"]
+    assert "skip_ema" in unmapped["ema_and_optimizer"]
+    assert "d2v_loss" in unmapped["pretraining_objectives"]
+    assert "cls_loss" in unmapped["pretraining_objectives"]
+    assert "encoder_dropout" in unmapped["regularisation"]
+    assert "modalities.image" in unmapped["other_modalities_and_top_level"]
+    assert "modalities.text" in unmapped["other_modalities_and_top_level"]
+    assert "decoder" in unmapped["audio_modality_not_mapped"]
+    assert "mask_prob" in unmapped["audio_modality_not_mapped"]
+    # everything mapped is genuinely absent from the unmapped buckets
+    assert "feature_encoder_spec" not in unmapped["audio_modality_not_mapped"]
+    assert report["scope_map"] == ["d2v_model.", "none"]
+    assert "model_conf" not in report["ignored_sections"]
+
+
+def test_emotion_config_flags_a_depth_disagreement():
+    raw = _official_emotion_yaml()
+    raw["model_conf"]["modalities"]["audio"]["model_depth"] = 6
+    _kwargs, report = au.emotion_native_config(raw, ["a"])
+    check = report["consistency"]["model_depth_vs_depth"]
+    assert check == {"model_depth": 6, "depth": 8, "agree": False}
+
+
+def test_emotion_config_reports_modalities_beyond_the_declared_one():
+    _kwargs, report = au.emotion_native_config(_official_emotion_yaml(), ["a"])
+    checks = report["consistency"]
+    assert checks["supported_modality"] == "AUDIO"
+    assert checks["modalities_beyond_declared"] == ["image", "text"]
+
+
+def test_emotion_config_defaults_conv_bias_because_the_official_omits_it():
+    kwargs, report = au.emotion_native_config(_official_emotion_yaml(), ["a"])
+    assert "conv_bias" not in _official_emotion_yaml()["model_conf"]["modalities"]["audio"]
+    assert kwargs["conv_bias"] is False
+    assert report["defaulted"] == ["model_conf.modalities.audio.conv_bias"]
+
+
+def test_emotion_config_tolerates_a_missing_optional_key():
+    raw = _official_emotion_yaml()
+    del raw["model_conf"]["modalities"]["audio"]["alibi_max_pos"]
+    kwargs, _report = au.emotion_native_config(raw, ["a"])
+    assert "alibi_max_pos" not in kwargs
+
+
+# --------------------------------------------------------------------------- #
+# ct-punc vocabulary format
+# --------------------------------------------------------------------------- #
+def test_ct_punc_tokens_are_read_as_a_json_list(tmp_path):
+    """The published tokens.json is a JSON list, not newline-separated text."""
+    path = tmp_path / "tokens.json"
+    path.write_text(json.dumps(["<blank>", "<s>", "</s>", "，", "。"], ensure_ascii=False))
+    assert au._load_ct_punc_tokens(str(path)) == ["<blank>", "<s>", "</s>", "，", "。"]
+
+
+def test_ct_punc_tokens_fall_back_to_newline_text(tmp_path):
+    path = tmp_path / "tokens.txt"
+    path.write_text("a\nb\n\nc\n")
+    assert au._load_ct_punc_tokens(str(path)) == ["a", "b", "c"]
+
+
+def test_ct_punc_tokens_reject_a_non_string_list(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps([1, 2, 3]))
+    with pytest.raises(ValueError, match="JSON list of strings"):
+        au._load_ct_punc_tokens(str(path))
+
+
 def test_vad_input_dim_is_read_from_either_config_shape():
     assert au._vad_input_dim({"encoder_conf": {"input_dim": 400}}) == 400
     assert au._vad_input_dim({"input_dim": 256}) == 256
