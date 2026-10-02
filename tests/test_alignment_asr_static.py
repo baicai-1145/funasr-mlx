@@ -28,6 +28,17 @@ def _dump(name: str) -> str:
     return ast.dump(FUNCTIONS[name])
 
 
+def _source(name: str) -> str:
+    """The real source text of a top-level function.
+
+    Preferred over matching against ``ast.dump`` for behaviour assertions: the
+    dump renders strings single-quoted and reorders nothing else usefully, so a
+    check written against it describes the serialiser rather than the code.
+    """
+    node = FUNCTIONS[name]
+    return "\n".join(SOURCE.splitlines()[node.lineno - 1 : node.end_lineno])
+
+
 def _imported_roots(name: str) -> set[str]:
     """Top-level module names actually imported anywhere inside ``name``.
 
@@ -116,19 +127,316 @@ def test_reference_process_never_touches_mlx_or_the_native_port():
 
 
 def test_native_process_never_touches_torch_or_funasr():
-    """The native run must not pull in the reference backend."""
+    """Only the reference may load Torch; the native run has its own loader.
+
+    The native side reads the CONVERTED safetensors through
+    ``funasr_mlx.pipeline.load_model``. Reading the original ``.pt`` there would
+    put two checkpoints and two backends in one process, and the comparison would
+    no longer be about the shipped load path at all.
+    """
     for helper in (
         "run_native",
         "_run_native_sample",
-        "_build_native_model",
         "_native_frontend_config",
+        "_native_conditioning_ids",
+        "_native_paraformer_token_ids",
     ):
         roots = _imported_roots(helper)
         assert "torch" not in roots, f"{helper} imports Torch"
         assert "funasr" not in roots, f"{helper} imports the reference package"
-    # The checkpoint is deliberately read through Torch's reader so both backends
-    # consume the same bytes; that one shared helper is the only exception.
+    # The Torch reader exists for the reference only, and the native run must not
+    # reach it even indirectly.
     assert "torch" in _imported_roots("_load_checkpoint_state")
+    assert "_load_checkpoint_state" not in _dump("run_native")
+    assert "_load_checkpoint_state" not in _dump("_run_native_sample")
+
+
+def test_native_run_uses_the_shipping_pipeline_loader():
+    """The validated artefact is the one the product loads, not a private path."""
+    src = _source("run_native")
+    assert "load_model" in src
+    # A missing guard, a missing artefact and a float16 checkpoint are all
+    # refused loudly rather than silently producing numbers to compare.
+    for token in ("guarded_child_active", "native_checkpoint", "float32"):
+        assert token in src, token
+    sample = _source("_run_native_sample")
+    # The CIF embeddings are the decoder INPUT and are never promoted to being
+    # the decoder logits.
+    assert "outputs.decoder_out" in sample
+    assert '"pre_decoder": outputs.acoustic_embeds' in sample
+    assert '"final_logits": outputs.acoustic_embeds' not in sample
+    assert "ctc_greedy_decode" in sample
+    # One encoder pass, not two: `model(...)` would recompute it.
+    assert "model.encode(" in sample
+    assert "= model(" not in sample
+
+
+def test_reference_builds_on_meta_and_binds_the_official_values():
+    """No weight storage is allocated, and nothing is loaded unverified."""
+    build = _source("_build_funasr_reference")
+    assert 'with torch.device("meta"):' in build
+    load = _source("_load_reference_weights")
+    assert "assign=True" in load
+    assert "strict=True" in load
+    # The shape check is stated here rather than left to a library internal.
+    assert "inventory_report(" in load
+    assert "shape_mismatch" in load
+    # A silent precision change is refused, not performed.
+    assert "torch.float32" in load
+    assert "model.float()" not in load
+    # Inference only: no autograd graph is retained over mmap'd weights.
+    assert "requires_grad_" in load
+
+
+def test_meta_non_parameters_are_rebuilt_by_source_code():
+    """Tensors no checkpoint contains are rebuilt, never invented or skipped."""
+    rules = _source("_meta_rebuild_rules")
+    # Rules come from the imported FunASR classes, so a subclass inherits the
+    # right rule and an unrelated same-named attribute does not borrow one.
+    assert "funasr.models.transformer" in rules
+    assert "isinstance" in _source("_rebuild_meta_tensors")
+    for attribute in ('"pe"', '"tmp"'):
+        assert attribute in rules
+    # The rebuild calls the source's own method rather than recomputing the table
+    # by hand.
+    assert "extend_pe" in _source("_rebuild_positional_encoding_pe")
+    assert "MAX_RECONSTRUCTED_ROWS" in _source("_rebuild_meta_tensors")
+    # Anything still on meta stops the run instead of reading as a real tensor.
+    assert "_meta_leftovers" in _source("_load_reference_weights")
+    assert "still on the meta device" in _source("_load_reference_weights")
+    assert "no source-defined" in _source("_rebuild_meta_tensors")
+    # The one construction step most likely to lack a meta kernel is proven on a
+    # 5000x8 instance of the real class before a 50-layer model is half-built,
+    # and through the same rule the real tables will use.
+    probe = _source("_probe_meta_positional_encoding")
+    assert "funasr_embedding.PositionalEncoding(" in probe
+    assert "_meta_rebuild_rules" in probe
+    assert "isfinite" in probe
+    assert "_probe_meta_positional_encoding" in _source("_build_funasr_reference")
+
+
+class _FakeIds:
+    def __init__(self, values):
+        self.values = list(values)
+
+    def tolist(self):
+        return list(self.values)
+
+
+class _FakeRow:
+    """Minimal stand-in for a 1-D tensor row: slice -> argmax -> tolist."""
+
+    def __init__(self, values):
+        self.values = list(values)
+
+    def __getitem__(self, index):
+        return _FakeRow(self.values[index])
+
+    def argmax(self, dim=-1):
+        assert dim == -1
+        return _FakeIds(self.values)
+
+
+class _FakeMatrix:
+    def __init__(self, rows):
+        self.rows = [list(row) for row in rows]
+
+    @property
+    def shape(self):
+        return (len(self.rows), len(self.rows[0]))
+
+    def __getitem__(self, index):
+        if isinstance(index, tuple):
+            batch, window = index
+            return _FakeRow(self.rows[batch][window])
+        return _FakeMatrix(self.rows[index])
+
+
+def test_ctc_greedy_ids_collapses_duplicates_before_dropping_blanks():
+    """``inference`` order: argmax -> unique_consecutive -> drop blanks.
+
+    Duplicates collapse BEFORE blanks are removed, so a blank between two equal
+    ids does not merge them. Getting that order wrong changes the text without
+    changing a single logit.
+    """
+    row = _FakeRow([5, 5, 0, 0, 7, 7, 0, 3])
+    assert alignment._ctc_greedy_ids(row, 8, 0) == [5, 7, 3]
+    # The valid length truncates first: the trailing [0, 3] is not audio.
+    assert alignment._ctc_greedy_ids(row, 6, 0) == [5, 7]
+    assert alignment._ctc_greedy_ids(_FakeRow([0, 0, 0]), 3, 0) == []
+
+
+def test_paraformer_greedy_ids_drops_sos_eos_and_blank():
+    """``inference`` slices by the rounded token length, then filters the ids."""
+    from types import SimpleNamespace
+
+    model = SimpleNamespace(eos=2, sos=2, blank_id=0)
+    matrix = _FakeMatrix([[9, 2, 5, 5, 0]])
+    assert alignment._paraformer_greedy_ids(model, matrix, [3]) == [9, 5]
+    # The length is the rounded CIF token count, so it decides how much of the
+    # argmax is real output -- and only sos/eos/blank are ever dropped.
+    assert alignment._paraformer_greedy_ids(model, matrix, [5]) == [9, 5, 5]
+    # A token length beyond the row is clamped, not an index error.
+    assert alignment._paraformer_greedy_ids(model, matrix, [9]) == [9, 5, 5]
+
+
+def test_overlength_is_measured_and_refused_on_both_sides():
+    """The bound is checked against the decoded array, on both backends."""
+    for name in ("_run_reference_sample", "_run_native_sample"):
+        src = _source(name)
+        assert "_reject_overlength(" in src, name
+        assert '"audio_samples"' in src, name
+        assert '"fbank_frames"' in src, name
+    reject = _source("_reject_overlength")
+    assert "truncated" in reject
+    assert "SAMPLE_RATE" in reject
+    variant = {"max_seconds": 20.0, "key": "paraformer-zh"}
+    alignment._reject_overlength("a", 16_000 * 20, variant)
+    for samples in (16_000 * 21, 16_000 * 60):
+        try:
+            alignment._reject_overlength("a", samples, variant)
+        except alignment.AlignmentError as error:
+            assert "refused" in str(error)
+        else:  # pragma: no cover
+            raise AssertionError("over-length audio was accepted")
+
+
+def test_native_artefact_is_named_explicitly_and_must_exist(tmp_path):
+    """Two artefacts, both explicit; nothing downloaded or inferred."""
+    assets = tmp_path / "models" / "paraformer"
+    assets.mkdir(parents=True)
+    (assets / "config.yaml").write_text(
+        "init_param: model.pt\n"
+        "model: Paraformer\n"
+        "frontend: WavFrontend\n"
+        "tokenizer: CharTokenizer\n"
+        "token_list: tokens.json\n"
+    )
+    (assets / "configuration.json").write_text(
+        json.dumps({"init_param": "model.pt", "cmvn_file": "am.mvn"})
+    )
+    manifest = _manifest(tmp_path, durations=(3.0,))
+    native = tmp_path / "converted" / "model.safetensors"
+    native.parent.mkdir()
+    native.write_bytes(b"")
+
+    spec = alignment.build_alignment_spec(
+        manifest,
+        "paraformer-zh",
+        tmp_path,
+        assets_root=tmp_path,
+        native_checkpoint=native,
+        max_samples=1,
+    )
+    assert spec["variant"]["native_checkpoint"] == str(native)
+    assert spec["variant"]["checkpoint"] == str(assets / "model.pt")
+    conversion = spec["variant"]["conversion"]
+    assert conversion["model"] == "paraformer"
+    assert conversion["dtype"] == "float32"
+    assert conversion["requires_guarded_child"] is True
+    assert conversion["source"] == str(assets / "model.pt")
+    assert spec["reference"]["init"] == "meta"
+    # json.dumps of the whole spec: the plan has to be reviewable in a diff.
+    assert json.loads(json.dumps(spec)) == spec
+
+    # A path that does not exist is refused at build time, with the fix named.
+    try:
+        alignment.build_alignment_spec(
+            manifest,
+            "paraformer-zh",
+            tmp_path,
+            assets_root=tmp_path,
+            native_checkpoint=tmp_path / "absent.safetensors",
+            max_samples=1,
+        )
+    except alignment.AlignmentError as error:
+        assert "not found" in str(error)
+        assert "convert_checkpoint" in str(error)
+    else:  # pragma: no cover
+        raise AssertionError("a missing native checkpoint was accepted")
+
+    # An unknown init device is refused rather than silently defaulted.
+    try:
+        alignment.build_alignment_spec(
+            manifest,
+            "paraformer-zh",
+            tmp_path,
+            assets_root=tmp_path,
+            reference_init="cuda",
+            max_samples=1,
+        )
+    except alignment.AlignmentError as error:
+        assert "reference_init" in str(error)
+    else:  # pragma: no cover
+        raise AssertionError("an unknown reference init device was accepted")
+
+
+def test_inventory_report_checks_shapes_as_well_as_names():
+    shapes_model = {"a": (2, 3), "b": (4,)}
+    shapes_checkpoint = {"a": (2, 3), "b": (5,)}
+    report = alignment.inventory_report(
+        shapes_model,
+        shapes_checkpoint,
+        label="t",
+        model_shapes=shapes_model,
+        checkpoint_shapes=shapes_checkpoint,
+    )
+    assert report["verdict"] == "mismatch"
+    assert report["missing"] == [] and report["unexpected"] == []
+    assert report["shape_mismatch"] == [{"name": "b", "model": [4], "checkpoint": [5]}]
+    # A name-only call stays usable and simply has no shape opinion.
+    plain = alignment.inventory_report(shapes_model, shapes_checkpoint, label="t")
+    assert plain["shape_mismatch"] == []
+
+
+def test_compare_flags_inventory_and_loading_problems():
+    """A run that cannot show how it loaded is not a clean comparison."""
+    base = {
+        "schema": "funasr-mlx-alignment-run/3",
+        "variant": {"key": "paraformer-zh"},
+        "inventory": {"verdict": "ok", "missing": [], "unexpected": [], "shape_mismatch": []},
+        "loading": {"dtype": "float32", "keys_checked": 4},
+        "samples": [],
+    }
+    assert alignment.compare_alignment(base, base)["clean"] is True
+
+    missing_inventory = {k: v for k, v in base.items() if k != "inventory"}
+    kinds = {f["kind"] for f in alignment.compare_alignment(missing_inventory, base)["findings"]}
+    assert "inventory_missing" in kinds
+
+    no_loading = {k: v for k, v in base.items() if k != "loading"}
+    kinds = {f["kind"] for f in alignment.compare_alignment(no_loading, base)["findings"]}
+    assert "loading_disposition_missing" in kinds
+
+    bad = {
+        **base,
+        "inventory": {
+            "verdict": "mismatch",
+            "missing": ["x"],
+            "unexpected": [],
+            "shape_mismatch": [],
+        },
+    }
+    kinds = {f["kind"] for f in alignment.compare_alignment(bad, base)["findings"]}
+    assert "inventory_not_exact" in kinds
+
+    float16_native = {**base, "loading": {"dtype": "float16", "keys_checked": 4}}
+    kinds = {f["kind"] for f in alignment.compare_alignment(base, float16_native)["findings"]}
+    assert "loading_disposition_differ" in kinds
+
+    # A mismatched feature count is a geometry problem, not a numeric one.
+    left = {**base, "samples": [{"key": "a", "audio_samples": 10, "fbank_frames": 3}]}
+    right = {**base, "samples": [{"key": "a", "audio_samples": 12, "fbank_frames": 4}]}
+    kinds = {f["kind"] for f in alignment.compare_alignment(left, right)["findings"]}
+    assert kinds == {"audio_length_disagreement", "fbank_frame_disagreement"}
+
+
+def test_whisper_cannot_be_aligned_end_to_end_and_says_so():
+    """Refused with a reason, not an empty run that reads like a pass."""
+    for name in ("run_reference", "run_native"):
+        src = _source(name)
+        assert "per-sample stage pipeline" in src, name
+        assert "paraformer-zh" in src, name
 
 
 def test_both_frontends_are_built_independently_from_one_config():

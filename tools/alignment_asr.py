@@ -24,8 +24,26 @@ Hard rules this module obeys
    CMVN and configuration, loaded independently.
 4. **Explicit float32** everywhere; every saved tensor's dtype is recorded.
 5. **No hidden normalisation.** Nothing here rescales or clips a tensor.
-6. **Strict key inventory in both directions**, and any unsupported variant is
-   refused with a reason rather than silently substituted.
+6. **Strict key inventory in both directions**, plus an explicit **shape**
+   check, and any unsupported variant is refused with a reason rather than
+   silently substituted.
+7. **The reference allocates no weights.** The FunASR model is constructed on
+   Torch's ``meta`` device and the official checkpoint is *bound* into it with
+   ``load_state_dict(..., assign=True)``, so peak RSS is the checkpoint plus
+   activations rather than the checkpoint plus a full random copy of itself.
+   Meta construction is not sufficient on its own -- the source also builds
+   non-parameter tensors in ``__init__`` that no checkpoint contains -- so those
+   are rebuilt through the source's own code and anything unaccounted for is a
+   hard error (see :func:`_rebuild_meta_tensors`).
+8. **The native side reads only the converted artifact**, through the shipping
+   pipeline loader (``pipeline.load_model``). It never opens a Torch
+   checkpoint, so the load path being validated is the one the product uses --
+   its prevalidation, its bounded shard loop, its strict key and shape checks --
+   rather than a second reader that could drift from it.
+9. **Nothing is downloaded, inferred or truncated.** The two artefacts per
+   variant -- the original FunASR directory and the converted safetensors -- are
+   named explicitly in the spec, and audio longer than the variant bound is
+   refused after measuring the decoded array, not trusted from the manifest.
 
 Both numeric runners must be invoked as separate processes; see ``main``.
 """
@@ -49,6 +67,26 @@ CANONICAL_WHISPER_SOURCE = Path("/Users/baicai1145/repos/funasr-mlx/.tmp/openai-
 #: Per-tensor element cap for saved arrays. Truncation is recorded, never silent:
 #: a partial activation must not be mistaken for a full one.
 MAX_SAVED_ELEMENTS = 4_000_000
+
+#: Reference-side parameter initialisation. ``"meta"`` allocates no weight
+#: storage at all; ``"cpu"`` is the documented escape hatch that materialises a
+#: real random model before the same strict load, for an architecture that turns
+#: out not to be constructible on meta. It costs a full-size copy in RSS, so it
+#: is opt-in and recorded in the run metadata.
+REFERENCE_INIT_DEVICES = ("meta", "cpu")
+DEFAULT_REFERENCE_INIT = "meta"
+
+#: Cap on a rebuilt non-parameter table, in rows. The source's own
+#: ``PositionalEncoding`` default is 5000; anything larger is refused rather
+#: than allocated, so a hostile or mistaken ``max_len`` cannot become an
+#: unbounded allocation hidden inside "reconstruct the buffers".
+MAX_RECONSTRUCTED_ROWS = 8_192
+
+#: SenseVoice conditioning, shared by both backends so the two cannot be
+#: configured differently by accident. ``inference`` resolves the textnorm from
+#: ``use_itn`` when no explicit ``text_norm`` is given.
+SENSEVOICE_LANGUAGE = "auto"
+SENSEVOICE_USE_ITN = False
 
 SAMPLE_RATE = 16_000
 
@@ -246,18 +284,37 @@ def build_alignment_spec(
     *,
     assets_root: str | Path = DEFAULT_ASSETS_ROOT,
     max_samples: int = 8,
-    cmvn_name: str = "am.mvn",
+    native_checkpoint: str | Path | None = None,
+    reference_init: str = DEFAULT_REFERENCE_INIT,
     canonical_whisper_source: str | Path = CANONICAL_WHISPER_SOURCE,
 ) -> dict[str, Any]:
     """Produce the JSON-serialisable plan both backend runs execute.
 
     Free of heavy imports on purpose: the spec is cheap to build, reviewable in a
     diff, and identical for both backends by construction.
+
+    Two artefacts are named per variant and neither is guessed. ``checkpoint`` is
+    the original FunASR file, read by the reference through Torch's mmap loader;
+    ``native_checkpoint`` is the converted safetensors the native side loads
+    through the shipping pipeline. Nothing is downloaded and no path is derived
+    from a naming convention.
     """
     variant = resolve_variant(variant_name)
     if max_samples <= 0:
         raise AlignmentError("--max-samples must be positive")
+    if reference_init not in REFERENCE_INIT_DEVICES:
+        raise AlignmentError(
+            f"reference_init must be one of {REFERENCE_INIT_DEVICES}, not {reference_init!r}"
+        )
     assets_root = Path(assets_root)
+    native = Path(native_checkpoint) if native_checkpoint else None
+    if native is not None and not native.exists():
+        raise AlignmentError(
+            f"converted native checkpoint not found at {native}; convert it first with "
+            f"convert_checkpoint(..., model={variant.family!r}, dtype='float32') inside "
+            "the memory guard, or build the spec without --native-checkpoint and add it "
+            "before the native run"
+        )
 
     inputs: list[dict[str, Any]] = []
     problems: list[str] = []
@@ -288,12 +345,30 @@ def build_alignment_spec(
         raise AlignmentError("no usable samples remain")
 
     spec: dict[str, Any] = {
-        "schema": "funasr-mlx-alignment/2",
+        "schema": "funasr-mlx-alignment/3",
         "variant": {
             "key": variant.key,
             "family": variant.family,
             "checkpoint": str(assets_root / variant.checkpoint),
             "config": str(assets_root / variant.config),
+            # The converted artefact the NATIVE side loads through the shipping
+            # pipeline loader (``pipeline.load_model``). It is a different file
+            # from ``checkpoint`` and is never inferred from a naming convention.
+            "native_checkpoint": str(native) if native is not None else None,
+            "conversion": {
+                # Named without its package on purpose: the reference half of this
+                # module must not mention the native port at all, and the native
+                # runner already spells out the full call.
+                "tool": "convert_checkpoint",
+                "model": variant.family,
+                # float32 is required: the reference is float32, and a float16
+                # native run would compare different numbers and say so only as a
+                # diffuse per-element difference.
+                "dtype": "float32",
+                "source": str(assets_root / variant.checkpoint),
+                "destination": str(native) if native is not None else None,
+                "requires_guarded_child": True,
+            },
             # CMVN and tokenizer filenames are declared only in configuration.json;
             # config.yaml ships cmvn_file: null, so they are never guessed here.
             "cmvn": None
@@ -312,11 +387,18 @@ def build_alignment_spec(
         "audio": {
             "sample_rate": SAMPLE_RATE,
             "batch_size": 1,
+            "max_seconds": variant.max_seconds,
             "fixed_order": [item["key"] for item in inputs],
         },
         "inputs": inputs,
         "output_root": str(output_root),
         "dtype": "float32",
+        "reference": {
+            # "meta" + assign=True is the memory-bounded path; "cpu" is the
+            # opt-in fallback and is recorded so a run can never be mistaken for
+            # one that allocated nothing.
+            "init": reference_init,
+        },
         "stages": ["frontend", "encoder", "pre_decoder", "final_logits", "token_ids"],
         "limits": {"max_saved_elements": MAX_SAVED_ELEMENTS},
         "unsupported_variants": dict(sorted(UNSUPPORTED.items())),
@@ -340,21 +422,44 @@ def inventory_report(
     checkpoint_keys: Iterable[str],
     *,
     label: str = "",
+    model_shapes: dict[str, tuple[int, ...]] | None = None,
+    checkpoint_shapes: dict[str, tuple[int, ...]] | None = None,
 ) -> dict[str, Any]:
-    """Compare two key sets, reporting every difference in both directions."""
+    """Compare two key sets, reporting every difference in both directions.
+
+    ``model_shapes``/``checkpoint_shapes`` add the second half of "strict": a key
+    that exists on both sides with the wrong shape is a failure that a name-only
+    check reads as a success. ``load_state_dict`` validates shapes internally as
+    well, but stating the check here means the adapter both owns it and *records*
+    the difference, instead of depending on a library internal it did not write.
+    """
     expected = sorted(str(key) for key in model_keys)
     provided = sorted(str(key) for key in checkpoint_keys)
     expected_set, provided_set = set(expected), set(provided)
     missing = sorted(expected_set - provided_set)
     unexpected = sorted(provided_set - expected_set)
+    shape_mismatch: list[dict[str, Any]] = []
+    if model_shapes is not None and checkpoint_shapes is not None:
+        shared = sorted(expected_set & provided_set)
+        shape_mismatch = [
+            {
+                "name": name,
+                "model": [int(size) for size in model_shapes[name]],
+                "checkpoint": [int(size) for size in checkpoint_shapes[name]],
+            }
+            for name in shared
+            if tuple(model_shapes[name]) != tuple(checkpoint_shapes[name])
+        ]
+    exact = not missing and not unexpected and not shape_mismatch
     return {
         "label": label,
         "model_key_count": len(expected),
         "checkpoint_key_count": len(provided),
         "missing": missing,
         "unexpected": unexpected,
-        "exact_match": not missing and not unexpected,
-        "verdict": "ok" if not missing and not unexpected else "mismatch",
+        "shape_mismatch": shape_mismatch,
+        "exact_match": exact,
+        "verdict": "ok" if exact else "mismatch",
     }
 
 
@@ -394,9 +499,62 @@ def compare_alignment(
             findings.append(
                 {
                     "kind": f"{field_name}_mismatch",
-                    "detail": f"reference={reference_meta.get(field_name)!r} native={native_meta.get(field_name)!r}",
+                    "detail": (
+                        f"reference={reference_meta.get(field_name)!r} "
+                        f"native={native_meta.get(field_name)!r}"
+                    ),
                 }
             )
+
+    # How each side was loaded is part of the evidence: two runs that agree
+    # numerically but were loaded differently are still not comparable, and a
+    # float16 native checkpoint must not be able to pass as a float32 run. A
+    # schema-3 run REQUIRES both records; an older or hand-made file is left
+    # alone rather than being told it is wrong.
+    for side, metadata in (("reference", reference_meta), ("native", native_meta)):
+        declared = str(metadata.get("schema", ""))
+        inventory = metadata.get("inventory")
+        if inventory is None:
+            if declared.endswith("/3"):
+                findings.append(
+                    {
+                        "kind": "inventory_missing",
+                        "detail": f"{side} declares {declared} but records no key inventory",
+                    }
+                )
+        elif inventory.get("verdict") != "ok":
+            findings.append(
+                {
+                    "kind": "inventory_not_exact",
+                    "detail": (
+                        f"{side} inventory={inventory.get('verdict')} "
+                        f"missing={len(inventory.get('missing', []))} "
+                        f"unexpected={len(inventory.get('unexpected', []))} "
+                        f"shape_mismatch={len(inventory.get('shape_mismatch', []))}"
+                    ),
+                }
+            )
+        if declared.endswith("/3") and not metadata.get("loading"):
+            findings.append(
+                {
+                    "kind": "loading_disposition_missing",
+                    "detail": f"{side} records how it was loaded nowhere in its metadata",
+                }
+            )
+    reference_loading = reference_meta.get("loading") or {}
+    native_loading = native_meta.get("loading") or {}
+    if reference_loading and native_loading:
+        for field in ("dtype", "keys_checked"):
+            if reference_loading.get(field) != native_loading.get(field):
+                findings.append(
+                    {
+                        "kind": "loading_disposition_differ",
+                        "detail": (
+                            f"{field}: reference={reference_loading.get(field)!r} "
+                            f"native={native_loading.get(field)!r}"
+                        ),
+                    }
+                )
 
     reference_samples = {item["key"]: item for item in reference_meta.get("samples", [])}
     native_samples = {item["key"]: item for item in native_meta.get("samples", [])}
@@ -424,6 +582,19 @@ def compare_alignment(
                 findings.append(
                     {
                         "kind": f"{field_name}_differ",
+                        "sample": key,
+                        "reference": reference_sample.get(field_name),
+                        "native": native_sample.get(field_name),
+                    }
+                )
+        for field_name, kind in (
+            ("audio_samples", "audio_length_disagreement"),
+            ("fbank_frames", "fbank_frame_disagreement"),
+        ):
+            if reference_sample.get(field_name) != native_sample.get(field_name):
+                findings.append(
+                    {
+                        "kind": kind,
                         "sample": key,
                         "reference": reference_sample.get(field_name),
                         "native": native_sample.get(field_name),
@@ -465,7 +636,7 @@ def compare_alignment(
                 )
 
     return {
-        "schema": "funasr-mlx-alignment-diff/2",
+        "schema": "funasr-mlx-alignment-diff/3",
         "variant": reference_meta.get("variant", {}).get("key"),
         "finding_count": len(findings),
         "findings": findings,
@@ -549,6 +720,319 @@ def _load_checkpoint_state(path: Path) -> dict[str, Any]:
     return {str(key): value for key, value in payload.items()}
 
 
+# --------------------------------------------------------------------------- #
+# Reference weight loading: strict, shape-checked, and allocation-free
+# --------------------------------------------------------------------------- #
+def _join(prefix: str, name: str) -> str:
+    return f"{prefix}.{name}" if prefix else name
+
+
+def _reference_parameter_shapes(model: Any) -> dict[str, tuple[int, ...]]:
+    """Every parameter's shape, read before any data is loaded.
+
+    On the meta device these are still the architecture's real shapes, which is
+    what makes an explicit shape check possible even though nothing was
+    allocated. Reading them from a model whose parameters already hold weights
+    would only re-derive what the checkpoint says.
+    """
+    return {
+        name: tuple(int(size) for size in tensor.shape) for name, tensor in model.named_parameters()
+    }
+
+
+def _meta_leftovers(
+    model: Any, torch: Any, kinds: Sequence[str] = ("parameter", "buffer", "attribute")
+) -> list[dict[str, Any]]:
+    """Tensors still on the meta device, with their owning class and attribute.
+
+    Parameters are included deliberately: a parameter left on meta is not an
+    error at the first matmul, it is wrong numbers.
+    """
+    leftovers: list[dict[str, Any]] = []
+    for path, module in model.named_modules():
+        owner = type(module).__name__
+        candidates: list[tuple[str, str, Any]] = [
+            (name, "parameter", value) for name, value in module._parameters.items()
+        ]
+        candidates += [(name, "buffer", value) for name, value in module._buffers.items()]
+        candidates += [
+            (name, "attribute", value)
+            for name, value in vars(module).items()
+            if isinstance(value, torch.Tensor)
+        ]
+        for name, kind, value in candidates:
+            if kind not in kinds or not isinstance(value, torch.Tensor) or not value.is_meta:
+                continue
+            leftovers.append(
+                {
+                    "path": _join(path, name),
+                    "kind": kind,
+                    "class": owner,
+                    "shape": [int(size) for size in value.shape],
+                }
+            )
+    return leftovers
+
+
+def _rebuild_positional_encoding_pe(module: Any, tensor: Any, torch: Any) -> Any:
+    """Recreate ``PositionalEncoding.pe`` with the source's own method.
+
+    ``pe`` is a plain attribute, so it is absent from every published
+    state_dict -- but it is not stateless either: ``__init__`` builds a
+    ``max_len``-row table and ``forward`` extends it. A meta tensor cannot be
+    brought back by ``extend_pe`` (``Tensor.to`` out of meta raises), so the table
+    is rebuilt here by the source's own code, with the source's own row count
+    (recoverable from the meta tensor's shape) and dtype. Rows are computed
+    independently of one another, so the result is bit-identical to the table the
+    reference would have built for itself.
+    """
+    rows = int(tensor.shape[1])
+    module.pe = None
+    module.extend_pe(torch.zeros(1, rows, dtype=tensor.dtype, device="cpu"))
+    return module.pe
+
+
+def _rebuild_stream_pe(module: Any, tensor: Any, torch: Any) -> Any:
+    """``StreamPositionalEncoding.extend_pe(length, device, dtype)`` has a
+    different signature; the values it produces are the same table."""
+    module.pe = None
+    module.extend_pe(int(tensor.shape[1]), torch.device("cpu"), torch.float32)
+    return module.pe
+
+
+def _rebuild_stream_tmp(module: Any, tensor: Any, torch: Any) -> Any:
+    """``self.tmp = torch.tensor(0.0).expand(1, max_len)`` -- zeros are the same
+    values, and the source only ever reads its size."""
+    return torch.zeros(1, int(tensor.shape[1]), dtype=torch.float32, device="cpu")
+
+
+def _meta_rebuild_rules(torch: Any) -> list[tuple[tuple[type, str], str, Any]]:
+    """(class, attribute) -> (human source call, rebuilder), most specific first.
+
+    The classes come from the imported FunASR module rather than from a name
+    comparison, so a subclass inherits the right rule and a same-named attribute
+    on an unrelated class does not.
+    """
+    from funasr.models.transformer import embedding as funasr_embedding
+
+    return [
+        (
+            (funasr_embedding.StreamPositionalEncoding, "tmp"),
+            "zeros(1, max_len)  # source: torch.tensor(0.0).expand(1, max_len)",
+            _rebuild_stream_tmp,
+        ),
+        (
+            (funasr_embedding.StreamPositionalEncoding, "pe"),
+            "extend_pe(max_len, cpu, float32)  # source's own method",
+            _rebuild_stream_pe,
+        ),
+        (
+            (funasr_embedding.PositionalEncoding, "pe"),
+            "extend_pe(zeros(1, max_len))  # source's own method",
+            _rebuild_positional_encoding_pe,
+        ),
+    ]
+
+
+def _rebuild_meta_tensors(model: Any, torch: Any) -> list[dict[str, Any]]:
+    """Rebuild every non-parameter tensor the source creates in ``__init__``.
+
+    No rule invents numbers: each one calls the source's own construction code,
+    and each records what it did. A meta tensor with no rule is a hard error,
+    because leaving it in place would not fail -- it would be read as an ordinary
+    tensor and produce plausible wrong activations.
+    """
+    rules = _meta_rebuild_rules(torch)
+    records: list[dict[str, Any]] = []
+    for path, module in model.named_modules():
+        targets: list[tuple[str, str, Any]] = [
+            (name, "buffer", value) for name, value in module._buffers.items()
+        ]
+        targets += [
+            (name, "attribute", value)
+            for name, value in vars(module).items()
+            if isinstance(value, torch.Tensor)
+        ]
+        for name, kind, tensor in targets:
+            if not tensor.is_meta:
+                continue
+            rule = next(
+                (
+                    entry
+                    for entry in rules
+                    if isinstance(module, entry[0][0]) and name == entry[0][1]
+                ),
+                None,
+            )
+            where = _join(path, name)
+            if rule is None:
+                raise AlignmentError(
+                    f"{where} is on the meta device and no source-defined "
+                    f"reconstruction exists for {type(module).__name__}.{name}; "
+                    "refusing to run with an uninitialised tensor instead of "
+                    "inventing values"
+                )
+            rows = int(tensor.shape[1]) if tensor.ndim > 1 else int(tensor.shape[0])
+            if rows > MAX_RECONSTRUCTED_ROWS:
+                raise AlignmentError(
+                    f"{where} needs {rows} rows, above the bounded "
+                    f"{MAX_RECONSTRUCTED_ROWS}; refusing to allocate it"
+                )
+            before = [int(size) for size in tensor.shape]
+            rebuilt = rule[2](module, tensor, torch)
+            if not isinstance(rebuilt, torch.Tensor) or rebuilt.is_meta:
+                raise AlignmentError(
+                    f"rebuilding {where} did not produce a real tensor, so the model "
+                    "is not fully initialised"
+                )
+            records.append(
+                {
+                    "path": where,
+                    "class": type(module).__name__,
+                    "attribute": name,
+                    "kind": kind,
+                    "source_call": rule[1],
+                    "shape_before": before,
+                    "shape_after": [int(size) for size in rebuilt.shape],
+                    "elements": int(rebuilt.numel()),
+                }
+            )
+    return records
+
+
+def _probe_meta_positional_encoding(torch: Any) -> dict[str, Any]:
+    """Prove, cheaply, that meta construction and the rebuild work together.
+
+    ``PositionalEncoding.__init__`` builds a ``max_len``-row table in place --
+    ``pe[:, 0::2] = torch.sin(...)`` -- and that is the one step of these two
+    architectures most likely to lack a meta kernel. Finding out halfway through
+    a 50-layer model would be expensive and vague, so a single tiny instance of
+    the real class is built on meta and pushed through the very same rule that
+    will later rebuild the real tables.
+
+    Nothing here is a weight: it is 5000x8 floats, built and discarded.
+    """
+    from funasr.models.transformer import embedding as funasr_embedding
+
+    rules = _meta_rebuild_rules(torch)
+    rule = next(
+        entry
+        for entry in rules
+        if entry[0][0] is funasr_embedding.PositionalEncoding and entry[0][1] == "pe"
+    )
+    d_model = 8
+    try:
+        with torch.device("meta"):
+            probe = funasr_embedding.PositionalEncoding(d_model, 0.0)
+    except Exception as error:  # noqa: BLE001 - reported, never swallowed
+        raise AlignmentError(
+            "the source PositionalEncoding cannot be constructed on the meta device "
+            f"({type(error).__name__}: {error}); rebuild with --reference-init cpu and "
+            "accept a full random copy in RSS, or extend the model construction itself"
+        ) from error
+    if not isinstance(probe.pe, torch.Tensor) or not probe.pe.is_meta:
+        raise AlignmentError(
+            "the meta probe produced no positional table, so the reconstruction rules "
+            "would have nothing to match; refusing to continue on that assumption"
+        )
+    rows = int(probe.pe.shape[1])
+    if rows > MAX_RECONSTRUCTED_ROWS:
+        raise AlignmentError(
+            f"the source positional table needs {rows} rows, above the bounded "
+            f"{MAX_RECONSTRUCTED_ROWS}"
+        )
+    rebuilt = rule[2](probe, probe.pe, torch)
+    if not isinstance(rebuilt, torch.Tensor) or rebuilt.is_meta:
+        raise AlignmentError(
+            "the positional table could not be rebuilt on a real device from a meta "
+            "tensor, so a real model would keep an uninitialised tensor"
+        )
+    if tuple(rebuilt.shape) != (1, rows, d_model) or not bool(torch.isfinite(rebuilt).all()):
+        raise AlignmentError(
+            f"the rebuilt positional table is unusable (shape={tuple(rebuilt.shape)}); "
+            "refusing to load a model that would attend to uninitialised positions"
+        )
+    return {
+        "class": funasr_embedding.PositionalEncoding.__name__,
+        "rows": rows,
+        "d_model_probe": d_model,
+        "rebuild": rule[1],
+        "shape": [int(size) for size in rebuilt.shape],
+    }
+
+
+def _load_reference_weights(
+    model: Any, state: dict[str, Any], *, torch: Any, device: str = "meta"
+) -> dict[str, Any]:
+    """Bind official weights into ``model``; return how that was done.
+
+    Names are compared in both directions and every shape is checked before a
+    single value is bound, so a renamed head, a dropped head or a re-ordered
+    weight is a failure rather than a silently missing parameter.
+    """
+    model_shapes = _reference_parameter_shapes(model)
+    checkpoint_shapes = {
+        str(name): tuple(int(size) for size in tensor.shape) for name, tensor in state.items()
+    }
+    inventory = inventory_report(
+        model_shapes,
+        checkpoint_shapes,
+        label="reference",
+        model_shapes=model_shapes,
+        checkpoint_shapes=checkpoint_shapes,
+    )
+    if inventory["missing"] or inventory["unexpected"]:
+        raise AlignmentError(
+            f"reference key inventory mismatch: missing={inventory['missing']} "
+            f"unexpected={inventory['unexpected']}"
+        )
+    if inventory["shape_mismatch"]:
+        raise AlignmentError(
+            f"reference shape mismatch for {len(inventory['shape_mismatch'])} keys: "
+            f"{inventory['shape_mismatch'][:5]}"
+        )
+    inexact = sorted(
+        name
+        for name, tensor in state.items()
+        if tensor.is_floating_point() and tensor.dtype != torch.float32
+    )
+    if inexact:
+        raise AlignmentError(
+            f"{len(inexact)} checkpoint tensors are not float32 (for example "
+            f"{inexact[:5]}); convert explicitly instead of letting each backend "
+            "pick a precision and comparing the difference as if it were a port bug"
+        )
+    if device == "meta":
+        # The only way a meta parameter receives data: the values are bound in
+        # place, so no tensor is allocated and nothing is copied. Torch still
+        # validates shapes here; the checks above are why this does not depend on
+        # that staying true.
+        model.load_state_dict(state, strict=True, assign=True)
+    else:
+        model.load_state_dict(state, strict=True)
+    model.requires_grad_(False)
+
+    pending = _meta_leftovers(model, torch, kinds=("buffer", "attribute"))
+    rebuilt = _rebuild_meta_tensors(model, torch) if device == "meta" else []
+    leftovers = _meta_leftovers(model, torch)
+    if leftovers:
+        raise AlignmentError(
+            f"{len(leftovers)} tensors are still on the meta device after loading, "
+            f"so the model is not fully initialised: {leftovers[:5]}"
+        )
+    return {
+        "device": device,
+        "assignment": "assign=True" if device == "meta" else "copy_",
+        "dtype": "float32",
+        "keys_checked": len(model_shapes),
+        "shapes_checked": len(checkpoint_shapes),
+        "meta_non_parameters_before": pending,
+        "rebuilt_non_parameters": rebuilt,
+        "meta_after": leftovers,
+        "inventory": inventory,
+    }
+
+
 def _deep_update(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
     """Recursive dict merge, matching FunASR's ``deep_update`` semantics."""
     for key, value in source.items():
@@ -622,43 +1106,68 @@ def run_reference(spec: dict[str, Any], output_root: str | Path | None = None) -
     import torch
 
     variant = spec["variant"]
+    reference_init = (spec.get("reference") or {}).get("init", DEFAULT_REFERENCE_INIT)
+    if reference_init not in REFERENCE_INIT_DEVICES:
+        raise AlignmentError(
+            f"unknown reference init device {reference_init!r}; expected one of "
+            f"{REFERENCE_INIT_DEVICES}"
+        )
     output_root = Path(output_root or spec["output_root"]) / "reference"
     output_root.mkdir(parents=True, exist_ok=True)
 
     if variant["family"] == "whisper":
+        if spec.get("inputs"):
+            raise AlignmentError(
+                "whisper-tiny has a loadable canonical reference and a checked key "
+                "inventory, but this adapter has no per-sample stage pipeline for it; "
+                "the families that can be aligned end to end are paraformer-zh and "
+                "sensevoice-small. Refusing rather than emitting an empty run that "
+                "reads like a pass."
+            )
+        # Canonical Whisper is a separate AST-loaded definition set with its own
+        # state_dict; it is loaded on CPU (no meta path) and that is recorded.
         model, extras = _build_canonical_whisper(variant)
-        frontend, loader = None, model.load_state_dict
-        assets = {"init_param": variant["checkpoint"], "cmvn_file": None}
+        frontend, tokenizer = None, None
+        loading = _load_reference_weights(
+            model,
+            _load_checkpoint_state(Path(variant["checkpoint"])),
+            torch=torch,
+            device="cpu",
+        )
+        loading["mode"] = "canonical AST-loaded Whisper state_dict"
     else:
         assets = resolve_asset_paths(variant["config"])
         # configuration.json is authoritative for the weights filename too.
         variant = {**variant, "checkpoint": assets["init_param"] or variant["checkpoint"]}
-        model, extras, frontend = _build_funasr_reference(variant, assets)
-        loader = model.load_state_dict
-
-    state = _load_checkpoint_state(Path(variant["checkpoint"]))
-    inventory = inventory_report(model.state_dict().keys(), state.keys(), label="reference")
-    if inventory["verdict"] != "ok":
-        raise AlignmentError(
-            f"reference key inventory mismatch: missing={inventory['missing']} "
-            f"unexpected={inventory['unexpected']}"
+        model, extras, frontend, tokenizer = _build_funasr_reference(
+            variant, assets, torch, reference_init
         )
-    loader(state, strict=True)
-    model = model.float().eval()
+        loading = _load_reference_weights(
+            model,
+            _load_checkpoint_state(Path(variant["checkpoint"])),
+            torch=torch,
+            device=reference_init,
+        )
+        loading["mode"] = "funasr real constructor"
+
+    inventory = loading["inventory"]
+    model.eval()
+    extras["loading"] = {k: v for k, v in loading.items() if k != "inventory"}
 
     samples = [
-        _run_reference_sample(model, frontend, variant, item, output_root, torch)
+        _run_reference_sample(model, frontend, variant, item, output_root, torch, tokenizer)
         for item in spec["inputs"]
     ]
 
     metadata = {
-        "schema": "funasr-mlx-alignment-run/2",
+        "schema": "funasr-mlx-alignment-run/3",
         "backend": "reference",
         "variant": variant,
         "dtype": "float32",
         "frontend_config": variant["frontend"],
         "cmvn": variant["cmvn"],
         "inventory": inventory,
+        "loading": loading,
         "extras": extras,
         "samples": samples,
         "torch_version": torch.__version__,
@@ -669,8 +1178,8 @@ def run_reference(spec: dict[str, Any], output_root: str | Path | None = None) -
 
 
 def _build_funasr_reference(
-    variant: dict[str, Any], assets: dict[str, Any]
-) -> tuple[Any, Any, dict[str, Any]]:
+    variant: dict[str, Any], assets: dict[str, Any], torch: Any, init_device: str = "meta"
+) -> tuple[Any, Any, Any, Any]:
     """Construct the real FunASR model exactly as ``AutoModel`` does.
 
     Order matters and follows ``auto_model.py:755-781``: the tokenizer supplies
@@ -678,7 +1187,13 @@ def _build_funasr_reference(
     ``output_size()``, and only then is the model constructed from
     ``build_model_conf``. Both of those values are DERIVED, not configured --
     the official config.yaml contains neither, so omitting either silently builds
-    a model with the wrong widths.
+    a model with the wrong widths (and the strict shape check then rejects the
+    checkpoint rather than loading it).
+
+    ``init_device="meta"`` wraps only the model construction: no weight storage
+    is allocated, and the official values are bound afterwards by
+    :func:`_load_reference_weights`. The frontend is deliberately built outside
+    that context -- it is real computation, not parameters.
     """
     import importlib
 
@@ -689,14 +1204,34 @@ def _build_funasr_reference(
 
     config = yaml.safe_load(Path(variant["config"]).read_text())
     frontend = _build_reference_frontend(config, assets)
-    vocab_size = _reference_vocab_size(config, assets)
+    vocab_size, tokenizer = _reference_vocab_size(config, assets)
 
     model_conf = build_model_conf(config)
     model_conf["input_size"] = int(frontend.output_size())
     model_conf["vocab_size"] = int(vocab_size["size"])
 
     module = importlib.import_module(variant["reference_import"])
-    model = getattr(module, variant["reference_class"])(**model_conf)
+    model_class = getattr(module, variant["reference_class"])
+    probe = _probe_meta_positional_encoding(torch) if init_device == "meta" else None
+    if init_device == "meta":
+        try:
+            with torch.device("meta"):
+                model = model_class(**model_conf)
+        except Exception as error:  # noqa: BLE001 - reported, never swallowed
+            # No silent fallback: a source constructor that cannot run without
+            # real storage is a fact the operator needs, and 'cpu' is an explicit
+            # opt-in with a known memory cost rather than a hidden default.
+            raise AlignmentError(
+                f"{variant['reference_class']} could not be constructed on the meta "
+                f"device ({type(error).__name__}: {error}). Either that source "
+                "constructor genuinely needs real storage -- in which case rebuild "
+                "with --reference-init cpu and accept a full random copy in RSS -- or "
+                "its non-parameter construction needs a bounded source-defined "
+                "reconstruction rule, which belongs in _meta_rebuild_rules. Refusing "
+                "to guess which."
+            ) from error
+    else:
+        model = model_class(**model_conf)
 
     extras: dict[str, Any] = {
         "model_conf_keys": sorted(model_conf),
@@ -707,6 +1242,8 @@ def _build_funasr_reference(
         "encoder_name": config.get("encoder"),
         "decoder_name": config.get("decoder"),
         "predictor_name": config.get("predictor"),
+        "init_device": init_device,
+        "meta_positional_probe": probe,
     }
     # Conditioning id tables must be recorded, not assumed: they decide what the
     # model actually consumed and are impossible to infer from a tensor shape.
@@ -716,7 +1253,7 @@ def _build_funasr_reference(
             extras[attribute] = {str(k): int(v) for k, v in table.items()}
     extras["ctc_weight"] = float(getattr(model, "ctc_weight", 0.0) or 0.0)
     extras["has_ctc_head"] = getattr(model, "ctc", None) is not None
-    return model, extras, frontend
+    return model, extras, frontend, tokenizer
 
 
 def _build_reference_frontend(config: dict[str, Any], assets: dict[str, Any]) -> Any:
@@ -732,11 +1269,16 @@ def _build_reference_frontend(config: dict[str, Any], assets: dict[str, Any]) ->
     return frontend_class(cmvn_file=assets.get("cmvn_file"), **frontend_conf)
 
 
-def _reference_vocab_size(config: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
+def _reference_vocab_size(
+    config: dict[str, Any], assets: dict[str, Any]
+) -> tuple[dict[str, Any], Any]:
     """Derive ``vocab_size`` from the official tokenizer, and record its order.
 
     Token ids are only comparable between backends once the vocabulary ORDER is
     pinned, so the id list is fingerprinted here rather than assumed to match.
+    The tokenizer instance is returned as well: the reference can decode the ids
+    it produced, which is provenance the native side cannot produce (it has no
+    tokenizer) and therefore is recorded rather than compared.
     """
     import importlib
     import json as _json
@@ -748,13 +1290,16 @@ def _reference_vocab_size(config: dict[str, Any], assets: dict[str, Any]) -> dic
 
     if tokenizer_name == "CharTokenizer" and token_list_path:
         tokens = _json.loads(Path(token_list_path).read_text())
-        return {
-            "class": tokenizer_name,
-            "size": len(tokens),
-            "token_list": token_list_path,
-            "head": [str(t) for t in tokens[:8]],
-            "first_ids": list(range(min(8, len(tokens)))),
-        }
+        return (
+            {
+                "class": tokenizer_name,
+                "size": len(tokens),
+                "token_list": token_list_path,
+                "head": [str(t) for t in tokens[:8]],
+                "first_ids": list(range(min(8, len(tokens)))),
+            },
+            None,
+        )
 
     for module_path, attribute in (
         ("funasr.tokenizer.sentencepiece_tokenizer", "SentencepiecesTokenizer"),
@@ -777,12 +1322,15 @@ def _reference_vocab_size(config: dict[str, Any], assets: dict[str, Any]) -> dic
                 f"{tokenizer_name} exposes no vocab_size; refusing to guess the "
                 "vocabulary size the checkpoint was trained with"
             )
-        return {
-            "class": attribute,
-            "size": int(size),
-            "bpemodel": bpemodel,
-            "module": module_path,
-        }
+        return (
+            {
+                "class": attribute,
+                "size": int(size),
+                "bpemodel": bpemodel,
+                "module": module_path,
+            },
+            tokenizer,
+        )
 
     raise AlignmentError(
         f"cannot derive vocab_size for tokenizer {tokenizer_name!r}; the constructor "
@@ -811,6 +1359,74 @@ def _resolve_wav_frontend() -> Any:
     )
 
 
+def _reject_overlength(key: str, samples: int, variant: dict[str, Any]) -> None:
+    """Refuse audio longer than the variant bound, measured rather than declared.
+
+    ``build_alignment_spec`` bounds what the manifest *claims*; this re-checks
+    the array that was actually decoded. A manifest that lies must fail here
+    rather than be truncated by one frontend and not the other, because only one
+    side truncating invalidates the whole comparison while still producing
+    numbers that look plausible.
+    """
+    seconds = samples / float(SAMPLE_RATE)
+    if seconds > float(variant["max_seconds"]):
+        raise AlignmentError(
+            f"{key}: audio is {seconds:.2f}s, above the {variant['max_seconds']:.2f}s "
+            f"bound of {variant['key']}; refused rather than truncated"
+        )
+
+
+def _paraformer_greedy_ids(model: Any, decoder_out: Any, token_length: Any) -> list[int]:
+    """``Paraformer.inference``'s greedy token path, without beam search.
+
+    ``model.py:632-664``: the argmax is taken over the first
+    ``pre_token_length[i]`` columns of the log-softmax, then ``sos``/``eos``/
+    ``blank_id`` are dropped. The same three ids the native port drops, because
+    otherwise the two sides would report different id lists for identical
+    posteriors.
+    """
+    dropped = {int(model.eos), int(model.sos), int(model.blank_id)}
+    limit = min(int(token_length[0]), int(decoder_out.shape[1]))
+    row = [int(v) for v in decoder_out[0, :limit].argmax(dim=-1).tolist()]
+    return [value for value in row if value not in dropped]
+
+
+def _ctc_greedy_ids(logits_row: Any, length: int, blank_id: int) -> list[int]:
+    """``SenseVoiceSmall.inference``'s CTC greedy path.
+
+    ``model.py:1013-1021``: argmax over the valid frames, then
+    ``unique_consecutive``, then blanks removed. Order matters -- collapsing
+    duplicates BEFORE removing blanks turns ``[a, blank, a]`` into ``[a, a]``.
+    """
+    ids = [int(v) for v in logits_row[:length].argmax(dim=-1).tolist()]
+    collapsed: list[int] = []
+    previous: int | None = None
+    for value in ids:
+        if value != previous:
+            collapsed.append(value)
+            previous = value
+    return [value for value in collapsed if value != blank_id]
+
+
+def _reference_text(tokenizer: Any, token_ids: Sequence[int], family: str) -> str | None:
+    """Decode the ids the reference produced, when its own tokenizer can.
+
+    Recorded as provenance only. The native port ships no tokenizer, so this is
+    never compared: inventing a text decoder to make the two sides look
+    comparable would defeat the purpose of comparing ids.
+    """
+    if tokenizer is None:
+        return None
+    try:
+        if hasattr(tokenizer, "decode"):
+            return str(tokenizer.decode(list(token_ids)))
+        if family == "paraformer" and hasattr(tokenizer, "ids2tokens"):
+            return " ".join(str(token) for token in tokenizer.ids2tokens(list(token_ids)))
+    except Exception as error:  # noqa: BLE001 - provenance must never fail a run
+        return f"<decode failed: {type(error).__name__}>"
+    return None
+
+
 def _run_reference_sample(
     model: Any,
     frontend: Any,
@@ -818,10 +1434,12 @@ def _run_reference_sample(
     item: dict[str, Any],
     output_root: Path,
     torch: Any,
+    tokenizer: Any = None,
 ) -> dict[str, Any]:
     import numpy as np
 
     audio = _load_audio(item["audio"])
+    _reject_overlength(item["key"], int(audio.shape[0]), variant)
     with torch.no_grad():
         fbank = frontend(audio)
         fbank = np.asarray(fbank, dtype=np.float32)
@@ -833,20 +1451,26 @@ def _run_reference_sample(
         conditioning: dict[str, Any] = {}
 
         if variant["family"] == "paraformer":
-            encoder_out, encoder_out_lens = model.encoder(speech, lengths)
-            sematic_embeds, token_length, _, _ = model.calc_predictor(encoder_out, encoder_out_lens)
-            ys_pad_lens = token_length
-            # The published model is ctc_weight=0, so self.ctc may not exist. The
-            # decoder log-softmax is the real final logits.
-            decoder_out, ys_pad_lens = model.cal_decoder_with_predictor(
-                encoder_out, encoder_out_lens, sematic_embeds, ys_pad_lens
+            encoder_out, encoder_out_lens = model.encode(speech, lengths)
+            if isinstance(encoder_out, tuple):
+                encoder_out = encoder_out[0]
+            sematic_embeds, pre_token_length, _, _ = model.calc_predictor(
+                encoder_out, encoder_out_lens
+            )
+            # ``inference`` rounds and casts the token length BEFORE the decoder
+            # and before slicing the argmax (model.py:617-620); the native port
+            # rounds the same value, so an unrounded one would desynchronise the
+            # two sides by a whole column.
+            token_length = pre_token_length.round().long()
+            decoder_out, _ = model.cal_decoder_with_predictor(
+                encoder_out, encoder_out_lens, sematic_embeds, token_length
             )
             finals = {
                 "encoder": encoder_out,
                 "pre_decoder": sematic_embeds,
                 "final_logits": decoder_out,
             }
-            token_ids = [int(v) for v in decoder_out[0].argmax(dim=-1)[: int(ys_pad_lens[0])]]
+            token_ids = _paraformer_greedy_ids(model, decoder_out, token_length)
         elif variant["family"] == "sensevoice":
             speech, lengths, conditioning = _apply_sensevoice_conditioning(
                 model, speech, lengths, torch
@@ -860,7 +1484,9 @@ def _run_reference_sample(
                 "pre_decoder": encoder_out,
                 "final_logits": ctc_logits,
             }
-            token_ids = [int(v) for v in ctc_logits[0].argmax(dim=-1)]
+            token_ids = _ctc_greedy_ids(
+                ctc_logits[0], int(encoder_out_lens[0]), int(model.blank_id)
+            )
         else:  # pragma: no cover - dispatched earlier
             raise AlignmentError(f"reference path for {variant['family']} is not wired")
 
@@ -877,9 +1503,16 @@ def _run_reference_sample(
         "key": item["key"],
         "audio": item["audio"],
         "duration_seconds": item["duration_seconds"],
+        # Measured, not declared: the manifest's own claim is compared against
+        # these, and a frontend that silently truncates shows up as a frame
+        # disagreement rather than as a mysterious numeric difference.
+        "audio_samples": int(audio.shape[0]),
+        "audio_seconds": round(int(audio.shape[0]) / float(SAMPLE_RATE), 6),
+        "fbank_frames": int(fbank.shape[0]),
         "stages": stages,
         "token_ids": token_ids,
-        "conditioning_ids": conditioning,
+        "conditioning_ids": conditioning or None,
+        "text": _reference_text(tokenizer, token_ids or [], variant["family"]),
     }
 
 
@@ -890,11 +1523,15 @@ def _apply_sensevoice_conditioning(
 
     The conditioning is a fixed id sequence built from ``lid_dict`` and
     ``textnorm_dict`` plus the hard-coded event/emotion pair ``[1, 2]``. It is
-    1 + 1 + 3 = 5 frames of prefix, and the lengths must grow to match or the
-    encoder masks real audio away.
+    1 (textnorm) + 3 (language + event + emo) = 4 frames of prefix, and the
+    lengths must grow to match or the encoder masks real audio away. The
+    resulting id ORDER is
+    ``[language, event, emo, textnorm, audio...]``, which is the same sequence
+    the native port builds as one embedded row; the ids are recorded so a
+    disagreement is visible rather than buried in a tensor shape.
     """
-    language = "auto"
-    textnorm = "woitn"
+    language = SENSEVOICE_LANGUAGE
+    textnorm = "withitn" if SENSEVOICE_USE_ITN else "woitn"
     lid = int(getattr(model, "lid_dict", {}).get(language, 0))
     norm = int(getattr(model, "textnorm_dict", {}).get(textnorm, 0))
     event_emo = [1, 2]
@@ -1013,28 +1650,84 @@ def _build_canonical_whisper(variant: dict[str, Any]) -> tuple[Any, dict[str, An
 # Native backend (MLX). Imports no Torch at module scope.
 # --------------------------------------------------------------------------- #
 def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> dict[str, Any]:
-    """Run the native MLX port with its own frontend and the same config."""
-    import mlx.core as mx
-    from mlx.utils import tree_flatten
+    """Run the native MLX port from the CONVERTED artefact, through the loader.
 
-    import funasr_mlx
+    Deliberately not through Torch. The native process reads only the
+    safetensors the converter produced, via ``funasr_mlx.pipeline.load_model``,
+    so the path being validated is the one the product ships -- its
+    prevalidation, its bounded shard loop, its strict key and shape checks --
+    rather than a second reader inside this tool that could quietly disagree with
+    it.
+    Must run inside the memory guard; the loader itself also enforces that, and
+    this wrapper says so in terms an operator can act on.
+    """
+    import mlx.core as mx
+
+    from funasr_mlx import pipeline
+    from funasr_mlx.checkpoints import checkpoint_files, safetensor_header
     from funasr_mlx.frontend import FbankConfig, WavFrontend
+    from funasr_mlx.memory import guarded_child_active
+    from funasr_mlx.models.sanm import flatten_state_dict
+
+    if not guarded_child_active():
+        raise AlignmentError(
+            "the native backend must run inside the memory guard: "
+            "python -m funasr_mlx.runtime -- <repo>/tools/alignment_asr.py run "
+            "--backend native --spec <spec.json> --output-root <dir>"
+        )
 
     variant = spec["variant"]
+    native_checkpoint = variant.get("native_checkpoint")
+    if not native_checkpoint:
+        raise AlignmentError(
+            f"{variant['key']} has no converted native checkpoint; build the spec with "
+            "--native-checkpoint <safetensors path|dir>, produced by "
+            f"funasr_mlx.checkpoints.convert_checkpoint(..., model={variant['family']!r}, "
+            "dtype='float32') in a guarded child"
+        )
+    if variant["family"] == "whisper" and spec.get("inputs"):
+        raise AlignmentError(
+            "whisper-tiny has no native per-sample stage pipeline in this adapter; "
+            "the families that can be aligned end to end are paraformer-zh and "
+            "sensevoice-small"
+        )
     output_root = Path(output_root or spec["output_root"]) / "native"
     output_root.mkdir(parents=True, exist_ok=True)
 
-    model = _build_native_model(variant, funasr_mlx)
-    state = _load_checkpoint_state(Path(variant["checkpoint"]))
-    expected = dict(tree_flatten(model.parameters()))
-    inventory = inventory_report(expected.keys(), state.keys(), label="native")
+    model, _ = pipeline.load_model(
+        native_checkpoint, family=variant["family"], config=variant["config"]
+    )
+
+    parameters = flatten_state_dict(model)
+    # Read the headers once, through the loader's own reader, so the reported
+    # inventory describes exactly the files that were loaded.
+    headers: dict[str, Any] = {}
+    for path in checkpoint_files(native_checkpoint):
+        header = safetensor_header(path)
+        header.pop("__metadata__", None)
+        headers.update(header)
+    inventory = inventory_report(
+        parameters,
+        headers,
+        label="native",
+        model_shapes={name: tuple(int(s) for s in a.shape) for name, a in parameters.items()},
+        checkpoint_shapes={
+            name: tuple(int(size) for size in entry["shape"]) for name, entry in headers.items()
+        },
+    )
     if inventory["verdict"] != "ok":
         raise AlignmentError(
             f"native key inventory mismatch: missing={inventory['missing']} "
-            f"unexpected={inventory['unexpected']}"
+            f"unexpected={inventory['unexpected']} shapes={len(inventory['shape_mismatch'])}"
         )
-    funasr_mlx.models.sanm.load_strict(model, state, convert=True, dtype=mx.float32)
-    mx.eval(model.parameters())
+    inexact = sorted(name for name, array in parameters.items() if str(array.dtype) != "float32")
+    if inexact:
+        raise AlignmentError(
+            f"{len(inexact)} native parameters are not float32 (for example {inexact[:5]}); "
+            "reconvert with dtype='float32' rather than comparing a float16 run against a "
+            "float32 reference and reading the difference as a port defect"
+        )
+    mx.eval(parameters)
 
     frontend = WavFrontend(_native_frontend_config(variant, FbankConfig), cmvn=variant["cmvn"])
     samples = [
@@ -1043,13 +1736,21 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
     ]
 
     metadata = {
-        "schema": "funasr-mlx-alignment-run/2",
+        "schema": "funasr-mlx-alignment-run/3",
         "backend": "native",
         "variant": variant,
         "dtype": "float32",
         "frontend_config": variant["frontend"],
         "cmvn": variant["cmvn"],
         "inventory": inventory,
+        "loading": {
+            "loader": "funasr_mlx.pipeline.load_model",
+            "device": str(mx.default_device()),
+            "dtype": "float32",
+            "keys_checked": inventory["model_key_count"],
+            "source_checkpoint": str(variant["checkpoint"]),
+            "native_checkpoint": str(native_checkpoint),
+        },
         "samples": samples,
         "default_device": str(mx.default_device()),
     }
@@ -1067,28 +1768,48 @@ def _native_frontend_config(variant: dict[str, Any], config_class: Any) -> Any:
     return config_class(**kwargs)
 
 
-def _build_native_model(variant: dict[str, Any], funasr_mlx: Any) -> Any:
-    import yaml
+def _native_conditioning_ids(language: str, use_itn: bool, text_norm: str | None) -> dict[str, Any]:
+    """The ids the native prefix actually embeds, read from the port's tables.
 
-    family = variant["family"]
-    if family == "paraformer":
-        from funasr_mlx.models import paraformer as module
-    elif family == "sensevoice":
-        from funasr_mlx.models import sensevoice as module
-    elif family == "whisper":
-        from funasr_mlx.models import whisper as module
-    else:  # pragma: no cover
-        raise AlignmentError(f"native path for {family} is not wired")
-
-    path = Path(variant["config"])
-    raw = (
-        json.loads(path.read_text()) if path.suffix == ".json" else yaml.safe_load(path.read_text())
+    Recorded rather than hard-coded so that a change to either vocabulary table
+    shows up as a conditioning disagreement in the diff instead of hiding inside
+    a prefix tensor nobody compares.
+    """
+    from funasr_mlx.models.sensevoice import (
+        EMO_ID,
+        EVENT_ID,
+        LID_DICT,
+        NUM_PREFIX_FRAMES,
+        TEXTNORM_DICT,
     )
-    if family == "paraformer":
-        return module.Paraformer(config=module.paraformer_config_from_dict(raw))
-    if family == "sensevoice":
-        return module.SenseVoiceSmall(module.sensevoice_config_from_dict(raw))
-    return module.Whisper(module.whisper_config_from_dict(raw).dims)
+
+    resolved = text_norm or ("withitn" if use_itn else "woitn")
+    return {
+        "language": language,
+        "language_id": int(LID_DICT.get(language, 0)),
+        "textnorm": resolved,
+        "textnorm_id": int(TEXTNORM_DICT.get(resolved, TEXTNORM_DICT["woitn"])),
+        "event_emo_ids": [int(EVENT_ID), int(EMO_ID)],
+        "prefix_frames": int(NUM_PREFIX_FRAMES),
+    }
+
+
+def _native_paraformer_token_ids(model: Any, outputs: Any) -> list[int]:
+    """``Paraformer.greedy_decode``'s token selection, without a second forward.
+
+    ``greedy_decode`` is the public entry point, but it recomputes the whole
+    encoder; the alignment run already holds exactly the activations it would
+    recompute, so the same helper it calls is used directly instead of paying
+    for a duplicate encoder pass over a full model. A rename surfaces loudly
+    here rather than silently changing the reported tokens.
+    """
+    helper = getattr(model, "_greedy_from_outputs", None)
+    if helper is None:
+        raise AlignmentError(
+            "Paraformer no longer exposes _greedy_from_outputs; refusing to hand-roll "
+            "token selection, because a second decode path is a second thing to be wrong"
+        )
+    return helper(outputs)[0]
 
 
 def _run_native_sample(
@@ -1102,6 +1823,7 @@ def _run_native_sample(
     import numpy as np
 
     audio = _load_audio(item["audio"])
+    _reject_overlength(item["key"], int(audio.shape[0]), variant)
     fbank = np.asarray(frontend(audio), dtype=np.float32)
     speech = mx.array(fbank)[None, :, :]
     lengths = mx.array([fbank.shape[0]], dtype=mx.int32)
@@ -1110,21 +1832,40 @@ def _run_native_sample(
     saved: dict[str, Any] = {"frontend": fbank}
     finals: dict[str, Any] = {}
     token_ids: list[int] | None = None
+    conditioning: dict[str, Any] | None = None
 
     if variant["family"] == "paraformer":
         outputs = model.forward(speech, lengths)
+        if outputs.decoder_out is None:
+            raise AlignmentError(
+                "the native paraformer produced no decoder output; the published "
+                "checkpoint has ctc_weight=0 and a decoder, so this means the config "
+                "was not applied -- refusing to substitute the CIF embeddings for logits"
+            )
         finals = {
             "encoder": outputs.encoder_out,
+            # The CIF acoustic embedding IS the decoder input, so it is exported
+            # under this name rather than being regenerated by a second call.
             "pre_decoder": outputs.acoustic_embeds,
-            "final_logits": outputs.acoustic_embeds,
+            "final_logits": outputs.decoder_out,
         }
+        token_ids = _native_paraformer_token_ids(model, outputs)
     elif variant["family"] == "sensevoice":
-        encoder_out, _ = model.encode(
-            speech, lengths, language="auto", use_itn=False, ban_emo_unk=False
+        from funasr_mlx.models.sensevoice import ctc_greedy_decode
+
+        # One encoder pass: `forward_logits` is `encode` + this same CTC head, so
+        # calling both would run a 50-layer encoder twice for no new information.
+        encoder_out, encoder_out_lens = model.encode(
+            speech,
+            lengths,
+            language=SENSEVOICE_LANGUAGE,
+            use_itn=SENSEVOICE_USE_ITN,
+            text_norm=None,
         )
-        logits = model(speech, lengths, language="auto", use_itn=False, ban_emo_unk=False)
+        logits = model.ctc.log_softmax(encoder_out)
         finals = {"encoder": encoder_out, "pre_decoder": encoder_out, "final_logits": logits}
-        token_ids = [int(v) for v in np.asarray(logits[0]).argmax(axis=-1)]
+        token_ids = ctc_greedy_decode(logits, encoder_out_lens, model.blank_id)[0]
+        conditioning = _native_conditioning_ids(SENSEVOICE_LANGUAGE, SENSEVOICE_USE_ITN, None)
     else:  # pragma: no cover
         raise AlignmentError(f"native path for {variant['family']} is not wired")
 
@@ -1139,9 +1880,15 @@ def _run_native_sample(
         "key": item["key"],
         "audio": item["audio"],
         "duration_seconds": item["duration_seconds"],
+        "audio_samples": int(audio.shape[0]),
+        "audio_seconds": round(int(audio.shape[0]) / float(SAMPLE_RATE), 6),
+        "fbank_frames": int(fbank.shape[0]),
         "stages": stages,
         "token_ids": token_ids,
-        "conditioning_ids": None,
+        "conditioning_ids": conditioning,
+        # The native port ships no tokenizer; the reference's text is provenance
+        # and is never compared, so the field is explicitly absent here.
+        "text": None,
     }
 
 
@@ -1161,7 +1908,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     build_parser.add_argument("--output-root", required=True)
     build_parser.add_argument("--assets-root", default=str(DEFAULT_ASSETS_ROOT))
     build_parser.add_argument("--max-samples", type=int, default=8)
-    build_parser.add_argument("--cmvn-name", default="am.mvn")
+    build_parser.add_argument(
+        "--native-checkpoint",
+        default=None,
+        help="converted safetensors file or directory the native run will load",
+    )
+    build_parser.add_argument(
+        "--reference-init",
+        default=DEFAULT_REFERENCE_INIT,
+        choices=REFERENCE_INIT_DEVICES,
+        help="'meta' allocates no reference weights; 'cpu' opts into a full random copy",
+    )
     build_parser.set_defaults(command="build")
 
     run_parser = subparsers.add_parser("run")
@@ -1181,6 +1938,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "list":
         for variant in SUPPORTED:
             print(f"aligned    {variant.key:22s} {variant.checkpoint:38s} {variant.notes}")
+            print(
+                f"          native artefact: convert it with "
+                f"funasr_mlx.checkpoints.convert_checkpoint(source=<assets>/"
+                f"{variant.checkpoint}, destination=<dir>, model={variant.family!r}, "
+                "dtype='float32') inside a guarded child, then pass the result to "
+                "build --native-checkpoint"
+            )
         for key, reason in sorted(UNSUPPORTED.items()):
             print(f"refused    {key:22s} {reason}")
         return 0
@@ -1192,7 +1956,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.output_root,
             assets_root=args.assets_root,
             max_samples=args.max_samples,
-            cmvn_name=args.cmvn_name,
+            native_checkpoint=args.native_checkpoint,
+            reference_init=args.reference_init,
         )
         destination = Path(args.output_root) / "spec.json"
         _write_metadata(destination, spec)
