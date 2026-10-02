@@ -332,7 +332,10 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
             _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
             tensors[name] = value
-            rules[name] = _module_layout_rule(module)
+            # Only the kernel needs a transpose.  The rule follows the OWNING
+            # module, so a conv's 1-D ``bias`` would inherit it and then be
+            # transposed with three axes; the bias is IDENTITY in both layouts.
+            rules[name] = _module_layout_rule(module) if key == "weight" else IDENTITY_LAYOUT
         elif isinstance(value, Mapping):
             # A plain dict of tensors stored directly on a Module.
             for sub_key, sub_value in value.items():

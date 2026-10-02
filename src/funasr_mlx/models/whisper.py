@@ -237,7 +237,7 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
             if name in NON_PERSISTENT_BUFFERS:
                 continue
             tensors[name] = value
-            rules[name] = _rule_for(module)
+            rules[name] = _rule_for(module) if key == "weight" else IDENTITY_LAYOUT
 
 
 @dataclass

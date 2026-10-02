@@ -18,6 +18,7 @@ from mlx import nn as mxnn  # noqa: E402
 
 from funasr_mlx.models.whisper import (  # noqa: E402
     CONV1D_LAYOUT,
+    IDENTITY_LAYOUT,
     AudioEncoder,
     CheckpointKeyError,
     GreedyDecodeConfig,
@@ -29,6 +30,7 @@ from funasr_mlx.models.whisper import (  # noqa: E402
     convert_checkpoint_tensor,
     detect_language,
     flatten_state_dict,
+    flatten_state_dict_with_rules,
     greedy_decode,
     load_strict,
     log_mel_spectrogram,
@@ -117,6 +119,23 @@ def test_decoder_causal_mask_is_lower_triangular_neg_inf():
     # The mask is NOT a checkpoint parameter: torch registers it persistent=False.
     assert "decoder.mask" not in flatten_state_dict(decoder)
     assert "decoder._mask" not in flatten_state_dict(decoder)
+
+
+def test_no_one_dimensional_tensor_carries_a_conv_layout_rule():
+    """Invariant: only kernels may carry a conv rule.
+
+    ``_rule_for`` keys off the *owning module*, so a conv's 1-D bias inherited
+    the kernel rule and was then transposed with three axes -- a hard ValueError
+    on every conv that has one, which is every conv in the published encoder
+    (``nn.Conv1d`` defaults to ``bias=True``).
+    """
+    report = flatten_state_dict_with_rules(_whisper())
+    biases = [
+        name
+        for name, tensor in report.tensors.items()
+        if name.endswith("bias") and report.rules[name] != IDENTITY_LAYOUT
+    ]
+    assert biases == [], f"conv biases must be IDENTITY, got {biases}"
 
 
 def test_load_strict_round_trips_and_rejects_mismatch():

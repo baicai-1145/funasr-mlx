@@ -86,6 +86,22 @@ def test_flatten_state_dict_reads_the_mapping_storage_not_dunder_dict():
     assert "xvector.dense.linear.weight" in state
 
 
+def test_no_one_dimensional_tensor_carries_a_conv_layout_rule():
+    """Invariant: only kernels may carry a conv rule.
+
+    ``_conv_rule`` keys off the *owning module*, so a conv's 1-D bias inherited
+    the kernel rule and was then transposed with three axes -- a hard ValueError
+    on every conv that has one, and ``mxnn.Conv1d`` defaults to ``bias=True``.
+    """
+    report = flatten_state_dict_with_rules(_campplus())
+    offenders = [
+        name
+        for name, tensor in report.tensors.items()
+        if name.endswith("bias") and report.rules[name] != IDENTITY_LAYOUT
+    ]
+    assert offenders == [], f"conv biases must be IDENTITY, got {offenders}"
+
+
 def test_flatten_state_dict_with_rules_matches_the_layout_report():
     """Both public views must agree exactly; the tuple form drops nothing."""
     model = _campplus()

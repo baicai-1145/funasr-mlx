@@ -464,10 +464,17 @@ def test_cif_v1_boundary_form_matches_the_longhand_expression():
     fires_np = np.asarray(fires)
 
     # The reference takes the cumulative sum in float64 before narrowing.
-    prefix = np.cumsum(alphas_np.astype(np.float64), axis=1)
-    rolled = np.roll(prefix, 1, axis=1)
+    # Two DIFFERENT prefixes are needed: the scalar alphas drive the fire
+    # decisions, while the boundary algebra uses ``prefix_sum_hidden`` -- the
+    # cumulative sum of alphas *weighted by* the hidden features, i.e. a
+    # (B, T, D) vector.  Conflating them makes the expectation a scalar.
+    alpha_prefix = np.cumsum(alphas_np.astype(np.float64), axis=1)
+    prefix_hidden = np.cumsum(
+        alphas_np.astype(np.float64)[..., None] * hidden_np.astype(np.float64), axis=1
+    )
+    rolled = np.roll(alpha_prefix, 1, axis=1)
     rolled[:, 0] = 0.0
-    fire_idxs = (np.floor(prefix) - np.floor(rolled)) > 0
+    fire_idxs = (np.floor(alpha_prefix) - np.floor(rolled)) > 0
     rem = fires_np - np.floor(fires_np)
 
     for row in range(2):
@@ -475,9 +482,9 @@ def test_cif_v1_boundary_form_matches_the_longhand_expression():
         assert times, "fixture must fire"
         for j, t in enumerate(times):
             prev = times[j - 1] if j else None
-            expected = prefix[row, t] - rem[row, t] * hidden_np[row, t]
+            expected = prefix_hidden[row, t] - rem[row, t] * hidden_np[row, t]
             if prev is not None:
-                expected -= prefix[row, prev]
+                expected -= prefix_hidden[row, prev]
                 expected += rem[row, prev] * hidden_np[row, prev]
             np.testing.assert_allclose(
                 got[row, j], expected, rtol=1e-5, atol=1e-6, err_msg=f"row {row} frame {j}"
@@ -586,17 +593,23 @@ def test_cif_v1_repeated_fresh_rows_match_the_reference_formula(seed, b, d):
         alphas_np.astype(np.float64)[..., None] * hidden_np.astype(np.float64), axis=1
     )
 
-    expected = None
+    # The source emits (B, max_label_len, D) with
+    #   max_label_len = round(max_b sum_t alphas[b, t])
+    # and zero-fills every column past that row's own fire count.  Building the
+    # expectation by concatenating all rows' frames loses the batch dimension
+    # entirely, so the row's frames must be written into their own row of a
+    # zero-filled (B, max_label_len, D) array -- the padding comes from the
+    # zeros, which is exactly what the source's `valid` mask produces.
+    label_lens = np.round(alphas_np.astype(np.float64).sum(axis=1)).astype(int)
+    max_label_len = int(label_lens.max())
+    expected = np.zeros((b, max_label_len, d), np.float64)
     for row in range(b):
-        times = list(np.flatnonzero(fire_idxs[row]))
-        row_frames = []
+        times = list(np.flatnonzero(fire_idxs[row]))[:max_label_len]
         previous = np.zeros(d, np.float64)  # boundary[-1] = 0
-        for t in times:
+        for j, t in enumerate(times):
             boundary = prefix[row, t] - rem[row, t] * hidden_np[row, t]
-            row_frames.append(boundary - previous)
+            expected[row, j] = boundary - previous
             previous = boundary
-        expected = row_frames if expected is None else expected + row_frames
-    expected = np.stack(expected, axis=0) if b > 1 else np.array(expected)[None]
 
     hidden = mx.array(hidden_np)
     alphas = mx.array(alphas_np)
@@ -1306,6 +1319,85 @@ def _torch_layout_state(model):
         else:
             torch_state[name] = tensor
     return state, torch_state, rules
+
+
+class _MixedConvHolder(mxnn.Module):
+    """A holder mixing both conv kinds so one module exercises both rules."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = mxnn.Conv1d(3, 5, (3,), bias=True)
+        self.conv2 = mxnn.Conv2d(2, 4, (3, 5), bias=True)  # deliberately non-square
+
+
+def _mixed_conv_holder():
+    """Distinct, non-uniform parameters so any axis mix-up is visible.
+
+    The Conv2d kernel is 3x5 rather than square, which is what makes the
+    permutations distinguishable at all: on a square kernel with equal
+    channels, ``(0,3,1,2)`` and a wrong ordering can coincide.
+    """
+    holder = _MixedConvHolder()
+    holder.conv1.weight = mx.arange(5 * 3 * 3, dtype=mx.float32).reshape(5, 3, 3) / 17.0
+    holder.conv1.bias = mx.arange(5, dtype=mx.float32) / 3.0 + 1.0
+    holder.conv2.weight = mx.arange(4 * 2 * 3 * 5, dtype=mx.float32).reshape(4, 3, 5, 2) / 23.0
+    holder.conv2.bias = mx.arange(4, dtype=mx.float32) / 5.0 - 1.0
+    return holder
+
+
+@pytest.mark.parametrize(
+    "name,rule,torch_shape",
+    [
+        ("conv1.weight", CONV1D_LAYOUT, (5, 3, 3)),
+        ("conv1.bias", IDENTITY_LAYOUT, (5,)),
+        ("conv2.weight", CONV2D_LAYOUT, (4, 2, 3, 5)),
+        ("conv2.bias", IDENTITY_LAYOUT, (4,)),
+    ],
+)
+def test_conv_layout_rule_applies_to_the_weight_only(name, rule, torch_shape):
+    """A conv's 1-D bias must be IDENTITY in both layouts.
+
+    The rule follows the *owning module*, so before this was pinned the bias
+    inherited the kernel rule and ``load_strict(convert=True)`` transposed a
+    1-D array with three axes -- a ValueError on every conv that has a bias,
+    which is essentially every conv in a real checkpoint.
+    """
+    report = flatten_state_dict_with_rules(_mixed_conv_holder())
+    assert report.rules[name] == rule
+    tensor = report.tensors[name]
+    assert tuple(tensor.shape) != tuple(torch_shape) or rule == IDENTITY_LAYOUT
+
+
+def test_standalone_conv_weights_and_biases_round_trip_through_the_loader():
+    """One end-to-end load of a full torch-layout conv state, weights and biases.
+
+    Built from the module-derived rules rather than by hand, so it exercises the
+    same public path a real checkpoint takes: ``flatten_state_dict_with_rules``
+    -> torch state -> ``load_strict(convert=True)`` -> exact round trip.
+    """
+    source = _mixed_conv_holder()
+    report = flatten_state_dict_with_rules(source)
+    torch_state = {}
+    for name, tensor in report.tensors.items():
+        rule = report.rules[name]
+        if rule == CONV1D_LAYOUT:
+            torch_state[name] = mx.transpose(tensor, (0, 2, 1))
+        elif rule == CONV2D_LAYOUT:
+            torch_state[name] = mx.transpose(tensor, (0, 3, 1, 2))
+        else:
+            torch_state[name] = tensor
+
+    # The torch layouts must genuinely differ, or the round trip proves nothing.
+    assert tuple(torch_state["conv1.weight"].shape) == (5, 3, 3)
+    assert tuple(torch_state["conv2.weight"].shape) == (4, 2, 3, 5)
+    assert tuple(torch_state["conv1.bias"].shape) == (5,)
+    assert tuple(torch_state["conv2.bias"].shape) == (4,)
+
+    clone = _MixedConvHolder()
+    load_strict(clone, torch_state, convert=True)
+    restored = flatten_state_dict(clone)
+    for name, tensor in report.tensors.items():
+        assert mx.array_equal(restored[name], tensor).item(), name
 
 
 def test_load_strict_converts_torch_conv_layout_on_load():

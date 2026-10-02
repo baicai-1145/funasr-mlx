@@ -269,7 +269,7 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
             _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
             tensors[name] = value
-            rules[name] = _conv_rule(module)
+            rules[name] = _conv_rule(module) if key == "weight" else IDENTITY_LAYOUT
 
 
 @dataclass
