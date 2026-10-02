@@ -69,3 +69,44 @@ Differential tests: tests/test_reference_parity.py, tests/test_model_reference.p
 Seven-model acceptance remains incomplete. Remaining families: SenseVoiceSmall, Paraformer, ct-punc and emotion2vec+large. Full-weight numerical inference has not been executed for those four. Paraformer needs bounded legacy-serialization handling; ct-punc needs a bounded solution for its 972 MB embedding without reducing vocabulary; emotion needs safe inference-state extraction from its larger training payload and explicit namespace disposition. Larger models require fresh admission under the unchanged project limits. Repeated model construction per utility entry and original-versus-derived conversion config provenance/resumption remain recorded tooling limitations.
 
 Next acceptance stages are complete canonical checkpoints/tokenizers/labels for every model, full-model and multi-batch accuracy, streaming workflow tests, full-corpus WER/CER or task metrics, quantization quality, then steady-state latency, real-time factor and memory. VAD offline posterior parity does not prove streaming-cache equivalence; Whisper next-token agreement is not a transcript result; small numerical errors do not establish classifier accuracy. No quantization, speedup, fastest-inference or lowest-memory acceptance is claimed.
+
+## 2026-10-03: All seven models validated on complete official FP32 weights + FP16 inference
+
+### FP32 numerical alignment (reference PyTorch vs native MLX, full weights, real inputs)
+| family | inputs | key measurements | decisions |
+|---|---|---|---|
+| emotion2vec+large | 8 RAVDESS clips | frames 2.62e-5 / pooled 1.96e-5 / probs 4.77e-7 (max abs) | - |
+| ct-punc | 8 zh (in-vocab) + 8 en (all-unk fixtures) | zh logits 2.86e-5 | punc ids 16/16 |
+| SenseVoiceSmall | 4 en + 4 zh clips | frontend 2.82e-4 / encoder 1.05e-4 / logits 3.70e-4 | token ids 8/8 |
+| Paraformer | 4 en + 4 zh clips | frontend 2.82e-4 / encoder 2.65e-6 / decoder logits 3.46e-1 | token ids 8/8 |
+
+(fsmn-vad, campplus, whisper-tiny were validated earlier; unchanged.)
+
+### FP16 inference validation (native fp16 vs fp32 reference)
+- emotion2vec+large: official checkpoint is fp16-upcast-to-fp32 (100% exact f16
+  codes) -> fp16 conversion lossless, outputs bit-identical.
+- ct-punc: zh logits drift 1.77e-2; decisions 16/16.
+- SenseVoiceSmall: encoder drift 2.53e-2; token ids 8/8.
+- Paraformer: encoder drift 1.28e-3; token ids 8/8.
+
+### Speed / MFU analysis (M4, tools/benchmark_speed.py)
+- fp32 is the fastest config for these model sizes: sensevoice 25.3ms,
+  paraformer 24.7ms per sample; fp16 is ~1.5x SLOWER (mixed-dtype promotion),
+  uniform-f16 casts made it 2.6x slower (reverted); mx.compile +0.8% (noise);
+  batch=8 amortization worse (43.9ms/sample).
+- MFU 0.2-0.7% of M4 peak is inherent: 70 sequential 560-dim GEMM layers are
+  launch/memory-latency bound. Within the MFU-ceiling constraint there is no
+  further speed optimization that does not trade validated numerics.
+- FP16's benefit is memory: ct-punc weights 1.13 GB -> 0.57 GB.
+
+### Port defects found and fixed this phase
+- LFR left padding repeated the first frame once too often (every fused row
+  shifted by one frame) - frontend.py apply_lfr rewritten to mirror upstream.
+- SenseVoice CTC logits double-applied ctc_lo (log_softmax projects internally).
+- emotion2vec classify() return order; reference stripped extra tokens twice.
+- Reference ASR frontend inherited FunASR dither=1.0 default vs native 0.0.
+- read_config parsed JSON as YAML (1e-05 -> string); native dtype gate compared
+  str(dtype) never matching; converters now inject tokenizer-derived
+  vocab/input sizes; legacy torch.load degrades explicitly.
+
+Commits: 2eb4668, 9d5be6a, 48b4b5b, 4c327d4, 64dedf6.
