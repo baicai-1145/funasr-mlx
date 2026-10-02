@@ -7,12 +7,12 @@ name = "funasr-mlx"
 version = "0.1.0"
 description = "Memory-bounded native MLX speech inference on Apple Silicon"
 requires-python = ">=3.11"
-dependencies = ["mlx>=0.32.0", "numpy>=1.26", "safetensors>=0.4", "soundfile>=0.12", "PyYAML>=6.0"]
+dependencies = ["mlx>=0.32.0", "numpy>=1.26", "safetensors>=0.4", "soundfile>=0.12", "PyYAML>=6.0", "psutil>=5.9"]
 
 [project.optional-dependencies]
 convert = ["torch>=2.2", "huggingface-hub>=0.24"]
-test = ["pytest>=8", "psutil>=5.9"]
-whisper = ["mlx-whisper>=0.4"]
+test = ["pytest>=8"]
+reference = ["torch>=2.2", "torchaudio>=2.2", "librosa>=0.10"]
 
 [project.scripts]
 funasr-mlx = "funasr_mlx.cli:main"
