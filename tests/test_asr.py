@@ -479,7 +479,9 @@ def test_cif_v1_boundary_form_matches_the_longhand_expression():
             if prev is not None:
                 expected -= prefix[row, prev]
                 expected += rem[row, prev] * hidden_np[row, prev]
-            assert got[row, j] == pytest.approx(float(expected), rel=1e-5, abs=1e-6)
+            np.testing.assert_allclose(
+                got[row, j], expected, rtol=1e-5, atol=1e-6, err_msg=f"row {row} frame {j}"
+            )
 
 
 def _cold_probe_case(d: int = 3):
@@ -499,7 +501,12 @@ def _cold_probe_case(d: int = 3):
 #     -> boundary[1] = [12/7, 2, 16/7]
 # and frames[j] = boundary[j] - boundary[j-1] with boundary[-1] = 0, so
 #   frames = [[9/28, 13/28, 17/28], [39/28, 43/28, 47/28]]
-_COLD_PROBE_EXPECTED_D3 = np.array([[9, 13, 17], [39, 43, 47]], np.float32) / 28.0
+# Both rows use the same alphas and the same broadcast hidden, so row 1 repeats
+# row 0; the frame axis is max_label_len = round(sum(alphas)) = round(2.125) = 2,
+# giving a (B=2, 2, D=3) expectation rather than a (2, 3) one.
+_COLD_PROBE_EXPECTED_D3 = (np.array([[9, 13, 17], [39, 43, 47]], np.float32) / 28.0)[None].repeat(
+    2, axis=0
+)
 
 
 def test_cif_predictor_defaults_to_the_deterministic_cpu_device():
@@ -575,7 +582,9 @@ def test_cif_v1_repeated_fresh_rows_match_the_reference_formula(seed, b, d):
         np.float32
     )
     rem = fires - np.floor(fires)
-    prefix = np.cumsum(alphas_np.astype(np.float64) * hidden_np.astype(np.float64), axis=1)
+    prefix = np.cumsum(
+        alphas_np.astype(np.float64)[..., None] * hidden_np.astype(np.float64), axis=1
+    )
 
     expected = None
     for row in range(b):
@@ -649,7 +658,7 @@ def test_cif_v1_cold_and_warm_calls_agree_with_the_reference_formula(d):
     hidden_np = np.asarray(hidden, dtype=np.float64)
     alphas_np = np.asarray(alphas, dtype=np.float64)
 
-    prefix = np.cumsum(alphas_np * hidden_np, axis=1)
+    prefix = np.cumsum(alphas_np[..., None] * hidden_np, axis=1)
     alpha_prefix = np.cumsum(alphas_np, axis=1)
     rolled = np.roll(alpha_prefix, 1, axis=1)
     rolled[:, 0] = 0.0
@@ -916,6 +925,17 @@ def test_module_stack_threads_the_leading_argument_only():
         stack()
 
 
+def _valid_output_rows(lens, width):
+    """``(B, 1, 1)`` mask selecting the output rows that correspond to real tokens.
+
+    Masking is only defined over *valid* output positions. A padded output row
+    has no defined value, so requiring it to match would be claiming a property
+    the reference never had. Corrupting a padded **input** frame cannot change
+    a valid output row; nothing constrains the padded output rows themselves.
+    """
+    return mx.expand_dims(mx.arange(width)[None, :] < lens[:, None], -1)
+
+
 def test_decoder_output_is_invariant_to_the_padded_memory_tail():
     """Regression: a padded memory frame must not influence the logits.
 
@@ -942,7 +962,11 @@ def test_decoder_output_is_invariant_to_the_padded_memory_tail():
     padded = mx.logical_not(mx.arange(8)[None, :] < hlens[:, None])  # (2, 8)
     corrupted = mx.where(mx.expand_dims(padded, -1), memory + 1000.0, memory)
     dirty, _ = decoder(corrupted, hlens, tgt, tgt_lens)
-    assert mx.allclose(clean, dirty, atol=1e-4).item()
+    # Valid output rows only; the tolerance is unchanged, not loosened.
+    valid = _valid_output_rows(tgt_lens, clean.shape[1])
+    assert mx.allclose(
+        mx.where(valid, clean, mx.array(0.0)), mx.where(valid, dirty, mx.array(0.0)), atol=1e-4
+    ).item()
     # Sanity: the corruption really did reach the padded region.
     assert not mx.allclose(mx.sum(corrupted, axis=-1), mx.sum(memory, axis=-1)).item()
 
@@ -962,7 +986,10 @@ def test_decoder_output_is_invariant_to_the_padded_target_tail():
     padded = mx.logical_not(mx.arange(4)[None, :] < tgt_lens[:, None])  # (2, 4)
     corrupted = mx.where(mx.expand_dims(padded, -1), tgt + 1000.0, tgt)
     dirty, _ = decoder(memory, hlens, corrupted, tgt_lens)
-    assert mx.allclose(clean, dirty, atol=1e-4).item()
+    valid = _valid_output_rows(tgt_lens, clean.shape[1])
+    assert mx.allclose(
+        mx.where(valid, clean, mx.array(0.0)), mx.where(valid, dirty, mx.array(0.0)), atol=1e-4
+    ).item()
 
 
 def test_cif_predictor_config_defaults_follow_paraformer():
@@ -1252,15 +1279,46 @@ def test_load_strict_accepts_a_shared_prefix_and_rejects_shape_mismatch():
         load_strict(_paraformer(), bad, prefix="model.")
 
 
+def _torch_layout_state(model):
+    """Full PyTorch-layout state derived from the module-derived layout rules.
+
+    ``convert=True`` applies a layout rule to *every* conv a module owns, so a
+    fixture that transposes only one conv is a mixed layout and cannot load.
+    Two details matter:
+
+    * only ``.weight`` is transposed. The rule is derived per owning module, so
+      it also labels the matching **bias**, which is 1-D and must be left alone.
+    * MLX Conv2d stores ``(out, KH, KW, in)`` and torch Conv2d stores
+      ``(out, in, KH, KW)``, so the round-trip is ``(0, 3, 1, 2)`` -- not
+      ``(0, 2, 3, 1)``, which reorders to ``(out, KW, in, KH)``.
+    """
+    state = dict(flatten_state_dict(model))
+    _, rules = flatten_state_dict_with_rules(model)
+    torch_state = {}
+    for name, tensor in state.items():
+        rule = rules[name]
+        if not name.endswith(".weight") or tensor.ndim not in (3, 4):
+            torch_state[name] = tensor
+        elif rule == CONV1D_LAYOUT:
+            torch_state[name] = mx.transpose(tensor, (0, 2, 1))
+        elif rule == CONV2D_LAYOUT:
+            torch_state[name] = mx.transpose(tensor, (0, 3, 1, 2))
+        else:
+            torch_state[name] = tensor
+    return state, torch_state, rules
+
+
 def test_load_strict_converts_torch_conv_layout_on_load():
     model = _paraformer()
-    state = dict(flatten_state_dict(model))
+    state, torch_state, rules = _torch_layout_state(model)
     key = "encoder.encoders.0.self_attn.fsmn_block.weight"
-    state[key] = mx.transpose(state[key], (0, 2, 1))  # emulate the torch layout
-    assert state[key].shape == (8, 1, 3)
+    assert rules[key] == CONV1D_LAYOUT
+    assert torch_state[key].shape == (8, 1, 3)
     clone = _paraformer()
-    load_strict(clone, state, convert=True)
+    load_strict(clone, torch_state, convert=True)
     assert clone.encoder.encoders[0].self_attn.fsmn_block.weight.shape == (8, 3, 1)
+    for name, tensor in state.items():
+        assert mx.array_equal(flatten_state_dict(clone)[name], tensor).item()
 
 
 @pytest.mark.parametrize("layer", ["pe", "conv2d"])
@@ -1275,20 +1333,16 @@ def test_load_strict_converts_every_conv_owner(layer):
     config = _paraformer_config()
     config.encoder_conf.input_layer = layer
     model = Paraformer(config=config)
-    state = dict(flatten_state_dict(model))
-    _, rules = flatten_state_dict_with_rules(model)
+    state, torch_state, rules = _torch_layout_state(model)
 
-    torch_state = {}
-    for name, tensor in state.items():
-        rule = rules[name]
-        if rule == CONV1D_LAYOUT:
-            torch_state[name] = mx.transpose(tensor, (0, 2, 1))
-        elif rule == CONV2D_LAYOUT:
-            torch_state[name] = mx.transpose(tensor, (0, 2, 3, 1))
-        else:
-            torch_state[name] = tensor
-
-    conv_keys = sorted(name for name in state if rules[name] != IDENTITY_LAYOUT)
+    # Weights only: the rule also labels the 1-D bias, which is never transposed.
+    conv_keys = sorted(
+        name
+        for name in state
+        if rules[name] != IDENTITY_LAYOUT
+        and name.endswith(".weight")
+        and state[name].ndim in (3, 4)
+    )
     assert conv_keys, "fixture must exercise at least one conv"
     if layer == "conv2d":
         # The conv2d branch only exists for a conv-subsampling encoder.
