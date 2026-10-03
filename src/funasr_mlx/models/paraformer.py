@@ -393,9 +393,16 @@ class SANMEncoder(mxnn.Module):
             return mxnn.Linear(input_size, cfg.output_size)
         if layer == "pe":
             return SinusoidalPositionEncoder()
+        if layer == "pe_online":
+            # The streaming position encoder; parameters-free like the offline
+            # one, so the checkpoint tree is unchanged. ``forward_chunk`` in
+            # ``paraformer_streaming`` drives it through ``cache['start_idx']``.
+            from .paraformer_streaming import StreamSinusoidalPositionEncoder
+
+            return StreamSinusoidalPositionEncoder()
         raise NotImplementedError(
             f"unsupported input_layer {layer!r}; ported: 'linear', 'conv2d', 'conv2d2', "
-            "'embed', 'pe', None"
+            "'embed', 'pe', 'pe_online', None"
         )
 
     def output_size(self) -> int:

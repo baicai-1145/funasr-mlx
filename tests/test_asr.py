@@ -319,7 +319,9 @@ def test_sanm_encoder_forward_shapes_and_lengths():
 
 def test_sanm_encoder_rejects_unsupported_input_layer():
     cfg = _sanm_encoder_config()
-    cfg.input_layer = "pe_online"
+    # pe_online is now supported (streaming port); keep the guard test for a
+    # genuinely unknown layer name.
+    cfg.input_layer = " unsupported_layer "
     with pytest.raises(NotImplementedError):
         SANMEncoder(input_size=8, config=cfg)
 
