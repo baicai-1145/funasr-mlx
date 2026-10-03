@@ -122,18 +122,22 @@ class MossTranscribeDiarize(mxnn.Module):
             ffn=whisper_cfg.get("encoder_ffn_dim", 4096),
             max_source_positions=whisper_cfg.get("max_source_positions", 1500),
         )
-        hidden = text_config["hidden_size"]
+        hidden = text_config.hidden_size
         self.vq_adaptor = VQAdaptor(hidden * audio_merge_size, hidden)
         self.language_model = Qwen3ForCausalLM(text_config)
         self.audio_merge_size = audio_merge_size
         self.audio_token_id = audio_token_id
 
     def encode_audio(self, mel: mx.array) -> mx.array:
-        """mel (F, T) -> whisper (1, T/2, 1024) -> adaptor (1, T/8, hidden).
+        """mel (F, T) -> whisper (1, T/2, 1024) -> adaptor (1, T/8, hidden)."""
+        whisper_hidden = self.whisper_encoder(mel)
+        return self.encode_audio_from_hidden(whisper_hidden)
+
+    def encode_audio_from_hidden(self, whisper_hidden: mx.array) -> mx.array:
+        """Merged/chunked whisper output (1, T, 1024) -> adaptor (1, T/4, hidden).
 
         Trims to a multiple of the merge size first (official time_merge).
         """
-        whisper_hidden = self.whisper_encoder(mel)
         m = self.audio_merge_size
         b, t, d = whisper_hidden.shape
         trim = (t // m) * m
@@ -164,7 +168,6 @@ class MossTranscribeDiarize(mxnn.Module):
         )
         mask = "causal" if prefill and h.shape[1] > 1 else None
         out = self.language_model.model(input_embeddings=h, cache=caches, mask=mask)
-        tc = self.language_model.config
-        if tc.get("tie_word_embeddings", False):
+        if self.language_model.args.tie_word_embeddings:
             return self.language_model.model.embed_tokens.as_linear(out)
         return self.language_model.lm_head(out)
