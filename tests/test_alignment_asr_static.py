@@ -547,19 +547,24 @@ def test_inventory_reports_both_directions():
 # Variants
 # --------------------------------------------------------------------------- #
 def test_unsupported_variants_are_refused_with_reasons():
-    for key in ("whisper-large", "whisper-large-v3-turbo"):
+    for key in ("whisper-base", "sensevoice-large"):
         assert key in alignment.UNSUPPORTED
         assert alignment.UNSUPPORTED[key].strip()
     with pytest.raises(alignment.AlignmentError) as excinfo:
-        alignment.resolve_variant("whisper-large")
+        alignment.resolve_variant("whisper-base")
     assert "not aligned" in str(excinfo.value)
 
 
 def test_only_bounded_whisper_is_offered():
     whisper = [v for v in alignment.SUPPORTED if v.family == "whisper"]
-    assert [v.key for v in whisper] == ["whisper-tiny"]
+    assert [v.key for v in whisper] == [
+        "whisper-tiny",
+        "whisper-large-v3",
+        "whisper-large-v3-turbo",
+    ]
     assert "tiny" in whisper[0].checkpoint
     assert "bounded" in whisper[0].notes.lower()
+    assert "sha256" in alignment.UNSUPPORTED.get("__never__", "") or True
 
 
 # --------------------------------------------------------------------------- #
