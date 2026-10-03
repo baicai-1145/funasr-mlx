@@ -167,11 +167,50 @@ Goal: adapt every model in the FunASR README model zoo.
   confirms this is the M4 fp32 compute envelope, not a regression:
   attention 16.3 ms + MLP 19.5 ms per layer x 32.
 
-### LLM-based ASR models (Fun-ASR-Nano / Qwen3-ASR / GLM-ASR-Nano / MOSS)
-These are thin wrappers over external LLM stacks: Qwen3-ASR delegates
-entirely to the `qwen-asr` pip package; GLM uses HF AutoModel with
-trust_remote_code; Fun-ASR-Nano = FunASR audio encoder + HF
-AutoModelForCausalLM (Qwen3-0.6B backbone); MOSS is third-party. Adapting
-them means porting an LLM inference stack. Recommended path: reuse
-mlx-lm's Qwen3/GLM implementations and port only the audio encoder +
-adaptor. Not started; each is a project of the size of this whole port.
+### LLM-based ASR models (Fun-ASR-Nano / Qwen3-ASR / GLM-ASR-Nano / MOSS) -- ALL PORTED
+Vendored-trimmed mlx-lm components (Apache 2.0, attribution kept; NO
+runtime dependency; core deps stay 6): `llm/qwen3.py`, `llm/llama.py`,
+`llm/rope.py`, `llm/kv_cache.py` (~600 lines self-maintained).
+
+- **Fun-ASR-Nano** (commit b6deb06): SenseVoiceEncoderSmall reuse +
+  ESPnet-style adaptor + Qwen3 backbone; vLLM template. e2e correct;
+  batch 6/8 (samples 3/7 empty transcripts on 5.2s clips -- unexplained,
+  open).
+- **Qwen3-ASR-0.6B** (commits c8b8e15, 7a9c405): chunked-conv audio tower
+  (abs 1.2e-6/rel 1.2e-5 on 67 frames), thinker = Qwen3ForCausalLM reuse.
+  Prefill causal-mask bug found via dual-decoder test (official vs port
+  decoders agreed 1.4e-4 on the same embeds; the generic model call only
+  builds a mask when cache is None -- pre-created KVCache objects got NO
+  mask). Fix: detect prefill by cache offset==0. Batch 6/6 semantically
+  correct; model emits its 'language Chinese<asr_text>' guide unprompted.
+- **GLM-ASR-Nano-2512** (commits 5de607b, 6941e1c, 351281f, 7c42707):
+  audio tower = whisper-shaped but conv1 stride 1 + partial RoPE 0.5
+  (no additive sinusoid table); projector input is the encoder output
+  REGROUPED 4x1280->5120. Llama text side. Two vendor-port bugs fixed:
+  gate/up MLP silu placement; llama rope offset=cache.offset for
+  incremental decode (missing -> degenerate repetition). Parity: tower
+  2.0e-5, llama logits rel 3.3e-6. e2e bf16 (mx.load mmap -- the fp32
+  convert path peaked 12 GB and HARD-CRASHED the host): batch 7/7
+  semantically correct.
+- **MOSS-Transcribe-Diarize** (commits 968d6e5, 9b8b146): HF
+  WhisperEncoder layout (conv1 s1 + conv2 s2, LEARNED positions,
+  top-level LN) + VQAdaptor + Qwen3-0.6B. Chunk semantics: 30s mel,
+  valid frames (tok_len*4) concatenated. Tower parity 1.3e-3/24 layers.
+  Root cause of degenerate outputs: checkpoint prefix
+  'model.language_model.' (single model. segment) vs double-stripped
+  binding -> zero keys -> silent random weights. Dual-decoder on
+  official embeds: 4.7e-5. e2e bf16 batch 8/8: transcript + [ts][S01]
+  speaker labels, e.g. '[0.35][S01]甚至出现交易几乎停滞的情况。[3.74]'.
+
+Final state: guarded suite 468 passed / 6 known-environment deselects.
+README model zoo fully covered: paraformer (+streaming), sensevoice,
+whisper (tiny/large-v3/turbo), emotion2vec, ct-punc, fsmn-vad, campplus,
+fun-asr-nano, qwen3-asr, glm-asr-nano, moss-transcribe-diarize.
+
+Lessons this round: (1) ALWAYS assert bound-weight key counts against
+the checkpoint manifest (three separate prefix bugs, all silent);
+(2) fp32 full-convert of bf16 checkpoints can triple peak RSS -- load
+bf16 via mx.load mmap; (3) HF safetensors strict=False silently accepts
+misaligned state dicts -- verify missing/unexpected lists are empty;
+(4) prompt format matters as much as weights (MOSS 2222-degeneration was
+a missing DEFAULT_PROMPT, not a model bug).
