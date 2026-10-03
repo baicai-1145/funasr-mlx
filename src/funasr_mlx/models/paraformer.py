@@ -403,6 +403,11 @@ class SANMEncoder(mxnn.Module):
 
     def __call__(self, xs_pad: mx.array, ilens: mx.array) -> tuple[mx.array, mx.array]:
         masks = mx.expand_dims(~make_pad_mask(ilens, xs_pad.shape[1]), 1)  # (B, 1, T)
+        # When every sample fills the window the mask is uniformly True and all
+        # its uses are identity; fold it to None so each layer takes the fused
+        # SDPA path (numerically identical, covered by the alignment suite).
+        uniform = bool(mx.all(masks).item())
+        layer_mask = None if uniform else masks
         xs_pad = xs_pad * (self.output_size() ** 0.5)
 
         embed = self.embed
@@ -416,17 +421,22 @@ class SANMEncoder(mxnn.Module):
                     f"(it needs more than {limit_size} frames), return empty results"
                 )
             xs_pad, masks = embed(xs_pad, masks)
+            layer_mask = None if uniform else masks
         else:
             xs_pad = embed(xs_pad)
 
         for layer in self.encoders0:
-            xs_pad, masks = layer(xs_pad, masks)
+            xs_pad, _ = layer(xs_pad, layer_mask)
         for layer in self.encoders:
-            xs_pad, masks = layer(xs_pad, masks)
+            xs_pad, _ = layer(xs_pad, layer_mask)
 
         if self._normalize_before:
             xs_pad = self.after_norm(xs_pad)
-        olens = mx.sum(mx.squeeze(masks, 1), axis=-1).astype(mx.int32)
+        olens = (
+            mx.asarray(ilens).reshape(-1).astype(mx.int32)
+            if uniform
+            else mx.sum(mx.squeeze(masks, 1), axis=-1).astype(mx.int32)
+        )
         return xs_pad, olens
 
 

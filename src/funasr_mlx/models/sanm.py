@@ -746,8 +746,20 @@ class MultiHeadedAttentionSANM(mxnn.Module):
         return self.linear_out(x)
 
     def __call__(self, x: mx.array, mask: mx.array | None = None) -> mx.array:
-        q_h, k_h, v_h, v = self.forward_qkv(x)
+        q_k_v = self.linear_q_k_v(x)
+        q, k, v = mx.split(q_k_v, 3, axis=-1)
+        q_h, k_h, v_h, v = self._split_heads(q), self._split_heads(k), self._split_heads(v), v
         fsmn_memory = self.forward_fsmn(v, mask)
+        # The unmasked branch uses the fused SDPA kernel (one kernel for
+        # scale+BMM+softmax+BMM, softmax in float32 internally). Numerically
+        # equivalent to the manual path -- asserted by tests -- but without
+        # four separate kernel launches per layer, which dominates latency on
+        # short sequences.
+        if mask is None:
+            attn = mx.fast.scaled_dot_product_attention(q_h, k_h, v_h, scale=self._d_k**-0.5)
+            b, _, t, _ = attn.shape
+            x = mx.reshape(mx.transpose(attn, (0, 2, 1, 3)), (b, t, self._h * self._d_k))
+            return self.linear_out(x) + fsmn_memory
         q_h = q_h * (self._d_k**-0.5)
         scores = mx.matmul(q_h, mx.swapaxes(k_h, -1, -2))
         return self.forward_attention(v_h, scores, mask) + fsmn_memory

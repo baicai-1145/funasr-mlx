@@ -341,22 +341,33 @@ class SenseVoiceEncoderSmall(mxnn.Module):
     def __call__(self, xs_pad: mx.array, ilens: mx.array) -> tuple[mx.array, mx.array]:
         maxlen = xs_pad.shape[1]
         masks = mx.expand_dims(sequence_mask(ilens, maxlen=maxlen), 1)  # (B, 1, T)
+        # When every sample fills the whole window the mask is uniformly 1.0:
+        # every ``where(blocked, ...)`` is a no-op and the mask products in the
+        # FSMN branch are identity. Fold it to None so each layer can take the
+        # fused SDPA path (numerically identical; covered by the alignment
+        # suite). ``olens`` is then just ``ilens``.
+        uniform = bool(mx.all(masks == 1.0).item())
+        layer_mask = None if uniform else masks
 
         xs_pad = xs_pad * (self.output_size() ** 0.5)
         xs_pad = self.embed(xs_pad)
 
         for layer in self.encoders0:
-            xs_pad, masks = layer(xs_pad, masks)
+            xs_pad, _ = layer(xs_pad, layer_mask)
         for layer in self.encoders:
-            xs_pad, masks = layer(xs_pad, masks)
+            xs_pad, _ = layer(xs_pad, layer_mask)
 
         xs_pad = self.after_norm(xs_pad)
         # ``olens`` is derived here, before the tail blocks (faithful to the
         # reference; the mask is unchanged by the tail blocks anyway).
-        olens = mx.sum(mx.squeeze(masks, 1), axis=-1).astype(mx.int32)
+        olens = (
+            mx.sum(mx.squeeze(masks, 1), axis=-1).astype(mx.int32)
+            if not uniform
+            else mx.asarray(ilens).reshape(-1).astype(mx.int32)
+        )
 
         for layer in self.tp_encoders:
-            xs_pad, masks = layer(xs_pad, masks)
+            xs_pad, _ = layer(xs_pad, layer_mask)
         xs_pad = self.tp_norm(xs_pad)
         return xs_pad, olens
 
