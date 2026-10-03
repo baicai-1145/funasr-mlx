@@ -140,3 +140,38 @@ Where the remaining time goes (measured, not estimated):
 
 Commits: 05ea904 (SANM SDPA), 7999814 (emotion2vec ALiBi-as-mask), d5a72d0
 (whisper SDPA).
+
+## 2026-10-03 (cont.2): README model-coverage expansion
+
+Goal: adapt every model in the FunASR README model zoo.
+
+### Done this round
+- **paraformer-zh-streaming** (commit ae71fe3): full streaming protocol
+  ported (pe_online positions, overlap stitching, KV caches, streaming CIF
+  with carried state, chunk decoder). Official 881 MB online checkpoint
+  loads unchanged. Numerics: per-layer RELATIVE diff 1e-6 (pure fp32 GEMM
+  reduction noise), tail-chunk path 4.0e-7 -- no semantic divergence. The
+  streaming state machine amplifies fp32 noise across chunks: cumulative
+  alpha drift ~0.1 flips end-of-chunk CIF fires; mean CER vs the torch
+  reference 0.156 on 8 clips. Precision finding, not a porting bug (MLX
+  has no fp64 to prove bitwise equivalence like the offline ports).
+  Deployment: streaming for partial results; final transcript from the
+  offline model.
+- **whisper-large-v3 / v3-turbo** (commit 34ba232): registered as alignment
+  variants; checkpoints downloaded (sha256 from official _MODELS URLs);
+  conversion shards 250 MB with funasr-mlx metadata and conv1d permute.
+  Dims verified from the checkpoints: n_mels=128, n_vocab=51866, turbo
+  decoder = 4 layers. Both load and run through the guarded pipeline.
+  RTF (encoder, 30 s window, FP32): large-v3 0.058 (17x realtime),
+  turbo 0.061 (16x); fp16 large-v3 0.046 (22x). Component-level budget
+  confirms this is the M4 fp32 compute envelope, not a regression:
+  attention 16.3 ms + MLP 19.5 ms per layer x 32.
+
+### LLM-based ASR models (Fun-ASR-Nano / Qwen3-ASR / GLM-ASR-Nano / MOSS)
+These are thin wrappers over external LLM stacks: Qwen3-ASR delegates
+entirely to the `qwen-asr` pip package; GLM uses HF AutoModel with
+trust_remote_code; Fun-ASR-Nano = FunASR audio encoder + HF
+AutoModelForCausalLM (Qwen3-0.6B backbone); MOSS is third-party. Adapting
+them means porting an LLM inference stack. Recommended path: reuse
+mlx-lm's Qwen3/GLM implementations and port only the audio encoder +
+adaptor. Not started; each is a project of the size of this whole port.
