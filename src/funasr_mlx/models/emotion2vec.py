@@ -319,9 +319,7 @@ def parse_feature_encoder_spec(spec: str) -> list[tuple[int, int, int]]:
             )
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
             return -evaluate(node.operand)
-        raise ValueError(
-            f"unsupported expression in feature_encoder_spec: {type(node).__name__}"
-        )
+        raise ValueError(f"unsupported expression in feature_encoder_spec: {type(node).__name__}")
 
     layers = evaluate(tree)
     if not isinstance(layers, tuple) or not layers:
@@ -346,9 +344,7 @@ def conv_feature_output_length(samples: int, layers: Sequence[tuple[int, int, in
     for _, kernel, stride in layers:
         length = math.floor((length - kernel) / stride + 1)
         if length < 1:
-            raise ValueError(
-                f"input of {samples} samples is too short for this feature encoder"
-            )
+            raise ValueError(f"input of {samples} samples is too short for this feature encoder")
     return length
 
 
@@ -361,8 +357,15 @@ class ConvFeatureBlock(OrderedModules):
     norm is **affine**, i.e. its ``weight``/``bias`` are real checkpoint tensors.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int,
-                 eps: float, conv_bias: bool) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int,
+        eps: float,
+        conv_bias: bool,
+    ) -> None:
         super().__init__(
             {
                 "0": nn.Conv1d(
@@ -415,15 +418,14 @@ class ConvFeatureBlock(OrderedModules):
 class ConvFeatureExtraction(nn.Module):
     """``ConvFeatureExtractionModel`` with ``mode="layer_norm"``."""
 
-    def __init__(self, layers: Sequence[tuple[int, int, int]], *, eps: float,
-                 conv_bias: bool) -> None:
+    def __init__(
+        self, layers: Sequence[tuple[int, int, int]], *, eps: float, conv_bias: bool
+    ) -> None:
         super().__init__()
         blocks = []
         in_d = 1
         for dim, kernel, stride in layers:
-            blocks.append(
-                ConvFeatureBlock(in_d, dim, kernel, stride, eps=eps, conv_bias=conv_bias)
-            )
+            blocks.append(ConvFeatureBlock(in_d, dim, kernel, stride, eps=eps, conv_bias=conv_bias))
             in_d = dim
         self.conv_layers = ModuleListStack(blocks)
         self.out_channels = int(layers[-1][0])
@@ -478,8 +480,14 @@ class PositionalBlock(OrderedModules):
         super().__init__(
             {
                 "0": nn.Conv1d(
-                    dim, dim, kernel_size, stride=1, padding=kernel_size // 2,
-                    dilation=1, groups=groups, bias=True,
+                    dim,
+                    dim,
+                    kernel_size,
+                    stride=1,
+                    padding=kernel_size // 2,
+                    dilation=1,
+                    groups=groups,
+                    bias=True,
                 ),
                 "1": SamePad(kernel_size),
                 "2": TransposeLast(),
@@ -549,8 +557,7 @@ class PositionalEncoder(OrderedModules):
     ``NCT`` in and ``NCT`` out, so nothing is transposed *between* blocks.
     """
 
-    def __init__(self, dim: int, depth: int, kernel_size: int, groups: int,
-                 eps: float) -> None:
+    def __init__(self, dim: int, depth: int, kernel_size: int, groups: int, eps: float) -> None:
         modules: dict[str, nn.Module] = {"0": TransposeLast()}
         for index in range(depth):
             modules[str(index + 1)] = PositionalBlock(dim, kernel_size, groups, eps)
@@ -591,16 +598,19 @@ class AltAttention(nn.Module):
         q = mx.swapaxes(qkv[:, :, 0], 1, 2)  # (B, H, N, d)
         k = mx.swapaxes(qkv[:, :, 1], 1, 2)
         v = mx.swapaxes(qkv[:, :, 2], 1, 2)
-        scores = q @ mx.swapaxes(k, -1, -2)
-        scores = scores * (self.head_dim**-0.5)
+        # The entire score pipeline (scale + QK^T + bias + softmax + @V) is one
+        # fused SDPA kernel; the ALiBi bias goes in as the additive ``mask``
+        # argument and SDPA's internal softmax runs in float32. Equivalent to
+        # the manual path (covered by the alignment suite) minus four kernel
+        # launches per layer.
+        bias = None
         if alibi_bias is not None:
             _require(
                 alibi_bias.shape == (b, self.num_heads, n, n),
                 f"alibi_bias must be (B, {self.num_heads}, N, N), got {alibi_bias.shape}",
             )
-            scores = scores + alibi_bias
-        attn = mx.softmax(scores, axis=-1)
-        out = attn @ v  # (B, H, N, d)
+            bias = alibi_bias.astype(q.dtype) if alibi_bias.dtype != q.dtype else alibi_bias
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.head_dim**-0.5, mask=bias)
         out = mx.swapaxes(out, 1, 2).reshape(b, n, self.num_heads * self.head_dim)
         return self.proj(out)
 
@@ -618,8 +628,16 @@ class AltBlock(nn.Module):
     teacher), so the port returns it for API parity but never consumes it.
     """
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, eps: float,
-                 affine: bool, layer_norm_first: bool, ffn_targets: bool) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float,
+        eps: float,
+        affine: bool,
+        layer_norm_first: bool,
+        ffn_targets: bool,
+    ) -> None:
         super().__init__()
         self.layer_norm_first = bool(layer_norm_first)
         self.ffn_targets = bool(ffn_targets)
@@ -658,15 +676,17 @@ class AltBlock(nn.Module):
 class BlockEncoder(nn.Module):
     """``modules.py:63-95`` ``BlockEncoder`` (the prenet / context encoder)."""
 
-    def __init__(self, blocks: Sequence[nn.Module], norm: nn.Module | None,
-                 layer_norm_first: bool) -> None:
+    def __init__(
+        self, blocks: Sequence[nn.Module], norm: nn.Module | None, layer_norm_first: bool
+    ) -> None:
         super().__init__()
         self.blocks = ModuleListStack(blocks)
         self.norm = norm
         self.layer_norm_first = bool(layer_norm_first)
 
-    def __call__(self, x: mx.array, alibi_bias: mx.array | None,
-                 alibi_scale: mx.array | None = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, alibi_bias: mx.array | None, alibi_scale: mx.array | None = None
+    ) -> mx.array:
         """``modules.py:72-93``.
 
         ``learned_alibi_scale_per_layer`` is honoured here: block ``i`` uses
@@ -678,9 +698,7 @@ class BlockEncoder(nn.Module):
         for index, block in enumerate(self.blocks):
             bias = alibi_bias
             if bias is not None and alibi_scale is not None:
-                scale = (
-                    alibi_scale[index] if alibi_scale.shape[0] > 1 else alibi_scale.squeeze(0)
-                )
+                scale = alibi_scale[index] if alibi_scale.shape[0] > 1 else alibi_scale.squeeze(0)
                 bias = bias * scale.astype(bias.dtype)
             x, _ = block(x, bias)
         return x
@@ -742,41 +760,66 @@ class Emotion2VecConfig:
 
     def __post_init__(self) -> None:
         for name in (
-            "embed_dim", "depth", "num_heads", "conv_pos_depth", "conv_pos_width",
-            "conv_pos_groups", "prenet_depth", "num_alibi_heads", "max_samples",
-            "max_frames", "vocab_size",
+            "embed_dim",
+            "depth",
+            "num_heads",
+            "conv_pos_depth",
+            "conv_pos_width",
+            "conv_pos_groups",
+            "prenet_depth",
+            "num_alibi_heads",
+            "max_samples",
+            "max_frames",
+            "vocab_size",
         ):
             object.__setattr__(self, name, _as_int(getattr(self, name), name))
         for name in ("mlp_ratio", "norm_eps", "alibi_scale_init"):
             object.__setattr__(self, name, _as_float(getattr(self, name), name))
         object.__setattr__(
-            self, "num_extra_tokens",
+            self,
+            "num_extra_tokens",
             _as_int(self.num_extra_tokens, "num_extra_tokens", minimum=0),
         )
-        for name in ("embed_dim", "num_heads", "conv_pos_depth", "conv_pos_groups",
-                     "prenet_depth", "num_alibi_heads", "max_samples", "max_frames"):
+        for name in (
+            "embed_dim",
+            "num_heads",
+            "conv_pos_depth",
+            "conv_pos_groups",
+            "prenet_depth",
+            "num_alibi_heads",
+            "max_samples",
+            "max_frames",
+        ):
             _require(getattr(self, name) >= 1, f"{name} must be >= 1")
-        _require(self.embed_dim % self.num_heads == 0,
-                 f"embed_dim {self.embed_dim} must be divisible by num_heads {self.num_heads}")
-        _require(self.extractor_mode == "layer_norm",
-                 f"only extractor_mode='layer_norm' is ported, got {self.extractor_mode!r}")
-        _require(self.num_alibi_heads == self.num_heads,
-                 f"num_alibi_heads {self.num_alibi_heads} must equal num_heads {self.num_heads}")
+        _require(
+            self.embed_dim % self.num_heads == 0,
+            f"embed_dim {self.embed_dim} must be divisible by num_heads {self.num_heads}",
+        )
+        _require(
+            self.extractor_mode == "layer_norm",
+            f"only extractor_mode='layer_norm' is ported, got {self.extractor_mode!r}",
+        )
+        _require(
+            self.num_alibi_heads == self.num_heads,
+            f"num_alibi_heads {self.num_alibi_heads} must equal num_heads {self.num_heads}",
+        )
         _require(
             self.embed_dim % self.conv_pos_groups == 0,
             f"embed_dim {self.embed_dim} must be divisible by "
             f"conv_pos_groups {self.conv_pos_groups}",
         )
         _require(self.depth >= 1, "depth must be >= 1")
-        _require(self.vocab_size == -1 or self.vocab_size >= 0,
-                 "vocab_size must be -1 (no head) or >= 0")
+        _require(
+            self.vocab_size == -1 or self.vocab_size >= 0, "vocab_size must be -1 (no head) or >= 0"
+        )
         object.__setattr__(self, "labels", tuple(self.labels))
         if self.vocab_size > 0 and self.labels:
-            _require(len(self.labels) == self.vocab_size,
-                     f"labels ({len(self.labels)}) must match vocab_size ({self.vocab_size})")
+            _require(
+                len(self.labels) == self.vocab_size,
+                f"labels ({len(self.labels)}) must match vocab_size ({self.vocab_size})",
+            )
         if self.learned_alibi:
-            _require(self.alibi_max_pos is not None,
-                     "learned_alibi requires alibi_max_pos")
+            _require(self.alibi_max_pos is not None, "learned_alibi requires alibi_max_pos")
         resolved = parse_feature_encoder_spec(self.feature_encoder_spec)
         object.__setattr__(self, "conv_layers", tuple(resolved))
 
@@ -796,8 +839,9 @@ class Emotion2VecConfig:
 
     def frames_for(self, samples: int) -> int:
         _require(samples >= 1, "samples must be >= 1")
-        _require(samples <= self.max_samples,
-                 f"{samples} samples exceeds max_samples={self.max_samples}")
+        _require(
+            samples <= self.max_samples, f"{samples} samples exceeds max_samples={self.max_samples}"
+        )
         frames = conv_feature_output_length(samples, self.conv_layers)
         total = frames + self.num_extra_tokens
         _require(
@@ -851,9 +895,7 @@ class AudioEncoder(nn.Module):
             if config.layer_norm_first
             else Fp32LayerNorm(config.embed_dim, eps=config.norm_eps, affine=config.norm_affine)
         )
-        self.context_encoder = BlockEncoder(
-            prenet_blocks, prenet_norm, config.layer_norm_first
-        )
+        self.context_encoder = BlockEncoder(prenet_blocks, prenet_norm, config.layer_norm_first)
         self.extra_tokens = mx.zeros((1, config.num_extra_tokens, config.embed_dim))
         if config.learned_alibi_scale and config.use_alibi_encoder:
             rows = config.prenet_depth + config.depth if config.learned_alibi_scale_per_layer else 1
@@ -917,7 +959,7 @@ class AudioEncoder(nn.Module):
                 alibi_bias = alibi_bias * alibi_scale.squeeze(0).astype(alibi_bias.dtype)
                 alibi_scale = None
             else:
-                remaining = alibi_scale[self.config.prenet_depth:]
+                remaining = alibi_scale[self.config.prenet_depth :]
 
         num = self.extra_tokens.shape[1]
         if num:
@@ -930,9 +972,7 @@ class AudioEncoder(nn.Module):
         x = self.context_encoder(x, alibi_bias, alibi_scale)
         return x, alibi_bias, remaining
 
-    def __call__(
-        self, samples: mx.array
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
+    def __call__(self, samples: mx.array) -> tuple[mx.array, mx.array, mx.array | None]:
         return self.contextualized_features(samples)
 
 
@@ -949,8 +989,7 @@ class EmotionResult:
     feats: mx.array
 
 
-def preprocess_waveform(waveform: mx.array, normalize: bool = True,
-                        eps: float = 1e-5) -> mx.array:
+def preprocess_waveform(waveform: mx.array, normalize: bool = True, eps: float = 1e-5) -> mx.array:
     """``source = F.layer_norm(source, source.shape)`` then ``view(1, -1)``.
 
     The reference normalises over the *entire* 1-D waveform (one global
@@ -1005,9 +1044,7 @@ class Emotion2VecModel(nn.Module):
             else None
         )
         self.proj = (
-            nn.Linear(config.embed_dim, config.vocab_size)
-            if config.vocab_size > 0
-            else None
+            nn.Linear(config.embed_dim, config.vocab_size) if config.vocab_size > 0 else None
         )
 
     # -- forward paths ------------------------------------------------------ #
@@ -1028,9 +1065,7 @@ class Emotion2VecModel(nn.Module):
         for index, block in enumerate(self.blocks):
             bias = alibi_bias
             if bias is not None and alibi_scale is not None:
-                scale = (
-                    alibi_scale[index] if alibi_scale.shape[0] > 1 else alibi_scale.squeeze(0)
-                )
+                scale = alibi_scale[index] if alibi_scale.shape[0] > 1 else alibi_scale.squeeze(0)
                 bias = bias * scale.astype(bias.dtype)
             x, _ = block(x, bias)
         if self.norm is not None:
@@ -1123,9 +1158,7 @@ def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
     Non-array leaves (ints, strings, tuples) are filtered out.
     """
     flat = tree_flatten(module, destination={})
-    return {
-        key: value for key, value in flat.items() if isinstance(value, mx.array)
-    }
+    return {key: value for key, value in flat.items() if isinstance(value, mx.array)}
 
 
 #: Exact checkpoint keys whose layout differs between PyTorch and MLX.  These
@@ -1136,12 +1169,8 @@ def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
 #: * ``conv_layers.<i>.0.weight`` -- ``nn.Conv1d`` weight ``(out, in//g, K)``
 #: * ``relative_positional_encoder.<i>.0.weight`` -- same ``nn.Conv1d``
 CONV_WEIGHT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(
-        r"^modality_encoders\.AUDIO\.local_encoder\.conv_layers\.\d+\.0\.weight$"
-    ),
-    re.compile(
-        r"^modality_encoders\.AUDIO\.relative_positional_encoder\.\d+\.0\.weight$"
-    ),
+    re.compile(r"^modality_encoders\.AUDIO\.local_encoder\.conv_layers\.\d+\.0\.weight$"),
+    re.compile(r"^modality_encoders\.AUDIO\.relative_positional_encoder\.\d+\.0\.weight$"),
 )
 
 
@@ -1169,8 +1198,7 @@ def convert_checkpoint_tensors(
         if is_conv_weight(name):
             if value.ndim != 3:
                 raise ValueError(
-                    f"{name}: expected a 3-D Conv1d weight (out, in//g, K), "
-                    f"got shape {value.shape}"
+                    f"{name}: expected a 3-D Conv1d weight (out, in//g, K), got shape {value.shape}"
                 )
             value = mx.transpose(value, (0, 2, 1))
         converted[name] = value
@@ -1206,9 +1234,7 @@ def load_state_dict_strict(
     """
     converted, discarded = convert_checkpoint_tensors(state)
     if not allow_training_only and discarded:
-        raise CheckpointKeyError(
-            f"training-only keys present but not allowed: {list(discarded)}"
-        )
+        raise CheckpointKeyError(f"training-only keys present but not allowed: {list(discarded)}")
     target = flat_parameter_names(module)
     missing = sorted(set(target) - set(converted))
     unexpected = sorted(set(converted) - set(target))
