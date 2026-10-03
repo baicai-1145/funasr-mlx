@@ -187,14 +187,39 @@ SUPPORTED: tuple[Variant, ...] = (
             "Bounded first full-model proof only; not evidence for larger variants."
         ),
     ),
+    Variant(
+        key="whisper-large-v3",
+        family="whisper",
+        checkpoint="models/whisper-large-v3/large-v3.pt",
+        config="models/whisper-large-v3/dims.json",
+        max_seconds=30.0,
+        frontend={"fs": 16000, "n_mels": 80, "n_fft": 400, "hop_length": 160},
+        reference_import="",
+        reference_class="",
+        notes=(
+            "Same canonical OpenAI architecture at large-v3 dimensions "
+            "(1280/32L/20H); SDPA-fused encoder path. Full FP32 weights ~3.1 GB; "
+            "runs under the large-model memory admission."
+        ),
+    ),
+    Variant(
+        key="whisper-large-v3-turbo",
+        family="whisper",
+        checkpoint="models/whisper-large-v3-turbo/large-v3-turbo.pt",
+        config="models/whisper-large-v3-turbo/dims.json",
+        max_seconds=30.0,
+        frontend={"fs": 16000, "n_mels": 80, "n_fft": 400, "hop_length": 160},
+        reference_import="",
+        reference_class="",
+        notes=(
+            "Encoder 32L like large-v3 but a 4-layer decoder (verified from the "
+            "checkpoint's block indices); dims.json pins n_text_layer=4."
+        ),
+    ),
 )
 
 #: Refused with a reason rather than quietly aliased to a smaller checkpoint.
 UNSUPPORTED: dict[str, str] = {
-    "whisper-large": "Not aligned. Roughly 1.5 GB of weights needs its own memory "
-    "budget and approval; a tiny result is not evidence about it.",
-    "whisper-large-v3-turbo": "Not aligned. Same budget reason as whisper-large, "
-    "and the turbo variant changes decoder depth, so tiny says nothing about it.",
     "whisper-base": "Not aligned. Structurally identical to tiny and covered by it; "
     "add it when a full base run is actually needed.",
     "paraformer-zh-streaming": "Not aligned. Streaming chunking changes the LFR and "

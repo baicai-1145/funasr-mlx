@@ -139,13 +139,25 @@ def catalog():
                 isinstance(target, ast.Name) and target.id == "_MODELS" for target in node.targets
             )
         )
-        url = ast.literal_eval(value)["tiny"]
+        models = ast.literal_eval(value)
+        url_tiny = models["tiny"]
         result["models"]["whisper"] = {
             "family": "whisper",
             "variant": "tiny",
             "source": source,
-            "files": [{"path": "tiny.pt", "url": url, "sha256": url.split("/")[-2]}],
+            "files": [{"path": "tiny.pt", "url": url_tiny, "sha256": url_tiny.split("/")[-2]}],
         }
+        for variant, name in (
+            ("whisper-large-v3", "large-v3"),
+            ("whisper-large-v3-turbo", "large-v3-turbo"),
+        ):
+            url = models[name]
+            result["models"][variant] = {
+                "family": "whisper",
+                "variant": name,
+                "source": source,
+                "files": [{"path": f"{name}.pt", "url": url, "sha256": url.split("/")[-2]}],
+            }
     except (urllib.error.URLError, ValueError, KeyError, StopIteration) as error:
         result["errors"]["whisper"] = str(error)
     result["datasets"]["librispeech-test-clean"] = {
