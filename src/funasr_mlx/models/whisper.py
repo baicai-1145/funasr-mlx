@@ -556,6 +556,25 @@ class MultiHeadAttention(mxnn.Module):
             k = kv_cache[key_name]
             v = kv_cache[value_name]
 
+        # Fused path: with no mask (cross-attention or any unmasked pass) the
+        # whole scale+QK^T+softmax+@V chain is one SDPA kernel -- at T=1500 the
+        # manual path materializes a (B,H,T,T) score matrix whose traffic
+        # dominates the encoder. Whisper's dual ``d^-0.25`` scaling is exactly
+        # SDPA's ``scale=d_k**-0.5``, and SDPA's internal softmax runs in
+        # float32 like the reference. The causal-masked self-attention path
+        # keeps the manual implementation (mask semantics + qk return value
+        # are covered by tests against the reference).
+        if mask is None:
+            attn = mx.fast.scaled_dot_product_attention(
+                self._split(q),
+                self._split(k),
+                self._split(v),
+                scale=(self._n_state // self._n_head) ** -0.5,
+            )
+            b, _, t, _ = attn.shape
+            attn = mx.reshape(mx.transpose(attn, (0, 2, 1, 3)), (b, t, self._n_state))
+            return self.out(attn)
+
         attn_out, _ = self.qkv_attention(
             self._split(q),
             mx.swapaxes(self._split(k), -1, -2),
