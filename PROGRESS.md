@@ -110,3 +110,33 @@ Next acceptance stages are complete canonical checkpoints/tokenizers/labels for 
   vocab/input sizes; legacy torch.load degrades explicitly.
 
 Commits: 2eb4668, 9d5be6a, 48b4b5b, 4c327d4, 64dedf6.
+
+## 2026-10-03 (cont.): SDPA fusion across all attention models + speed envelope
+
+Per-model outcome of "operator fusion where it exists":
+| family | attention | fused path | speed |
+|---|---|---|---|
+| sensevoice | SANM x70, T=99 | SDPA (mask folded to None) | 25.3 -> 23.2 ms (-8.3%) |
+| paraformer | SANM 50+16, T=99 | SDPA (same) | 24.7 -> 24.2 ms (-1.9%) |
+| whisper-tiny | MHA, T=1500 | SDPA (encoder self + decoder cross) | 38.4 -> 30.0 ms (-22%) |
+| emotion2vec | Alt x24 + ALiBi | SDPA (bias as additive mask) | ~unchanged (81 ms; MLP-bound) |
+| ct-punc | SANM copy x6, T~13 | not applied (T too short; 6.0 ms is GEMM-bound) | - |
+| fsmn-vad | none | n/a | - |
+| campplus | none | n/a | - |
+
+Whisper parity on saved artifacts: encoder 1.4e-4 relative vs torch reference,
+decoder one-step 4.96e-5 vs old native (which was 1.66e-4 vs reference),
+next token identical.
+
+Where the remaining time goes (measured, not estimated):
+- emotion2vec 75 ms = MLP GEMM (174x1024@1024x4096 x2 x12 = 29 ms at ~1.7
+  TFLOPS, the M4's realistic fp32 GEMM rate) + attention 1.5 ms/layer + LN.
+  f16 blocks save only 10% and cost 8.3e-4 relative - not adopted for speed.
+- SANM stacks are launch-latency bound (0.55 ms/layer, ~15 kernels); the
+  un-fusable remainder (GEMM, depthwise conv, mx.fast.layer_norm) has no
+  MLX fused equivalents.
+- mx.compile: +0.8% (noise). astype to same dtype is near-zero-copy, so
+  Fp32LayerNorm carries no cast tax in f32.
+
+Commits: 05ea904 (SANM SDPA), 7999814 (emotion2vec ALiBi-as-mask), d5a72d0
+(whisper SDPA).
