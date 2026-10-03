@@ -154,6 +154,12 @@ class GlmAsrAudioEncoder(mxnn.Module):
         x = self.norm(x)
         b, t, d = x.shape
         g = self.cfg.projector_groups  # frames merged per projector row
-        x = mx.reshape(x, (b, t // g, d * g))
+        # the reference pads the mel to 3000 frames so L % 4 == 0; on real
+        # length pad the conv output to a multiple of g, reshape, then keep
+        # the first (t - g) // g + 1 rows (the padding rows are dropped)
+        if t % g:
+            x = mx.pad(x, [(0, 0), (0, g - t % g), (0, 0)])
+        n = (t - g) // g + 1
+        x = mx.reshape(x, (b, -1, d * g))[:, :n]
         x = mxnn.GELU()(self.linear_1(x))
         return self.linear_2(x)

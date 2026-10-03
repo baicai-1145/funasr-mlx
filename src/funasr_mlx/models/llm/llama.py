@@ -49,11 +49,12 @@ class _LlamaAttention(mxnn.Module):
         def split(v: mx.array, heads: int) -> mx.array:
             return mx.transpose(mx.reshape(v, (b, t, heads, self.head_dim)), (0, 2, 1, 3))
 
-        q = self.rope(split(self.q_proj(x), self.n_heads))
-        k = self.rope(split(self.k_proj(x), self.n_kv))
+        offset = cache.offset if cache is not None else 0
+        q = self.rope(split(self.q_proj(x), self.n_heads), offset=offset)
+        k = self.rope(split(self.k_proj(x), self.n_kv), offset=offset)
         v = split(self.v_proj(x), self.n_kv)
         if cache is not None:
-            k, v = cache.update(k, v)
+            k, v = cache.update_and_fetch(k, v)
         o = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         o = mx.reshape(mx.transpose(o, (0, 2, 1, 3)), (b, t, -1))
         return self.o_proj(o)
