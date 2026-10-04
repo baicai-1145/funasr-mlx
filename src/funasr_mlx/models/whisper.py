@@ -756,13 +756,25 @@ class AudioEncoder(mxnn.Module):
         self._n_state = n_state
         self._n_ctx = n_ctx
 
+    def _weight_dtype(self) -> mx.Dtype:
+        """Dtype of this module's checkpoint weights (``conv1`` always exists)."""
+        return self.conv1.weight.dtype
+
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``(B, T', n_mels)`` -> ``(B, T'/2, n_state)``.
 
         ``conv1`` has **no** stride and only ``conv2`` halves the time axis, so
         the contract is exactly ``2 * n_ctx`` mel frames in and ``n_ctx`` frames
         out.
+
+        The incoming mel is cast to the **weight** dtype first.  The front-end
+        always produces float32 mel, so without this cast an fp16 checkpoint
+        would promote the first conv to float32 and leave the whole encoder in
+        mixed precision, paying a promotion at every conv and Linear (measured
+        on M4: 22.67 ms vs 17.48 ms for the 30 s encoder window).  For a float32
+        checkpoint the cast is a no-op, so its numerics stay bit-identical.
         """
+        x = x.astype(self._weight_dtype())
         x = _GELU(self.conv1(x))
         x = _GELU(self.conv2(x))
 
@@ -824,6 +836,10 @@ class TextDecoder(mxnn.Module):
         """The ``(n_ctx, n_ctx)`` lower-triangular ``-inf`` mask."""
         return self._mask
 
+    def _weight_dtype(self) -> mx.Dtype:
+        """Dtype of this module's checkpoint weights (``ln`` always exists)."""
+        return self.ln.weight.dtype
+
     def offset(self, kv_cache: Mapping[str, mx.array] | None) -> int:
         """Absolute position of the next token, from the self-attention cache.
 
@@ -851,7 +867,13 @@ class TextDecoder(mxnn.Module):
         emb = self.token_embedding(x)
         pos = self.positional_embedding[offset : offset + x.shape[1]]
         emb = emb + pos.reshape(1, pos.shape[0], pos.shape[1])
-        emb = emb.astype(xa.dtype)
+        # Follow the **decoder's own weight dtype**, not ``xa``/the mel dtype.
+        # The front-end mel is float32, so casting to ``xa.dtype`` used to lock
+        # the entire decoder into float32 activations against fp16 weights: a
+        # mixed-dtype promotion at every Linear, every step (measured on M4:
+        # 9.12 ms/step vs 2.02 ms/step for a 24-step decode).  A float32
+        # checkpoint is unaffected -- the cast is a no-op there.
+        emb = emb.astype(self._weight_dtype())
         for block in self.blocks:
             emb = block(emb, xa=xa, mask=mask, kv_cache=kv_cache)
         emb = self.ln(emb)
@@ -904,6 +926,12 @@ class Whisper(mxnn.Module):
         return True
 
     def embed_audio(self, mel: mx.array) -> mx.array:
+        """Encode ``(B, 2 * n_audio_ctx, n_mels)`` mel frames.
+
+        The encoder casts the mel to its own weight dtype (see
+        :meth:`AudioEncoder.__call__`), so an fp16 checkpoint produces fp16
+        audio features even though the front-end mel is float32.
+        """
         return self.encoder(mel)
 
     def logits(
