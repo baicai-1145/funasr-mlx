@@ -914,6 +914,10 @@ class AudioEncoder(nn.Module):
             self.alibi_scale = None
 
     # -- pieces, kept separate so the tests can drive them individually ----- #
+    def _weight_dtype(self) -> mx.Dtype:
+        """Dtype of this encoder's checkpoint weights (first conv always exists)."""
+        return self.local_encoder.conv_layers["0"]["0"].weight.dtype
+
     def local_features(self, samples: mx.array) -> mx.array:
         """Waveform ``(B, samples)`` -> projected features ``(B, T, embed_dim)``.
 
@@ -947,6 +951,15 @@ class AudioEncoder(nn.Module):
         # Bound the O(T^2) attention here too, not only via Emotion2VecModel.
         self.config.frames_for(int(samples.shape[-1]))
 
+        # Follow the module's own weight dtype, exactly as whisper's
+        # ``AudioEncoder.__call__`` does.  The waveform is normalised in float32
+        # (``preprocess_waveform``), so without this cast an fp16 checkpoint
+        # runs the conv stack and all 12 blocks with float32 activations against
+        # fp16 weights and pays a mixed-dtype promotion at every op (measured on
+        # M4, 3.3 s window: 51.7 ms vs 37.2 ms, 1.39x).
+        weight_dtype = self._weight_dtype()
+        samples = samples.astype(weight_dtype)
+
         x = self.local_features(samples)
         x = x + self.relative_positional_encoder(x)
 
@@ -963,8 +976,20 @@ class AudioEncoder(nn.Module):
 
         num = self.extra_tokens.shape[1]
         if num:
+            # ``extra_tokens`` is a plain buffer that is concatenated onto the
+            # conv features.  A published float32 buffer would re-promote the
+            # whole 12-block stack of an fp16 checkpoint at the very first op --
+            # exactly the promotion the entry cast above removes -- so the
+            # broadcast follows the activation dtype.  The buffer is zeros, so
+            # this is numerically exact; for a float32 checkpoint it is a no-op.
             x = mx.concatenate(
-                [mx.broadcast_to(self.extra_tokens, (x.shape[0], num, x.shape[2])), x], axis=1
+                [
+                    mx.broadcast_to(
+                        self.extra_tokens.astype(x.dtype), (x.shape[0], num, x.shape[2])
+                    ),
+                    x,
+                ],
+                axis=1,
             )
             if alibi_bias is not None:
                 alibi_bias = mx.pad(alibi_bias, [(0, 0), (0, 0), (num, 0), (num, 0)])
