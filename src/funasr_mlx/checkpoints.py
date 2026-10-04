@@ -352,12 +352,12 @@ def convert_checkpoint(
             "Safetensors sources must declare their layout: pass source_rule"
         )
     source_is_file = source.is_file()
-    if not source_is_file and not (source / "model.safetensors.index.json").is_file():
-        source_is_file = bool(tuple(source.glob("*.safetensors")))
-    if not source_is_file or (
-        source.is_file() and source.stat().st_size > 8_000_000_000
-    ):
-        raise ValueError("Missing or oversized source checkpoint")
+    has_index = (source / "model.safetensors.index.json").is_file()
+    has_shards = bool(tuple(source.glob("*.safetensors")))
+    if not source_is_file and not (has_index or has_shards):
+        raise ValueError("Missing source checkpoint")
+    if source_is_file and source.stat().st_size > 8_000_000_000:
+        raise ValueError("Oversized source checkpoint")
     if destination.exists():
         raise FileExistsError("Conversion destination must not already exist")
 
