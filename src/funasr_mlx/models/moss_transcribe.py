@@ -156,6 +156,15 @@ class MossTranscribeDiarize(mxnn.Module):
         x = mx.reshape(x, (b, trim // m, d * m))
         return self.vq_adaptor(x)
 
+    def _decoder_dtype(self) -> mx.Dtype:
+        """Dtype of the decoder's checkpoint weights (``embed_tokens``).
+
+        This is the dtype the decoder activations must follow: the token
+        embedding produces it, so splicing anything else into the stream
+        promotes every Linear in the stack (see :meth:`forward_with_audio`).
+        """
+        return self.language_model.model.embed_tokens.weight.dtype
+
     def forward_with_audio(
         self,
         token_ids: mx.array,
@@ -171,6 +180,16 @@ class MossTranscribeDiarize(mxnn.Module):
         match = token_ids == self.audio_token_id
         first = int(mx.argmax(match).item())
         h = self.language_model.model.embed_tokens(token_ids)
+        # Follow the decoder's own weight dtype, exactly as the Qwen3-ASR and
+        # GLM thinkers do (57bf9cb) and as whisper's TextDecoder does.  The
+        # whisper tower + VQAdaptor emit float32 (float32 mel in), so splicing
+        # them unchanged locked all 28 Qwen3 decoder layers into float32
+        # activations against bf16 weights: a mixed-dtype promotion at every
+        # Linear, every step (measured on M4: 80.5 vs 13.8 ms/step, 5.8x).
+        # Both in-repo callers previously cast in the CALLER, which masked this
+        # -- the shipping model path was still promoted.  A float32 checkpoint
+        # is unaffected: the cast is a no-op there.
+        audio_embeds = audio_embeds.astype(self._decoder_dtype())
         h = mx.concatenate(
             [h[:, :first, :], audio_embeds, h[:, first + pad_span :, :]], axis=1
         )
