@@ -20,7 +20,76 @@ SUPPORTED_MODELS = (
     "campplus",
     "emotion2vec",
     "whisper",
+    # LLM-based ASR families (safetensors sources; see SOURCE_RULES).
+    "fun-asr-nano",
+    "qwen3-asr",
+    "glm-asr-nano",
+    "moss-transcribe-diarize",
 )
+
+#: Output precisions ``convert_checkpoint`` may emit. ``bfloat16`` is only
+#: reachable through the streaming writer (NumPy has no bfloat16), so it is
+#: admitted for families whose canonical dtype is bf16.
+SUPPORTED_DTYPES = ("float16", "float32", "bfloat16")
+
+
+@dataclass(frozen=True)
+class SourceRule:
+    """How one LLM family's source keys map onto the native parameter names.
+
+    ``prefixes`` maps a source key prefix to the native prefix, longest
+    first. ``renames`` are literal substring rewrites applied afterwards
+    (used for the Qwen3-ASR ``conv2d`` -> ``conv`` submodule move). A rule is
+    strict: a key that matches no prefix raises rather than being passed
+    through, so a renamed upstream checkpoint cannot silently produce a
+    wrong key set.
+    """
+
+    prefixes: tuple[tuple[str, str], ...]
+    renames: tuple[tuple[str, str], ...] = ()
+
+    def apply(self, name: str) -> str:
+        for source, target in self.prefixes:
+            if name.startswith(source):
+                short = target + name[len(source) :]
+                break
+        else:
+            raise ValueError(f"Checkpoint key outside the declared source layout: {name}")
+        for old, new in self.renames:
+            if old in short:
+                short = short.replace(old, new)
+        return short
+
+
+#: The five LLM-ASR families. Fun-ASR-Nano's ``llm.*`` subtree is an
+#: unmodified ``Qwen3ForCausalLM`` state dict (PROGRESS.md), so it is bound
+#: under the model's ``llm.`` attribute with the prefix stripped.
+SOURCE_RULES = {
+    "fun-asr-nano": SourceRule(
+        prefixes=(
+            ("audio_encoder.", "audio_encoder."),
+            ("audio_adaptor.", "audio_adaptor."),
+            ("llm.", "llm."),
+        )
+    ),
+    "qwen3-asr": SourceRule(
+        prefixes=(("thinker.", ""),),
+        renames=tuple(
+            (f"audio_tower.conv2d{index}.{suffix}", f"audio_tower.conv2d{index}.conv.{suffix}")
+            for index in (1, 2, 3)
+            for suffix in ("weight", "bias")
+        ),
+    ),
+    "glm-asr-nano": SourceRule(prefixes=(("", ""),)),
+    "moss-transcribe-diarize": SourceRule(prefixes=(("model.", ""),)),
+}
+
+#: Families whose source tensors are bfloat16 and whose canonical native
+#: dtype is therefore bfloat16 (no lossy cast on conversion).
+BFLOAT16_FAMILIES = frozenset(SOURCE_RULES)
+
+#: Families whose source is a torch ZIP rather than safetensors.
+TORCH_SOURCE_FAMILIES = frozenset({"fun-asr-nano"})
 DTYPE_BYTES = {
     "F64": 8,
     "F32": 4,
@@ -161,6 +230,22 @@ def convert_tensor(name: str, tensor: np.ndarray, model: str) -> np.ndarray:
         if tensor.ndim != 3:
             raise ValueError(f"Expected rank-3 Whisper convolution for {name}")
         return tensor.transpose(0, 2, 1)
+    elif model == "fun-asr-nano":
+        # SANM fsmn_block: torch (D, 1, K) -> MLX Conv1d (D, K, 1).
+        if name.endswith("fsmn_block.weight"):
+            if tensor.ndim != 3:
+                raise ValueError(f"Expected rank-3 FSMN block for {name}")
+            return tensor.transpose(0, 2, 1)
+    elif model == "qwen3-asr":
+        # Qwen3-ASR audio tower: torch Conv2d (O, I, KH, KW) -> MLX (O, KH, KW, I).
+        if ".conv." in name and name.endswith("weight") and tensor.ndim == 4:
+            return tensor.transpose(0, 2, 3, 1)
+    elif model in {"glm-asr-nano", "moss-transcribe-diarize"}:
+        # torch Conv1d (O, I, K) -> MLX Conv1d (O, K, I).
+        if name.endswith(("conv1.weight", "conv2.weight")):
+            if tensor.ndim != 3:
+                raise ValueError(f"Expected rank-3 convolution for {name}")
+            return tensor.transpose(0, 2, 1)
     return tensor
 
 
