@@ -173,9 +173,13 @@ runtime dependency; core deps stay 6): `llm/qwen3.py`, `llm/llama.py`,
 `llm/rope.py`, `llm/kv_cache.py` (~600 lines self-maintained).
 
 - **Fun-ASR-Nano** (commit b6deb06): SenseVoiceEncoderSmall reuse +
-  ESPnet-style adaptor + Qwen3 backbone; vLLM template. e2e correct;
-  batch 6/8 (samples 3/7 empty transcripts on 5.2s clips -- unexplained,
-  open).
+  ESPnet-style adaptor + Qwen3 backbone; vLLM template. e2e correct.
+  Samples 3/7 (both 5.2s) initially decoded EMPTY -- root cause was the
+  SAME prefill-mask bug as Qwen3-ASR (pre-created KVCache list -> no
+  causal mask on the 70-token prefill; short clips survived, long ones
+  hit im_end at step 0). After mask='causal': 8/8 semantically correct
+  (sample 3 tail truncation and sample 7 numeral noise remain, same
+  class as MOSS/GLM minor deviations).
 - **Qwen3-ASR-0.6B** (commits c8b8e15, 7a9c405): chunked-conv audio tower
   (abs 1.2e-6/rel 1.2e-5 on 67 frames), thinker = Qwen3ForCausalLM reuse.
   Prefill causal-mask bug found via dual-decoder test (official vs port
