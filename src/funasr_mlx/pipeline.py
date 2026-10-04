@@ -8,7 +8,12 @@ import os
 import warnings
 from pathlib import Path
 
-from .checkpoints import checkpoint_files, inspect_checkpoint, safetensor_header
+from .checkpoints import (
+    DERIVED_NATIVE_PARAMETERS,
+    checkpoint_files,
+    inspect_checkpoint,
+    safetensor_header,
+)
 from .memory import MB, MemoryBudgetExceeded, MemoryPolicy, guarded_child_active
 
 
@@ -66,6 +71,24 @@ def create_model(family: str, config: dict):
         except TypeError as error:
             raise ValueError(f"Invalid emotion2vec configuration: {error}") from error
         return module.Emotion2VecModel(parsed)
+    if family == "fun-asr-nano":
+        module = importlib.import_module(".models.fun_asr_nano", __package__)
+        return module.FunASRNano(module.nano_config_from_dict(config))
+    if family == "qwen3-asr":
+        module = importlib.import_module(".models.qwen3_asr_thinker", __package__)
+        return module.Qwen3ASR(module.qwen3asr_config_from_dict(config))
+    if family == "glm-asr-nano":
+        module = importlib.import_module(".models.glm_asr_thinker", __package__)
+        return module.GlmAsrThinker(module.glmasr_thinker_config_from_dict(config))
+    if family == "moss-transcribe-diarize":
+        module = importlib.import_module(".models.moss_transcribe", __package__)
+        text = importlib.import_module(".models.llm.qwen3", __package__)
+        return module.MossTranscribeDiarize(
+            config["audio_config"],
+            text.Qwen3ModelArgs.from_dict(config["text_config"]),
+            audio_merge_size=int(config.get("audio_merge_size", 4)),
+            audio_token_id=int(config.get("audio_token_id", 151671)),
+        )
     raise ValueError(f"Unknown model family: {family}")
 
 
@@ -113,6 +136,17 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
 
     model = create_model(family, config_dict)
     expected = dict(tree_flatten(model.parameters()))
+    # A port may derive a parameter at construction instead of loading it (the
+    # Qwen3-ASR sinusoidal position table is computed from the config). Those
+    # names are declared as data beside the layout rules; each declaration is
+    # checked against the built model here, so a stale entry fails loudly
+    # instead of quietly excusing a missing tensor.
+    derived = set(DERIVED_NATIVE_PARAMETERS.get(family, ()))
+    unknown_derived = sorted(derived - set(expected))
+    if unknown_derived:
+        raise KeyError(f"Declared derived parameters are not model parameters: {unknown_derived}")
+    for name in derived:
+        del expected[name]
     ignored = set()
     if family == "campplus":
         from .models.campplus import TORCH_ONLY_BUFFERS, BatchNorm
@@ -154,6 +188,8 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     model.eval()
     mx.eval(model.parameters())
     mx.clear_cache()
+    if derived:
+        model._derived_parameters = tuple(sorted(derived))
     if ignored:
         model._checkpoint_ignored_buffers = tuple(sorted(ignored))
         warnings.warn(

@@ -22,21 +22,87 @@ _CODES = {
     "bool": "BOOL",
 }
 
+#: safetensors type codes the bounded writer can emit directly, with their
+#: bytes per element. Includes ``BF16``, which NumPy cannot name as a dtype:
+#: a bfloat16 payload is carried as raw ``uint16`` words and written under the
+#: ``BF16`` code, so the bits reach disk unchanged.
+_CODE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F64": 8}
+
+
+def write_shard(path: Path, tensors: dict, *, metadata: dict, code: str) -> None:
+    """Write a whole shard whose tensors are all carried in one dtype.
+
+    ``code`` is the safetensors type code written for every tensor. It exists
+    because a bfloat16 shard has to be written as raw ``uint16`` words under
+    the ``BF16`` code -- NumPy cannot name a bfloat16 dtype, so
+    ``safetensors.numpy.save_file`` would write ``U16`` and the loader would
+    then see integer weights.
+    """
+    if code not in _CODE_BYTES:
+        raise ValueError(f"Unsupported shard type code {code}")
+    width = _CODE_BYTES[code]
+    header: dict = {"__metadata__": dict(metadata)}
+    offset = 0
+    for name, array in tensors.items():
+        if array.dtype.itemsize != width:
+            raise ValueError(
+                f"Shard tensor {name} has element width {array.dtype.itemsize}, "
+                f"but code {code} needs {width}"
+            )
+        size = int(array.size) * width
+        header[name] = {
+            "dtype": code,
+            "shape": list(array.shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * ((-len(encoded)) % 8)
+    temporary = path.with_suffix(path.suffix + ".partial")
+    try:
+        with temporary.open("wb") as output:
+            output.write(struct.pack("<Q", len(encoded)))
+            output.write(encoded)
+            for array in tensors.values():
+                output.write(np.ascontiguousarray(array).tobytes())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
 
 def write_tensor(
-    path: Path, name: str, array: np.ndarray, *, dtype, metadata, chunk_bytes: int = 16_000_000
+    path: Path,
+    name: str,
+    array: np.ndarray,
+    *,
+    dtype,
+    metadata,
+    chunk_bytes: int = 16_000_000,
+    code: str | None = None,
 ):
-    """Write one tensor, converting only bounded slices rather than its full data."""
+    """Write one tensor, converting only bounded slices rather than its full data.
+
+    ``code`` overrides the safetensors type code written for the payload; it is
+    how a bfloat16 tensor (carried as a ``uint16`` array, since NumPy has no
+    bfloat16) is stored as ``BF16`` rather than ``U16``. The override must agree
+    with the array's element width, so no reinterpretation can silently happen.
+    """
     output_dtype = np.dtype(dtype)
     if not array.flags.c_contiguous:
         raise ValueError("Large streaming tensors must be C-contiguous")
-    if not output_dtype.isnative or output_dtype.name not in _CODES:
+    if code is not None:
+        if _CODE_BYTES.get(code) != array.dtype.itemsize:
+            raise ValueError("Streaming type code disagrees with the array element width")
+        output_code = code
+    elif not output_dtype.isnative or output_dtype.name not in _CODES:
         raise ValueError("Unsupported streaming tensor dtype")
+    else:
+        output_code = _CODES[output_dtype.name]
     count = int(array.size)
     header = {
         "__metadata__": dict(metadata),
         name: {
-            "dtype": _CODES[output_dtype.name],
+            "dtype": output_code,
             "shape": list(array.shape),
             "data_offsets": [0, count * output_dtype.itemsize],
         },
