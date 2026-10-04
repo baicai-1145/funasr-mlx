@@ -976,20 +976,8 @@ class AudioEncoder(nn.Module):
 
         num = self.extra_tokens.shape[1]
         if num:
-            # ``extra_tokens`` is a plain buffer that is concatenated onto the
-            # conv features.  A published float32 buffer would re-promote the
-            # whole 12-block stack of an fp16 checkpoint at the very first op --
-            # exactly the promotion the entry cast above removes -- so the
-            # broadcast follows the activation dtype.  The buffer is zeros, so
-            # this is numerically exact; for a float32 checkpoint it is a no-op.
             x = mx.concatenate(
-                [
-                    mx.broadcast_to(
-                        self.extra_tokens.astype(x.dtype), (x.shape[0], num, x.shape[2])
-                    ),
-                    x,
-                ],
-                axis=1,
+                [mx.broadcast_to(self.extra_tokens, (x.shape[0], num, x.shape[2])), x], axis=1
             )
             if alibi_bias is not None:
                 alibi_bias = mx.pad(alibi_bias, [(0, 0), (0, 0), (num, 0), (num, 0)])
