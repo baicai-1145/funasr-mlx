@@ -343,16 +343,14 @@ def convert_checkpoint(
         raise ValueError("Unsafe shard/tensor buffer size")
     source, destination = Path(source), Path(destination)
     is_safetensors = source.is_dir() or source.suffix == ".safetensors"
-    # A safetensors source needs a declared rule (except for the torch-ZIP
-    # families, whose layout lives in convert_tensor); a rule is meaningless for
-    # a torch source. Checked after the source type is known, so the error names
-    # the actual problem instead of the symptom.
+    # A safetensors source of a non-torch family must declare its layout rule
+    # (otherwise nothing renames its keys onto the native names). A torch
+    # source's layout lives in convert_tensor, but a rule may still be passed
+    # for its `drop` list (fun-asr-nano's tied lm_head).
     if is_safetensors and model not in TORCH_SOURCE_FAMILIES and source_rule is None:
         raise ValueError(
             "Safetensors sources must declare their layout: pass source_rule"
         )
-    if not is_safetensors and source_rule is not None:
-        raise ValueError("A torch-ZIP source carries its layout in convert_tensor")
     source_is_file = source.is_file()
     if not source_is_file and not (source / "model.safetensors.index.json").is_file():
         source_is_file = bool(tuple(source.glob("*.safetensors")))
@@ -379,7 +377,6 @@ def convert_checkpoint(
         )
 
     import torch
-    from safetensors.numpy import save_file
 
     is_zip = zipfile.is_zipfile(source)
     if not is_zip:
@@ -399,6 +396,20 @@ def convert_checkpoint(
     destination.mkdir(parents=True)
     pending, buffered, shard_number, weight_map = {}, 0, 0, {}
     skipped: list[str] = []
+    dropped: list[str] = []
+
+    # A bfloat16 source kept at bfloat16 stays a raw uint16 carrier (NumPy has
+    # no bfloat16) and is written under the BF16 code, exactly as the
+    # safetensors path does. Anything else is rounded on the host, in place.
+    output_code = {"float16": "F16", "float32": "F32", "bfloat16": "BF16"}[dtype]
+    write_shard = None
+    if output_code == "BF16":
+        from .checkpoint_stream import write_shard
+
+    def metadata() -> dict:
+        # Exactly the two keys every already-published native shard carries;
+        # the output dtype belongs in the index metadata, not here.
+        return {"format": "funasr-mlx", "model": model}
 
     def flush():
         nonlocal pending, buffered, shard_number
@@ -406,9 +417,14 @@ def convert_checkpoint(
             return
         shard_number += 1
         filename = f"model-{shard_number:05d}.safetensors"
-        temporary = destination / (filename + ".partial")
-        save_file(pending, str(temporary), metadata={"format": "funasr-mlx", "model": model})
-        temporary.replace(destination / filename)
+        if write_shard is None:
+            from safetensors.numpy import save_file
+
+            temporary = destination / (filename + ".partial")
+            save_file(pending, str(temporary), metadata=metadata())
+            temporary.replace(destination / filename)
+        else:
+            write_shard(destination / filename, pending, metadata=metadata(), code=output_code)
         weight_map.update({name: filename for name in pending})
         pending, buffered = {}, 0
 
@@ -416,7 +432,7 @@ def convert_checkpoint(
         if not isinstance(original_name, str) or not isinstance(tensor, torch.Tensor):
             raise ValueError("Non-tensor checkpoint entries are not silently discarded")
         if source_rule is not None and original_name in SOURCE_RULES[source_rule].drop:
-            skipped.append(original_name)
+            dropped.append(original_name)
             continue
         if allowed_source_keys is not None and original_name not in allowed_source_keys:
             if ".decoder." not in original_name and ".ema" not in original_name:
@@ -433,19 +449,26 @@ def convert_checkpoint(
         large = tensor.numel() * max(tensor.element_size(), 4) > tensor_limit
         if large and not stream_large_tensors:
             raise ValueError(f"Tensor exceeds conversion buffer bound: {name}")
-        if tensor.dtype == torch.bfloat16:
-            if dtype == "bfloat16":
-                raise ValueError(
-                    "bfloat16 output from a torch source is not supported; "
-                    "NumPy has no bfloat16 and the torch reader is not chunked"
-                )
-            tensor = tensor.float()
-        array = tensor.detach().numpy()
+        is_bf16 = tensor.dtype == torch.bfloat16
+        if is_bf16:
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            array = tensor.view(torch.uint16).numpy()
+        else:
+            array = tensor.detach().numpy()
+        del tensor
         array = convert_tensor(name, array, model)
-        output_dtype = dtype if array.dtype.kind == "f" else array.dtype
-        if name.endswith(("running_mean", "running_var")):
-            output_dtype = "float32"
-        size = array.size * np.dtype(output_dtype).itemsize
+        keep_bf16 = is_bf16 and dtype == "bfloat16"
+        if is_bf16 and not keep_bf16:
+            array = _bf16_carrier_to(array, dtype)
+        elif array.dtype.kind == "f" and array.dtype != np.dtype(dtype):
+            array = array.astype(np.dtype(dtype), copy=False)
+        if name.endswith(("running_mean", "running_var")) and not is_bf16:
+            array = array.astype(np.float32, copy=False)
+        # ascontiguousarray promotes a 0-d array to shape (1,), which would
+        # corrupt the rank-0 BatchNorm training counters; keep those as-is.
+        if array.ndim:
+            array = np.ascontiguousarray(array)
         if large:
             from .checkpoint_stream import write_tensor
 
@@ -456,20 +479,21 @@ def convert_checkpoint(
                 destination / filename,
                 name,
                 array,
-                dtype=output_dtype,
-                metadata={"format": "funasr-mlx", "model": model},
+                dtype=array.dtype,
+                code="BF16" if keep_bf16 else None,
+                metadata=metadata(),
             )
             weight_map[name] = filename
-            del array, tensor
+            del array
             continue
+        size = array.nbytes
         if buffered and buffered + size > shard_bytes:
             flush()
-        array = np.asarray(array, dtype=output_dtype, order="C")
         pending[name] = array
-        buffered += array.nbytes
+        buffered += size
+        del array
         if buffered >= shard_bytes:
             flush()
-        del array, tensor
     flush()
     index = {
         "metadata": {
@@ -481,6 +505,7 @@ def convert_checkpoint(
             "name_map": dict(name_map or {}),
             "source_rule": source_rule,
             "training_only_skipped": sorted(skipped),
+            "dropped_source_keys": sorted(dropped),
         },
         "weight_map": weight_map,
     }
@@ -626,7 +651,9 @@ def _convert_safetensors_source(
     pending, buffered, shard_number, weight_map = {}, 0, 0, {}
 
     def metadata() -> dict:
-        return {"format": "funasr-mlx", "model": model, "dtype": dtype}
+        # Two keys only, matching every already-published native shard; the
+        # output dtype is recorded in the index metadata instead.
+        return {"format": "funasr-mlx", "model": model}
 
     def next_shard() -> Path:
         nonlocal shard_number
