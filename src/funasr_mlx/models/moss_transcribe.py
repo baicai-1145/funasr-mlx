@@ -42,10 +42,21 @@ class _HfWhisperBlock(mxnn.Module):
 
 
 class _HfWhisperAttn(mxnn.Module):
+    """HF ``WhisperAttention``: q/v/out carry biases, **k does not**.
+
+    ``k_proj`` is bias-free in the reference (``nn.Linear(embed_dim,
+    embed_dim, bias=False)`` in transformers' ``modeling_whisper.py``), and the
+    checkpoint agrees: ``...self_attn.k_proj.bias`` is absent from all 24
+    layers.  Building it with ``bias=True`` therefore left a random,
+    never-trained key bias in the audio tower -- measured on the previous
+    release: exists=True, absmax 0.0312, absmean 0.0158.  The old permissive
+    loaders never noticed, which is why MOSS tower parity sat at 1.3e-3.
+    """
+
     def __init__(self, d: int, heads: int) -> None:
         super().__init__()
         self.q_proj = mxnn.Linear(d, d, bias=True)
-        self.k_proj = mxnn.Linear(d, d, bias=True)
+        self.k_proj = mxnn.Linear(d, d, bias=False)
         self.v_proj = mxnn.Linear(d, d, bias=True)
         self.out_proj = mxnn.Linear(d, d, bias=True)
         self._h = heads
