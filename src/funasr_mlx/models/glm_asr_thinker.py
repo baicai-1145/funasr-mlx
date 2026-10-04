@@ -66,17 +66,23 @@ class GlmAsrThinker(mxnn.Module):
         """
         return self.language_model.model.embed_tokens.weight.dtype
 
+    def _tower_dtype(self) -> mx.Dtype:
+        """Dtype of the audio tower's checkpoint weights (first conv)."""
+        return self.audio_tower.conv1.weight.dtype
+
     def encode_audio(self, mel: mx.array) -> mx.array:
         """mel (F, T) -> (1, N, text_hidden) embeddings for the pad run.
 
-        The mel is deliberately NOT cast to the tower's weight dtype here.
-        The same cast buys qwen3-asr's tower 27% (interleaved A/B, M4), but
-        this encoder measures at 1.00x (see .tmp/task4/tower-tight-*.json):
-        32 layers of 1280d attention are dispatch-bound, so the promotion it
-        would remove is hidden.  Per the task rule (<2% -> skip) the cast is
-        omitted, so these numerics stay bit-identical to the previous release.
+        The mel is cast to the tower's weight dtype, as whisper's AudioEncoder
+        and qwen3-asr's tower do.  This cast ALONE measures 1.00x here (see
+        .tmp/task4/tower-tight-*.json and the re-measurement in
+        .tmp/t7/glm-isolate.json), which is why it was originally skipped -- but
+        that A/B was misleading: the tower's partial-RoPE tables were float32,
+        so attention re-promoted the stream to float32 regardless.  With the
+        tables also following the activation dtype (see ``_Attn._rope``) the
+        two casts together give 1.44x on the tower and 28.7% on the pipeline.
         """
-        return self.audio_tower(mel)
+        return self.audio_tower(mel.astype(self._tower_dtype()))
 
     def forward_with_audio(
         self,

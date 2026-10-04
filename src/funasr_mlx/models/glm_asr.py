@@ -84,6 +84,11 @@ class _Attn(mxnn.Module):
         r = int(cfg.head_dim * cfg.partial_rotary_factor)
         self._rotary = r
         half = r // 2
+        # The table is built in float32 for accuracy but is NOT stored as the
+        # activation dtype on purpose: it is cast per call in ``_rope``.  A
+        # float32 table multiplied into a bf16 stream promotes the whole
+        # attention path (and the whole tower) to float32 against bf16 weights;
+        # see the note in :meth:`_rope`.
         pos = mx.arange(cfg.max_position_embeddings, dtype=mx.float32)
         inv = cfg.rope_theta ** (-mx.arange(half, dtype=mx.float32) / half)
         angles = pos[:, None] * inv[None, :]
@@ -95,6 +100,16 @@ class _Attn(mxnn.Module):
         x1, x2 = x[..., : r // 2], x[..., r // 2 : r]
         cos = mx.concatenate([self._cos, self._cos], axis=-1)[None, None, : x.shape[2]]
         sin = mx.concatenate([self._sin, self._sin], axis=-1)[None, None, : x.shape[2]]
+        # Follow the activation dtype.  ``x * cos`` with a float32 ``cos``
+        # promotes q/k (and therefore the scores, the softmax, v, o_proj and
+        # every downstream layer) to float32 against bf16 weights -- a
+        # mixed-dtype promotion at every Linear, exactly the disease
+        # 57cec39/57bf9cb fixed for the decoder.  Casting ONLY the mel is not
+        # enough: this line re-promotes the stream inside attention, which is
+        # why the earlier mel-only A/B measured 1.00x and the fix was skipped.
+        # With both cast, the tower is 1.44x (interleaved A/B, M4).
+        cos = cos.astype(x.dtype)
+        sin = sin.astype(x.dtype)
         rot = mx.concatenate([-x2, x1], axis=-1)
         return mx.concatenate([x[..., :r] * cos + rot * sin, x[..., r:]], axis=-1)
 
