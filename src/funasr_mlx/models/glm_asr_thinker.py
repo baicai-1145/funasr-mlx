@@ -57,8 +57,25 @@ class GlmAsrThinker(mxnn.Module):
         self.audio_tower = GlmAsrAudioEncoder(cfg.audio)
         self.language_model = LlamaForCausalLM(cfg.text)
 
+    def _decoder_dtype(self) -> mx.Dtype:
+        """Dtype of the decoder's checkpoint weights (``embed_tokens``).
+
+        This is the dtype the decoder activations must follow: the token
+        embedding produces it, so splicing anything else into the stream
+        promotes every Linear in the stack (see :meth:`forward_with_audio`).
+        """
+        return self.language_model.model.embed_tokens.weight.dtype
+
     def encode_audio(self, mel: mx.array) -> mx.array:
-        """mel (F, T) -> (1, N, text_hidden) embeddings for the pad run."""
+        """mel (F, T) -> (1, N, text_hidden) embeddings for the pad run.
+
+        The mel is deliberately NOT cast to the tower's weight dtype here.
+        The same cast buys qwen3-asr's tower 27% (interleaved A/B, M4), but
+        this encoder measures at 1.00x (see .tmp/task4/tower-tight-*.json):
+        32 layers of 1280d attention are dispatch-bound, so the promotion it
+        would remove is hidden.  Per the task rule (<2% -> skip) the cast is
+        omitted, so these numerics stay bit-identical to the previous release.
+        """
         return self.audio_tower(mel)
 
     def forward_with_audio(
@@ -78,6 +95,13 @@ class GlmAsrThinker(mxnn.Module):
         match = token_ids == cfg.audio_token_id
         first = int(mx.argmax(match).item())
         h = self.language_model.model.embed_tokens(token_ids)
+        # Follow the decoder's own weight dtype, exactly as whisper's
+        # TextDecoder does.  The tower emits float32 embeds (float32 mel in),
+        # so splicing them unchanged locked the whole Llama stack into fp32
+        # activations against bf16/fp16 weights: a mixed-dtype promotion at
+        # every Linear, every step.  A float32 checkpoint is unaffected -- the
+        # cast is a no-op there.
+        audio_embeds = audio_embeds.astype(self._decoder_dtype())
         h = mx.concatenate(
             [h[:, :first, :], audio_embeds, h[:, first + pad_span :, :]], axis=1
         )

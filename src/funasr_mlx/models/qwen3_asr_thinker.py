@@ -65,9 +65,32 @@ class Qwen3ASR(mxnn.Module):
         self.audio_tower = Qwen3ASRAudioEncoder(config.audio)
         self.thinker = Qwen3ForCausalLM(config.text)
 
+    def _decoder_dtype(self) -> mx.Dtype:
+        """Dtype of the decoder's checkpoint weights (``embed_tokens``).
+
+        This is the dtype the decoder activations must follow: the token
+        embedding produces it, so splicing anything else into the stream
+        promotes every Linear in the stack (see :meth:`forward_with_audio`).
+        """
+        return self.thinker.model.embed_tokens.weight.dtype
+
+    def _tower_dtype(self) -> mx.Dtype:
+        """Dtype of the audio tower's checkpoint weights (first conv)."""
+        return self.audio_tower.conv2d1.conv.weight.dtype
+
     def encode_audio(self, mel: mx.array) -> mx.array:
-        """``(F, T)`` mel -> ``(1, T', text.hidden_size)`` tower embeddings."""
-        return self.audio_tower(mel)
+        """``(F, T)`` mel -> ``(1, T', text.hidden_size)`` tower embeddings.
+
+        The front-end always produces float32 mel, so the mel is cast to the
+        tower's **weight** dtype first (same rule as whisper's
+        ``AudioEncoder.__call__``); without it an fp16 checkpoint runs the
+        conv stack and every tower Linear in mixed precision.  Interleaved
+        A/B on M4 (25 rounds, .tmp/task4/tower-tight-*.json): 55.7 -> 44.0 ms
+        at the real 420-frame shape and 273.9 -> 214.7 ms at 30 s, i.e. 1.27x
+        at both dtypes.  For a float32 checkpoint the cast is a no-op, so
+        those numerics stay bit-identical.
+        """
+        return self.audio_tower(mel.astype(self._tower_dtype()))
 
     def forward_with_audio(
         self,
@@ -87,6 +110,13 @@ class Qwen3ASR(mxnn.Module):
         match = token_ids == cfg.audio_pad_token_id
         first = int(mx.argmax(match).item())
         h = self.thinker.model.embed_tokens(token_ids)
+        # Follow the decoder's own weight dtype, exactly as whisper's
+        # TextDecoder does.  The tower emits float32 embeds (float32 mel in),
+        # so splicing them unchanged locked all 28 decoder layers into fp32
+        # activations against fp16 weights: a mixed-dtype promotion at every
+        # Linear, every step (measured on M4: 109.6 vs 20.7 ms/step).  A
+        # float32 checkpoint is unaffected -- the cast is a no-op there.
+        audio_embeds = audio_embeds.astype(self._decoder_dtype())
         h = mx.concatenate(
             [h[:, :first, :], audio_embeds, h[:, first + pad_span :, :]], axis=1
         )
