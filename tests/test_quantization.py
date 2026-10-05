@@ -693,3 +693,50 @@ def test_a_quantized_decoder_reports_a_floating_activation_dtype():
         "quantizing the tied embedding"
     )
     assert dtype != mx.uint32
+
+
+def test_no_dtype_helper_reads_a_quantizable_weight_directly():
+    """Every activation-dtype helper must survive its module being quantized.
+
+    The failure this guards is subtle and was hit twice in one task: a helper
+    reads `<module>.weight.dtype` to decide what to cast activations to. That is
+    correct for a plain module, but a quantized module stores packed ``uint32``
+    codes in ``weight``, so the cast turns real activations into integers --
+    silently, and only for checkpoints that quantize that particular module. It
+    produced garbage transcripts from step 0 that looked exactly like "4-bit is
+    too coarse", and it survived being chased through GPTQ, act-order, w8 and
+    mixed Hessians.
+
+    This test walks the helpers that feed activations and asserts each either
+    routes through ``activation_dtype`` or reads a weight that quantization
+    cannot reach (a conv / norm, which are not ``nn.Linear``).
+    """
+    import inspect
+
+    from funasr_mlx.models import (
+        emotion2vec,
+        glm_asr_thinker,
+        moss_transcribe,
+        qwen3_asr_thinker,
+        sensevoice,
+        whisper,
+    )
+
+    helpers = [
+        (qwen3_asr_thinker.Qwen3ASRThinker, "_decoder_dtype"),
+        (qwen3_asr_thinker.Qwen3ASRThinker, "_tower_dtype"),
+        (glm_asr_thinker.GlmAsrThinker, "_decoder_dtype"),
+        (glm_asr_thinker.GlmAsrThinker, "_tower_dtype"),
+        (moss_transcribe.MossTranscribeDiarize, "_decoder_dtype"),
+        (sensevoice.SenseVoiceEncoderSmall, "_weight_dtype"),
+        (whisper.AudioEncoder, "_weight_dtype"),
+        (whisper.TextDecoder, "_weight_dtype"),
+        (emotion2vec.Emotion2vec, "_weight_dtype"),
+    ]
+    for owner, name in helpers:
+        source = inspect.getsource(getattr(owner, name))
+        assert "activation_dtype" in source or "conv" in source or "ln" in source, (
+            f"{owner.__name__}.{name} reads a weight dtype directly; if that "
+            "weight is ever quantized the cast becomes a uint32 cast. Route it "
+            "through funasr_mlx.models.llm.quant.activation_dtype."
+        )

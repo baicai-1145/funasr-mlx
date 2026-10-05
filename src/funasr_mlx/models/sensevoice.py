@@ -336,8 +336,19 @@ class SenseVoiceEncoderSmall(mxnn.Module):
         self.tp_norm = Float32LayerNorm(cfg.output_size)
 
     def _weight_dtype(self) -> mx.Dtype:
-        """Dtype of this encoder's checkpoint weights (``encoders0`` always exists)."""
-        return self.encoders0[0].self_attn.linear_q_k_v.weight.dtype
+        """Dtype of this encoder's checkpoint weights (``encoders0`` always exists).
+
+        Read through :func:`~funasr_mlx.models.llm.quant.activation_dtype` rather
+        than ``weight.dtype`` directly: the SANM stack is a documented
+        quantization target (``audio_encoder.`` is in fun-asr-nano's scope), and
+        a quantized Linear's ``weight`` holds packed ``uint32`` codes.  Casting
+        the fbank input to ``uint32`` would destroy it exactly as the decoder
+        embedding cast did.  The helper returns the side tensor's dtype for a
+        quantized module, so this stays correct either way.
+        """
+        from .llm.quant import activation_dtype
+
+        return activation_dtype(self.encoders0[0].self_attn.linear_q_k_v)
 
     def output_size(self) -> int:
         return self._output_size
