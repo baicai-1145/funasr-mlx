@@ -135,6 +135,16 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     from mlx.utils import tree_flatten, tree_unflatten
 
     model = create_model(family, config_dict)
+    # Weight quantization is applied BEFORE the expected parameter set is
+    # computed, so a quantized checkpoint's `.scales`/`.biases` tensors are
+    # part of the strict key/shape check like every other parameter. The
+    # converter uses the same declaration to decide which tensors to pack, so
+    # a mismatch between the two rules fails here instead of mis-binding.
+    from .models.llm.quant import apply_quantization
+
+    quantization = apply_quantization(model, config_dict.get("quantization"))
+    if quantization is not None:
+        model._quantization = quantization
     expected = dict(tree_flatten(model.parameters()))
     # A port may derive a parameter at construction instead of loading it (the
     # Qwen3-ASR sinusoidal position table is computed from the config). Those

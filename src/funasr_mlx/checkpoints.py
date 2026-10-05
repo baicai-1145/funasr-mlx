@@ -119,6 +119,11 @@ SOURCE_RULES = {
     ),
 }
 
+#: Sentinel ``source_rule`` for a source that is already in the native layout
+#: (a converted bf16 checkpoint being re-emitted as W4A16, for instance). Keys
+#: pass through unchanged; the strict loader still checks every name.
+IDENTITY_SOURCE_RULE = "native"
+
 #: Families whose source tensors are bfloat16 and whose canonical native
 #: dtype is therefore bfloat16 (no lossy cast on conversion).
 BFLOAT16_FAMILIES = frozenset(SOURCE_RULES)
@@ -151,6 +156,69 @@ DTYPE_BYTES = {
     "U32": 4,
     "U64": 8,
 }
+
+#: Suffix added to a quantized ``<module>.weight`` for MLX's group-quantization
+#: side tensors. ``nn.QuantizedLinear`` owns exactly these three parameters, so
+#: the emitted names are what the strict loader expects to find.
+QUANTIZED_SUFFIXES = (".weight", ".scales", ".biases")
+
+
+def quantize_bf16_weight(
+    name: str,
+    array: np.ndarray,
+    *,
+    code: str,
+    bits: int,
+    group_size: int,
+    mode: str = "affine",
+) -> dict[str, np.ndarray]:
+    """Pack one 16-bit weight with MLX group quantization.
+
+    ``array`` arrives as a NumPy carrier: ``uint16`` raw words for a bfloat16
+    source (NumPy has no bfloat16) or a real ``float16`` array. The result is
+    keyed by native parameter name: ``<module>.weight`` (``uint32`` packed
+    codes), ``<module>.scales`` and ``<module>.biases`` (both carried in the
+    source's 16-bit dtype). Those are exactly the three parameter names
+    ``nn.QuantizedLinear`` owns -- note the side tensors hang off the *module*,
+    not off ``weight``.
+
+    The quantization itself runs in MLX (``mx.quantize``) on the device, which
+    is the only implementation guaranteed to agree bit-for-bit with
+    ``mx.quantized_matmul``'s expectations; the input is freed before the
+    packed copy is materialised on the host.
+    """
+    import mlx.core as mx
+
+    if code not in ("BF16", "F16"):
+        raise ValueError(f"Quantization requires a 16-bit source weight, got {code}")
+    if not name.endswith(".weight"):
+        raise ValueError(f"Expected a Linear weight name, got {name}")
+    module = name[: -len(".weight")]
+    if code == "BF16":
+        weight = mx.array(array).view(mx.bfloat16)
+    elif code == "F16":
+        weight = mx.array(array).astype(mx.float16)
+    else:  # pragma: no cover - guarded above
+        raise ValueError(f"Quantization requires a 16-bit source weight, got {code}")
+    packed, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits, mode=mode)
+    mx.eval(packed, scales, biases)
+    del weight
+    if biases is None:
+        raise ValueError(f"Mode {mode} produced no group biases for {name}")
+    # NumPy cannot name bfloat16, so the 16-bit side tensors go back out as raw
+    # uint16 carriers under the same BF16 code the full-precision path uses.
+    carry = (
+        (lambda tensor: np.array(tensor.view(mx.uint16)))
+        if code == "BF16"
+        else (lambda tensor: np.array(tensor))
+    )
+    result = {
+        name: np.array(packed),
+        module + ".scales": carry(scales),
+        module + ".biases": carry(biases),
+    }
+    del packed, scales, biases
+    return result
 
 
 @dataclass(frozen=True)
@@ -311,6 +379,7 @@ def convert_checkpoint(
     name_map: Mapping[str, str] | None = None,
     allowed_source_keys: tuple[str, ...] | None = None,
     source_rule: str | None = None,
+    quantization: Mapping | None = None,
 ) -> CheckpointInfo:
     """Convert a local checkpoint to the native layout, one tensor at a time.
 
@@ -336,8 +405,9 @@ def convert_checkpoint(
     if dtype == "bfloat16" and model not in BFLOAT16_FAMILIES:
         raise ValueError("bfloat16 output is only defined for the bf16-native LLM families")
     if source_rule is not None and source_rule not in SOURCE_RULES:
-        raise ValueError(f"Unknown source rule: {source_rule}")
-    if source_rule is not None and model != source_rule:
+        if source_rule != IDENTITY_SOURCE_RULE:
+            raise ValueError(f"Unknown source rule: {source_rule}")
+    if source_rule is not None and source_rule not in (model, IDENTITY_SOURCE_RULE):
         raise ValueError(f"Source rule {source_rule} does not describe model {model}")
     if not 1_000_000 <= shard_bytes <= 128_000_000 or not 0 < tensor_limit <= 384_000_000:
         raise ValueError("Unsafe shard/tensor buffer size")
@@ -348,9 +418,7 @@ def convert_checkpoint(
     # source's layout lives in convert_tensor, but a rule may still be passed
     # for its `drop` list (fun-asr-nano's tied lm_head).
     if is_safetensors and model not in TORCH_SOURCE_FAMILIES and source_rule is None:
-        raise ValueError(
-            "Safetensors sources must declare their layout: pass source_rule"
-        )
+        raise ValueError("Safetensors sources must declare their layout: pass source_rule")
     source_is_file = source.is_file()
     has_index = (source / "model.safetensors.index.json").is_file()
     has_shards = bool(tuple(source.glob("*.safetensors")))
@@ -374,6 +442,7 @@ def convert_checkpoint(
             tensor_limit=tensor_limit,
             config=config,
             source_rule=source_rule,
+            quantization=quantization,
         )
 
     import torch
@@ -515,10 +584,6 @@ def convert_checkpoint(
     return inspect_checkpoint(destination)
 
 
-def info_json(info: CheckpointInfo) -> str:
-    return json.dumps(asdict(info), indent=2)
-
-
 #: safetensors type code -> NumPy dtype used to carry the payload in memory.
 #: ``BF16`` maps to ``uint16``: NumPy has no bfloat16, so a bfloat16 tensor is
 #: moved around as its raw 16-bit words and only ever written under the
@@ -603,6 +668,7 @@ def _convert_safetensors_source(
     tensor_limit: int,
     config: Mapping | None,
     source_rule: str | None,
+    quantization: Mapping | None = None,
 ) -> CheckpointInfo:
     """One-tensor-at-a-time conversion of a safetensors source.
 
@@ -618,7 +684,16 @@ def _convert_safetensors_source(
     """
     from safetensors import safe_open
 
-    rule = SOURCE_RULES[source_rule] if source_rule is not None else None
+    from .models.llm.quant import QuantizationSpec
+
+    spec = QuantizationSpec.from_dict(quantization) if quantization is not None else None
+    if spec is not None and dtype not in ("bfloat16", "float16"):
+        raise ValueError("W4A16 quantization requires a 16-bit checkpoint dtype")
+    if spec is not None and not spec.targets:
+        raise ValueError("A quantization section must declare at least one target prefix")
+    rule = None
+    if source_rule is not None and source_rule != IDENTITY_SOURCE_RULE:
+        rule = SOURCE_RULES[source_rule]
     files = _safetensors_source_files(source)
     if not files:
         raise ValueError("No safetensors shards found in the source checkpoint")
@@ -634,21 +709,26 @@ def _convert_safetensors_source(
         raise ValueError("Checkpoint contains no tensors")
     # Resolve every source key to its native name up front, so a key outside
     # the declared layout fails before anything is written to disk.
-    native_names = {
-        name: (rule.apply(name) if rule is not None else name) for name in declared
-    }
+    native_names = {name: (rule.apply(name) if rule is not None else name) for name in declared}
     dropped = sorted(name for name, target in native_names.items() if target is None)
     if not any(target is not None for target in native_names.values()):
         raise ValueError("The source layout maps no tensor onto a native parameter")
 
-    # One output code per shard, so a bf16 checkpoint stays bf16 on disk.
+    # One output code per shard, so a bf16 checkpoint stays bf16 on disk. A
+    # quantized run mixes widths -- 4-byte packed codes beside 2-byte group
+    # scales -- so those shards carry a per-tensor code map instead.
     output_code = {"float16": "F16", "float32": "F32", "bfloat16": "BF16"}[dtype]
     write_shard = None
-    if output_code == "BF16":
+    if output_code == "BF16" or spec is not None:
         from .checkpoint_stream import write_shard
 
     destination.mkdir(parents=True)
     pending, buffered, shard_number, weight_map = {}, 0, 0, {}
+    quant_pending: dict[str, np.ndarray] = {}
+    quant_codes: dict[str, str] = {}
+    quant_buffered = 0
+    quantized_names: list[str] = []
+    skipped_quantization: list[str] = []
 
     def metadata() -> dict:
         # Two keys only, matching every already-published native shard; the
@@ -661,6 +741,7 @@ def _convert_safetensors_source(
         return destination / f"model-{shard_number:05d}.safetensors"
 
     def flush() -> None:
+        """Write the buffered full-precision tensors as one single-code shard."""
         nonlocal pending, buffered
         if not pending:
             return
@@ -676,6 +757,23 @@ def _convert_safetensors_source(
         weight_map.update({name: shard.name for name in pending})
         pending, buffered = {}, 0
 
+    def flush_quantized() -> None:
+        """Write the buffered quantized tensors as one mixed-width shard.
+
+        A W4A16 shard holds 4-byte packed codes beside 2-byte group scales, so
+        it needs a per-tensor code map rather than the single ``code`` the
+        full-precision path uses.
+        """
+        nonlocal quant_pending, quant_codes, quant_buffered
+        if not quant_pending:
+            return
+        shard = next_shard()
+        if write_shard is None:
+            raise ValueError("Mixed-width output requires the bounded writer")
+        write_shard(shard, quant_pending, metadata=metadata(), codes=quant_codes)
+        weight_map.update({name: shard.name for name in quant_pending})
+        quant_pending, quant_codes, quant_buffered = {}, {}, 0
+
     for path in files:
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             for name in handle.keys():
@@ -685,15 +783,52 @@ def _convert_safetensors_source(
                 native = native_names[name]
                 if native is None:
                     continue
-                if native in weight_map or native in pending:
+                if native in weight_map or native in pending or native in quant_pending:
                     raise ValueError(f"Duplicate converted tensor name: {native}")
                 elements = int(np.prod(shape) if shape else 1)
                 large = elements * max(DTYPE_BYTES[code], 4) > tensor_limit
-                array = convert_tensor(native, _carry(handle.get_tensor(name), code), model)
+                array = _carry(handle.get_tensor(name), code)
+                if source_rule != IDENTITY_SOURCE_RULE:
+                    array = convert_tensor(native, array, model)
                 # A bfloat16 source kept at bfloat16 stays a raw uint16 carrier
                 # and is written under the BF16 code; anything else is rounded
                 # to the requested precision here, on the host.
                 keep_bf16 = code == "BF16" and dtype == "bfloat16"
+                if spec is not None and spec.quantizes_tensor(native, array.shape):
+                    packed = quantize_bf16_weight(
+                        native,
+                        array,
+                        code="BF16" if keep_bf16 else "F16",
+                        bits=spec.bits,
+                        group_size=spec.group_size,
+                        mode=spec.mode,
+                    )
+                    del array
+                    side_code = "BF16" if keep_bf16 else "F16"
+                    module = native[: -len(".weight")]
+                    quant_pending[native] = packed[native]
+                    quant_pending[module + ".scales"] = packed[module + ".scales"]
+                    quant_pending[module + ".biases"] = packed[module + ".biases"]
+                    quant_codes[native] = "U32"
+                    quant_codes[module + ".scales"] = side_code
+                    quant_codes[module + ".biases"] = side_code
+                    quant_buffered += sum(int(value.nbytes) for value in packed.values())
+                    quantized_names.append(native)
+                    del packed
+                    if quant_buffered >= shard_bytes:
+                        flush_quantized()
+                    continue
+                if (
+                    spec is not None
+                    and not spec.quantizes_tensor(native, array.shape)
+                    and spec.is_linear_weight(native, array.shape)
+                ):
+                    # A Linear the group size cannot divide (e.g. fun-asr-nano's
+                    # (1536, 560) q_k_v). The model predicate skips it too, so
+                    # the loader stays consistent -- but it is recorded, because
+                    # an unnoticed skip would silently leave the model partly
+                    # full precision.
+                    skipped_quantization.append(native)
                 if code == "BF16" and not keep_bf16:
                     array = _bf16_carrier_to(array, dtype)
                 elif array.dtype.kind == "f":
@@ -724,6 +859,7 @@ def _convert_safetensors_source(
                 if buffered >= shard_bytes:
                     flush()
     flush()
+    flush_quantized()
     index = {
         "metadata": {
             "format": "funasr-mlx",
@@ -734,6 +870,9 @@ def _convert_safetensors_source(
             "source_shards": [path.name for path in files],
             "source_tensors": len(declared),
             "dropped_source_keys": dropped,
+            "quantization": spec.to_dict() if spec is not None else None,
+            "quantized_tensors": len(quantized_names),
+            "quantization_skipped": sorted(skipped_quantization),
         },
         "weight_map": weight_map,
     }

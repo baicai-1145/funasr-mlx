@@ -25,11 +25,33 @@ _CODES = {
 #: safetensors type codes the bounded writer can emit directly, with their
 #: bytes per element. Includes ``BF16``, which NumPy cannot name as a dtype:
 #: a bfloat16 payload is carried as raw ``uint16`` words and written under the
-#: ``BF16`` code, so the bits reach disk unchanged.
-_CODE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F64": 8}
+#: ``BF16`` code, so the bits reach disk unchanged. ``U32`` is the packed-code
+#: width of group quantization, which is why a W4A16 shard mixes it with the
+#: 2-byte ``BF16`` scales and needs a per-tensor code map.
+_CODE_BYTES = {
+    "BF16": 2,
+    "F16": 2,
+    "F32": 4,
+    "F64": 8,
+    "I8": 1,
+    "U8": 1,
+    "I16": 2,
+    "I32": 4,
+    "I64": 8,
+    "U32": 4,
+    "U64": 8,
+    "BOOL": 1,
+}
 
 
-def write_shard(path: Path, tensors: dict, *, metadata: dict, code: str) -> None:
+def write_shard(
+    path: Path,
+    tensors: dict,
+    *,
+    metadata: dict,
+    code: str | None = None,
+    codes: dict | None = None,
+) -> None:
     """Write a whole shard whose tensors are all carried in one dtype.
 
     ``code`` is the safetensors type code written for every tensor. It exists
@@ -37,21 +59,32 @@ def write_shard(path: Path, tensors: dict, *, metadata: dict, code: str) -> None
     the ``BF16`` code -- NumPy cannot name a bfloat16 dtype, so
     ``safetensors.numpy.save_file`` would write ``U16`` and the loader would
     then see integer weights.
+    ``codes`` overrides the code per tensor name, for shards that mix element
+    widths: a W4A16 shard holds 4-byte packed ``uint32`` codes beside 2-byte
+    ``BF16`` group scales. Exactly one of ``code``/``codes`` must be given, and
+    every per-tensor code is still checked against that tensor's element width.
     """
-    if code not in _CODE_BYTES:
-        raise ValueError(f"Unsupported shard type code {code}")
-    width = _CODE_BYTES[code]
+    if (code is None) == (codes is None):
+        raise ValueError("Pass exactly one of code or codes")
+    if code is not None:
+        if code not in _CODE_BYTES:
+            raise ValueError(f"Unsupported shard type code {code}")
+        codes = {name: code for name in tensors}
     header: dict = {"__metadata__": dict(metadata)}
     offset = 0
     for name, array in tensors.items():
+        tensor_code = codes.get(name)
+        if tensor_code not in _CODE_BYTES:
+            raise ValueError(f"Unsupported shard type code {tensor_code} for {name}")
+        width = _CODE_BYTES[tensor_code]
         if array.dtype.itemsize != width:
             raise ValueError(
                 f"Shard tensor {name} has element width {array.dtype.itemsize}, "
-                f"but code {code} needs {width}"
+                f"but code {tensor_code} needs {width}"
             )
         size = int(array.size) * width
         header[name] = {
-            "dtype": code,
+            "dtype": tensor_code,
             "shape": list(array.shape),
             "data_offsets": [offset, offset + size],
         }
