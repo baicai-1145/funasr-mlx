@@ -524,3 +524,60 @@ def test_hessian_accumulator_rejects_wrong_width() -> None:
         accumulator.add(np.zeros((3, 5), dtype=np.float32), "zh")
     with pytest.raises(ValueError, match="No activations"):
         HessianAccumulator(columns=4).hessian()
+
+
+def test_row_chunking_is_exact_and_does_not_change_the_result() -> None:
+    """Row chunks must be a pure memory optimisation, not an approximation.
+
+    GPTQ quantizes every row of ``W`` against the same ``H`` with no coupling
+    between rows, so splitting the rows cannot change any decision.  This matters
+    because a tied LM head (151936x1024) is 622 MB as one float32 array and the
+    memory guard's MLX limit is far below what the inner loop would need, so the
+    shipping path always chunks -- if chunking perturbed the result, every
+    acceptance number would describe a different matrix than the one tested.
+    """
+    activations, weight = _least_squares_problem(rows=512, columns=128)
+    hessian = 2.0 * (activations.T @ activations)
+    reference = None
+    for act_order in (False, True):
+        reference = None
+        for row_chunk in (0, 1, 7, 64):
+            config = GptqConfig(
+                bits=4,
+                group_size=64,
+                act_order=act_order,
+                storage="float32",
+                row_chunk=row_chunk,
+            )
+            outcome = gptq_quantize(weight, hessian, config)
+            codes = unpack_codes(outcome.packed, weight.shape[1])
+            if reference is None:
+                reference = codes
+                baseline = outcome
+            else:
+                assert np.array_equal(codes, reference), (
+                    f"row_chunk={row_chunk} changed the codes (act_order={act_order})"
+                )
+        # The reported metrics must not depend on the chunking either.
+        assert outcome.error == pytest.approx(baseline.error, rel=1e-6)
+        assert outcome.output_error == pytest.approx(baseline.output_error, rel=1e-6)
+
+
+def test_row_chunk_accepts_a_single_row_and_the_whole_matrix() -> None:
+    """The two degenerate chunk sizes must agree (one row vs all rows)."""
+    activations, weight = _least_squares_problem(rows=32, columns=64)
+    hessian = 2.0 * (activations.T @ activations)
+    whole = gptq_quantize(
+        weight, hessian, GptqConfig(bits=4, group_size=64, storage="float32", row_chunk=0)
+    )
+    single = gptq_quantize(
+        weight, hessian, GptqConfig(bits=4, group_size=64, storage="float32", row_chunk=1)
+    )
+    assert np.array_equal(
+        unpack_codes(whole.packed, 64), unpack_codes(single.packed, 64)
+    )
+
+
+def test_row_chunk_must_not_be_negative() -> None:
+    with pytest.raises(ValueError, match="row_chunk"):
+        GptqConfig(row_chunk=-1)

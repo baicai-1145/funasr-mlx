@@ -311,6 +311,13 @@ class GptqConfig:
     act_order: bool = False
     #: Dtype the side tensors are stored in (must match the checkpoint dtype).
     storage: str = "bfloat16"
+    #: Rows processed per pass.  GPTQ is row-independent -- every row of ``W`` is
+    #: quantized against the same ``H`` with no coupling between rows -- so this
+    #: is exact, not an approximation.  It exists because a tied LM head is large
+    #: (151936x1024 is 622 MB as a single float32 array, and the inner loop wants
+    #: several such arrays live at once) while the memory guard's MLX limit is far
+    #: below that.  0 means "all rows in one pass".
+    row_chunk: int = 8192
 
     def __post_init__(self) -> None:
         if self.bits not in (2, 3, 4, 5, 6, 8):
@@ -321,6 +328,8 @@ class GptqConfig:
             raise ValueError("damp_percent must be finite and non-negative")
         if self.block_size <= 0:
             raise ValueError("block_size must be positive")
+        if self.row_chunk < 0:
+            raise ValueError("row_chunk must be non-negative")
         if self.storage not in _STORAGE_DTYPES:
             raise ValueError(f"Unsupported storage dtype: {self.storage}")
 
@@ -509,12 +518,6 @@ def gptq_quantize(
     damped[diagonal, diagonal] += damp
     upper = _upper_cholesky_inverse(damped)
 
-    quantized = np.zeros_like(weight)
-    running = weight.copy()
-    codes = np.empty(weight.shape, dtype=np.uint8)
-    group_count = columns // config.group_size
-    scales = np.empty((weight.shape[0], group_count), dtype=np.float32)
-    biases = np.empty_like(scales)
     # Group parameters, keyed by the group index in the *stored* layout.
     #
     # Without act-order the columns are visited in storage order, so a group's
@@ -528,71 +531,127 @@ def gptq_quantize(
     # therefore paired with **static groups**, as in the reference
     # implementation: the parameters are chosen once, from the original matrix,
     # over the group's own columns in storage order.
-    group_params: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-    if config.act_order:
-        for index in range(group_count):
-            start = index * config.group_size
-            group_params[index] = quantizer.params(
-                original_weight[:, start : start + config.group_size]
-            )
+    group_count = columns // config.group_size
+    codes = np.empty(weight.shape, dtype=np.uint8)
+    scales = np.empty((weight.shape[0], group_count), dtype=np.float32)
+    biases = np.empty_like(scales)
+    chunk = config.row_chunk or weight.shape[0]
 
-    def params_for(column: int) -> tuple[np.ndarray, np.ndarray]:
-        """Parameters for the *stored* group that permuted column ``column`` lands in."""
-        stored_column = column if permutation is None else int(permutation[column])
-        index = stored_column // config.group_size
-        if index not in group_params:
-            stop = (index + 1) * config.group_size
-            group_params[index] = quantizer.params(
-                running[:, index * config.group_size : stop]
-            )
-        return group_params[index]
+    # GPTQ is row-independent: each row is quantized against the same ``H`` with
+    # no coupling between rows, so processing row chunks is exact.  It is what
+    # keeps a 151936x1024 tied head inside the guard's MLX budget -- one full
+    # float32 copy of that matrix is already 622 MB, and the inner loop wants
+    # several live at once.
+    for row_start in range(0, weight.shape[0], chunk):
+        row_stop = min(row_start + chunk, weight.shape[0])
+        running = weight[row_start:row_stop].copy()
+        quantized = np.empty_like(running)
 
-    for start in range(0, columns, config.block_size):
-        stop = min(start + config.block_size, columns)
-        # ``block`` is this block's slice of the running (error-compensated)
-        # matrix.  The compensation must be applied to it as the loop proceeds,
-        # so it is kept separate from the values actually chosen.
-        block = running[:, start:stop].copy()
-        block_upper = upper[start:stop, start:stop]
-        block_error = np.empty_like(block)
-        for offset in range(stop - start):
-            column = start + offset
-            scale, bias = params_for(column)
-            block_codes, reconstruction = quantizer.quantize(block[:, offset], scale, bias)
-            codes[:, column] = block_codes
-            quantized[:, column] = reconstruction
-            pivot = float(block_upper[offset, offset])
-            error = (block[:, offset] - reconstruction) / pivot
-            block_error[:, offset] = error
-            if offset + 1 < block.shape[1]:
-                block[:, offset + 1 :] -= np.outer(
-                    error, block_upper[offset, offset + 1 :]
+        # Group parameters are keyed by the group index in the *STORED* layout,
+        # because that is what the checkpoint carries.
+        #
+        # Without act-order the columns are visited in storage order, so a
+        # group's parameters are simply taken when the loop reaches its first
+        # column, read off the running (already error-compensated) matrix --
+        # Frantar's "dynamic groups".  With act-order the columns arrive in
+        # permuted order, so a stored group's columns are no longer contiguous
+        # and taking the parameters from the permuted matrix would leave the
+        # stored codes and the stored side tensors describing different groups
+        # (the checkpoint would dequantize to something the metrics never
+        # described).  act-order is therefore paired with **static groups**, as
+        # in the reference implementation: the parameters are chosen once, from
+        # the original matrix, over the group's own columns in storage order.
+        #
+        # Either way the parameters are per-chunk: they are read off this chunk's
+        # rows, so they are recomputed here rather than shared across chunks.
+        static_params: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        if config.act_order:
+            for index in range(group_count):
+                start = index * config.group_size
+                static_params[index] = quantizer.params(
+                    original_weight[row_start:row_stop, start : start + config.group_size]
                 )
-        if stop < columns:
-            # Lazy batch update (Frantar's act-order note): every column in the
-            # block contributes ``error_i * Hinv[i, stop:]`` to the remaining
-            # columns, so the whole block's compensation is applied at once.
-            # ``error_i`` is the *scaled* error ``(w - q) / Hinv[i, i]`` -- the
-            # reference's ``Err1`` -- and NOT ``block - block_quantized``, which
-            # differs by a factor of ``Hinv[i, i]`` per column because the
-            # running block has already absorbed the earlier columns' updates.
-            running[:, stop:] -= block_error @ upper[start:stop, stop:]
+        dynamic_params: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
-    for index in range(group_count):
-        scale, bias = group_params[index]
-        scales[:, index] = scale
-        biases[:, index] = bias
+        def stored_params(
+            index: int, current: np.ndarray = running
+        ) -> tuple[np.ndarray, np.ndarray]:
+            """Parameters for stored group ``index`` on this chunk's rows."""
+            if index in static_params:
+                return static_params[index]
+            if index not in dynamic_params:
+                stop = (index + 1) * config.group_size
+                dynamic_params[index] = quantizer.params(
+                    current[:, index * config.group_size : stop]
+                )
+            return dynamic_params[index]
 
-    if inverse_permutation is not None:
-        quantized = quantized[:, inverse_permutation]
-        codes = codes[:, inverse_permutation]
+        def params_for(column: int) -> tuple[np.ndarray, np.ndarray]:
+            """Parameters for the stored group that column ``column`` lands in."""
+            stored_column = column if permutation is None else int(permutation[column])
+            return stored_params(stored_column // config.group_size)
 
-    error = float(np.mean((original_weight - quantized) ** 2))
-    result_output_error = output_error(original_weight, quantized, original_hessian)
+        for start in range(0, columns, config.block_size):
+            stop = min(start + config.block_size, columns)
+            # ``block`` is this block's slice of the running (error-compensated)
+            # matrix.  The compensation must be applied to it as the loop
+            # proceeds, so it is kept separate from the values chosen.
+            block = running[:, start:stop].copy()
+            block_upper = upper[start:stop, start:stop]
+            block_error = np.empty_like(block)
+            for offset in range(stop - start):
+                column = start + offset
+                scale, bias = params_for(column)
+                block_codes, reconstruction = quantizer.quantize(
+                    block[:, offset], scale, bias
+                )
+                codes[row_start:row_stop, column] = block_codes
+                quantized[:, offset] = reconstruction
+                pivot = float(block_upper[offset, offset])
+                error = (block[:, offset] - reconstruction) / pivot
+                block_error[:, offset] = error
+                if offset + 1 < block.shape[1]:
+                    block[:, offset + 1 :] -= np.outer(
+                        error, block_upper[offset, offset + 1 :]
+                    )
+            if stop < columns:
+                # Lazy batch update (Frantar's act-order note): every column in
+                # the block contributes ``error_i * Hinv[i, stop:]`` to the
+                # remaining columns, so the whole block's compensation is applied
+                # at once.  ``error_i`` is the *scaled* error
+                # ``(w - q) / Hinv[i, i]`` -- the reference's ``Err1`` -- and NOT
+                # ``block - block_quantized``, which differs by a factor of
+                # ``Hinv[i, i]`` per column because the running block has already
+                # absorbed the earlier columns' updates.
+                running[:, stop:] -= block_error @ upper[start:stop, stop:]
+
+        for index in range(group_count):
+            scale, bias = stored_params(index)
+            scales[row_start:row_stop, index] = scale
+            biases[row_start:row_stop, index] = bias
+
+        if inverse_permutation is not None:
+            codes[row_start:row_stop] = codes[row_start:row_stop][:, inverse_permutation]
+
+        del running, quantized, block, block_error
+
     dtype = quantizer.storage_dtype
     packed = quantizer.pack(codes)
     scales = scales.astype(dtype)
     biases = biases.astype(dtype)
+    # The metrics are computed from the STORED triple, not accumulated per chunk.
+    # ``trace(D (H/2) D^T)`` does not decompose into per-row-block terms -- the
+    # off-diagonal blocks of ``D`` couple the chunks -- so summing chunk-local
+    # traces silently undercounts (measured 628M against the true 392.6 on the
+    # module's own test problem).  Rebuilding the reconstruction is cheap next to
+    # the quantization itself and makes the reported numbers describe exactly
+    # what a reader of the checkpoint would get.
+    reconstruction = np.repeat(scales, config.group_size, axis=1) * codes + np.repeat(
+        biases, config.group_size, axis=1
+    )
+    error = float(np.mean((original_weight - reconstruction) ** 2))
+    result_output_error = output_error(original_weight, reconstruction, original_hessian)
+    del reconstruction, codes
     reduction = None
     frobenius_reduction = None
     if rtn_output_error:

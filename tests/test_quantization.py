@@ -460,3 +460,165 @@ def test_converter_skips_layers_the_group_size_cannot_divide(tmp_path):
     skipped = index["metadata"]["quantization_skipped"]
     assert len(skipped) == 12 and all(name.endswith(".weight") for name in skipped)
     assert not any("down_proj" in name for name in skipped)
+
+
+# --------------------------------------------------------------------------- #
+# GPTQ integration: same layout, better values
+# --------------------------------------------------------------------------- #
+def test_gptq_converter_writes_the_same_layout_as_rtn(tmp_path):
+    """A GPTQ run must be indistinguishable from RTN by layout alone.
+
+    The whole point of GPTQ here is that the runtime path is untouched: the same
+    three parameter names, the same packed-code dtype and shape, the same
+    group side-tensor shape.  Only the values differ.  This asserts the layout
+    part and that the values really did change, so a regression that silently
+    fell back to RTN would be caught.
+    """
+    from funasr_mlx.checkpoints import GptqWeight
+    from funasr_mlx.models.llm.gptq import GptqConfig
+
+    source = tmp_path / "source"
+    _write_native_bf16_source(source, "qwen3-asr", TINY_QWEN3_ASR)
+    quantization = _spec(targets=["thinker.model.embed_tokens"])
+    config = {**TINY_QWEN3_ASR, "quantization": quantization}
+
+    plain = tmp_path / "plain"
+    convert_checkpoint(
+        source, plain, model="qwen3-asr", dtype="bfloat16", config=config,
+        source_rule=IDENTITY_SOURCE_RULE, quantization=quantization,
+    )
+
+    # A Hessian for the embedding: identity-ish, so GPTQ has something real to
+    # compensate against without needing a calibration forward.
+    import mlx.core as mx
+
+    model = create_model("qwen3-asr", config)
+    weight = np.array(model.thinker.model.embed_tokens.weight.astype(mx.float32))
+    hidden = weight.shape[1]
+    rng = np.random.RandomState(0)
+    activations = rng.randn(256, hidden).astype(np.float32)
+    hessian = 2.0 * (activations.T @ activations)
+    gptq = GptqWeight(
+        hessians={"thinker.model.embed_tokens.weight": hessian},
+        configs={
+            "thinker.model.embed_tokens.weight": GptqConfig(
+                bits=4, group_size=64, storage="bfloat16", act_order=True
+            ).to_dict()
+        },
+    )
+
+    destination = tmp_path / "gptq"
+    convert_checkpoint(
+        source, destination, model="qwen3-asr", dtype="bfloat16", config=config,
+        source_rule=IDENTITY_SOURCE_RULE, quantization=quantization, gptq=gptq,
+    )
+
+    assert gptq.outcomes, "GPTQ did not run for the embedding"
+    outcome = gptq.outcomes["thinker.model.embed_tokens.weight"]
+    assert outcome["method"] == "gptq"
+    assert outcome["output_error"] is not None
+    assert outcome["rtn_output_error"] is not None
+    # The gain is the reason for the whole exercise.
+    assert outcome["output_error"] < outcome["rtn_output_error"]
+
+    plain_index = json.loads((plain / "model.safetensors.index.json").read_text())
+    gptq_index = json.loads((destination / "model.safetensors.index.json").read_text())
+    name = "thinker.model.embed_tokens.weight"
+    assert set(gptq_index["weight_map"]) == set(plain_index["weight_map"])
+    assert gptq_index["weight_map"][name] == gptq_index["weight_map"][
+        "thinker.model.embed_tokens.scales"
+    ]
+    assert gptq_index["metadata"]["gptq"] is not None
+
+    def triple(directory):
+        index = json.loads((directory / "model.safetensors.index.json").read_text())
+        shard = mx.load(str(directory / index["weight_map"][name]))
+        return (
+            np.array(shard[name]),
+            np.array(shard["thinker.model.embed_tokens.scales"].astype(mx.float32)),
+            np.array(shard["thinker.model.embed_tokens.biases"].astype(mx.float32)),
+        )
+
+    plain_packed, plain_scales, plain_biases = triple(plain)
+    gptq_packed, gptq_scales, gptq_biases = triple(destination)
+    # Same layout ...
+    assert gptq_packed.shape == plain_packed.shape
+    assert gptq_packed.dtype == plain_packed.dtype
+    assert gptq_scales.shape == plain_scales.shape
+    assert gptq_biases.shape == plain_biases.shape
+    # ... different values.
+    assert not np.array_equal(gptq_packed, plain_packed)
+
+
+def test_gptq_converter_loads_through_the_normal_loader(tmp_path):
+    """The GPTQ checkpoint must load with the existing strict loader, unchanged."""
+    from funasr_mlx.checkpoints import GptqWeight
+    from funasr_mlx.models.llm.gptq import GptqConfig
+    from funasr_mlx.pipeline import load_model
+
+    source = tmp_path / "source"
+    _write_native_bf16_source(source, "qwen3-asr", TINY_QWEN3_ASR)
+    quantization = _spec(targets=["thinker.model.embed_tokens"])
+    config = {**TINY_QWEN3_ASR, "quantization": quantization}
+    model = create_model("qwen3-asr", config)
+    weight = np.array(model.thinker.model.embed_tokens.weight.astype(mx.float32))
+    hessian = 2.0 * np.eye(weight.shape[1], dtype=np.float32)
+    gptq = GptqWeight(
+        hessians={"thinker.model.embed_tokens.weight": hessian},
+        configs={
+            "thinker.model.embed_tokens.weight": GptqConfig(
+                bits=4, group_size=64, storage="bfloat16"
+            ).to_dict()
+        },
+    )
+    destination = tmp_path / "gptq"
+    convert_checkpoint(
+        source, destination, model="qwen3-asr", dtype="bfloat16", config=config,
+        source_rule=IDENTITY_SOURCE_RULE, quantization=quantization, gptq=gptq,
+    )
+    loaded, _ = load_model(destination, family="qwen3-asr")
+    assert isinstance(loaded.thinker.model.embed_tokens, nn.QuantizedEmbedding)
+
+
+def test_gptq_config_must_agree_with_the_converter(tmp_path):
+    """A bits/group mismatch must fail loudly, not write a mixed checkpoint."""
+    from funasr_mlx.checkpoints import GptqWeight
+    from funasr_mlx.models.llm.gptq import GptqConfig
+
+    source = tmp_path / "source"
+    _write_native_bf16_source(source, "qwen3-asr", TINY_QWEN3_ASR)
+    quantization = _spec(targets=["thinker.model.embed_tokens"])
+    config = {**TINY_QWEN3_ASR, "quantization": quantization}
+    gptq = GptqWeight(
+        hessians={"thinker.model.embed_tokens.weight": np.eye(64, dtype=np.float32)},
+        configs={
+            "thinker.model.embed_tokens.weight": GptqConfig(
+                bits=8, group_size=64, storage="bfloat16"
+            ).to_dict()
+        },
+    )
+    with pytest.raises(ValueError, match="bits=8"):
+        convert_checkpoint(
+            source, tmp_path / "out", model="qwen3-asr", dtype="bfloat16",
+            config=config, source_rule=IDENTITY_SOURCE_RULE,
+            quantization=quantization, gptq=gptq,
+        )
+
+
+def test_gptq_weight_without_a_hessian_raises():
+    """Asking GPTQ for a tensor it has no Hessian for must not silently fall back."""
+    from funasr_mlx.checkpoints import GptqWeight
+
+    gptq = GptqWeight(hessians={"a.weight": np.eye(4, dtype=np.float32)})
+    assert gptq.has("a.weight")
+    assert not gptq.has("b.weight")
+    with pytest.raises(ValueError, match="No GPTQ Hessian"):
+        gptq.quantize_tensor("b.weight", mx.zeros((2, 4)), bits=4, group_size=4)
+
+
+def test_quantization_spec_records_the_method_and_rejects_unknown_ones():
+    assert QuantizationSpec.from_dict(_spec()).method == "rtn"
+    assert QuantizationSpec.from_dict(_spec(method="gptq")).method == "gptq"
+    assert QuantizationSpec.from_dict(_spec(method="gptq")).to_dict()["method"] == "gptq"
+    with pytest.raises(ValueError, match="Unsupported quantization method"):
+        QuantizationSpec.from_dict(_spec(method="magic"))
