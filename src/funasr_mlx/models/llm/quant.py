@@ -48,10 +48,12 @@ DEFAULT_BITS = 4
 DEFAULT_GROUP_SIZE = 64
 
 #: Substrings that mark a rank-2 ``.weight`` tensor which must NOT be quantized
-#: even when it sits under a quantized prefix: the tied/untied token embedding,
-#: a learned position table, or the sinusoidal table the qwen3-asr tower derives.
-#: The model-side rule is "only ``nn.Linear``", so these are exactly the
-#: exceptions to the tensor-name rule and they must stay in sync with it.
+#: through the ``nn.Linear`` path, even when it sits under a quantized prefix:
+#: the untied ``lm_head``, a learned position table, or the sinusoidal table the
+#: qwen3-asr tower derives. ``embed_tokens`` is handled separately (it is an
+#: ``nn.Embedding``, not an ``nn.Linear``, and can only be selected by an
+#: explicit ``embed_tokens`` target prefix); the marker is kept here so a Linear
+#: named ``...embed_tokens`` is still never quantized by the Linear rule.
 NON_LINEAR_WEIGHT_NAMES = (
     "embed_tokens",
     "embed_positions",
@@ -105,6 +107,36 @@ class QuantizationSpec:
         """Whether ``module_path`` sits under one of the declared prefixes."""
         return any(module_path.startswith(target) for target in self.targets)
 
+    def selects_embedding(self, module_path: str) -> bool:
+        """Whether a token-embedding module at ``module_path`` is selected.
+
+        The tied ``embed_tokens`` is the one non-Linear weight worth offering:
+        when ``tie_word_embeddings`` is set the same matrix is also the LM head,
+        so at bs=1 it is streamed once per step and is a large share of the step
+        (311 MB bf16 for a 151936-vocab family). It needs its own predicate
+        because ``nn.Embedding`` is not an ``nn.Linear`` subclass, so the Linear
+        rule can never reach it; a family opts in by naming ``embed_tokens`` in
+        ``targets``.
+        """
+        if not module_path.endswith("embed_tokens"):
+            return False
+        return any(
+            target.startswith(module_path) or module_path.startswith(target)
+            for target in self.targets
+            if target.rstrip(".").endswith("embed_tokens")
+        )
+
+    def quantizes_embedding(self, name: str, shape: Iterable[int]) -> bool:
+        """Converter predicate for the token-embedding matrix."""
+        if not name.endswith("embed_tokens.weight"):
+            return False
+        dims = tuple(shape)
+        if len(dims) != 2:
+            return False
+        if not self.selects_embedding(name[: -len(".weight")]):
+            return False
+        return dims[1] % self.group_size == 0
+
     def is_linear_weight(self, name: str, shape: Iterable[int]) -> bool:
         """Whether ``name`` is a Linear weight the target prefixes select.
 
@@ -127,24 +159,37 @@ class QuantizationSpec:
         """Whether the converter should quantize checkpoint tensor ``name``.
 
         Mirrors the model-side predicate exactly: a Linear weight (see
-        :meth:`is_linear_weight`) whose input dimension the group size divides.
+        :meth:`is_linear_weight`) or a selected token embedding (see
+        :meth:`quantizes_embedding`), whose input dimension the group size
+        divides.
         """
+        if self.quantizes_embedding(name, shape):
+            return True
         if not self.is_linear_weight(name, shape):
             return False
         return tuple(shape)[1] % self.group_size == 0
 
     def quantizes_module(self, module_path: str, module: nn.Module) -> bool:
-        """Whether ``module`` (a live ``nn.Module``) should become quantized."""
+        """Whether ``module`` (a live ``nn.Module``) should become quantized.
+
+        The token embedding is a separate case from ``nn.Linear``: it is not a
+        ``Linear`` subclass, so it can only be selected through an explicit
+        ``embed_tokens`` target prefix, and it is the tied LM head as well.
+        """
+        if isinstance(module, nn.Embedding):
+            return self.selects_embedding(module_path) and self._fits(module)
         if not isinstance(module, nn.Linear):
             return False
         if any(marker in module_path for marker in NON_LINEAR_WEIGHT_NAMES):
             return False
         if not self.selects(module_path):
             return False
+        return self._fits(module)
+
+    def _fits(self, module: nn.Module) -> bool:
+        """Whether the group size divides the module's input dimension."""
         weight = getattr(module, "weight", None)
-        if weight is None or weight.ndim != 2:
-            return False
-        return weight.shape[1] % self.group_size == 0
+        return weight is not None and weight.ndim == 2 and weight.shape[1] % self.group_size == 0
 
 
 @dataclass
@@ -188,7 +233,12 @@ def apply_quantization(model: nn.Module, data: Any) -> QuantizationResult | None
     )
 
     def predicate(path: str, module: nn.Module) -> bool:
-        if isinstance(module, nn.Linear) and spec.selects(path):
+        # Only the two weight-bearing module kinds the scheme supports are
+        # considered; everything else (norms, convs, position tables) is left
+        # at the checkpoint dtype and is not reported as a skip.
+        if isinstance(module, (nn.Linear, nn.Embedding)) and (
+            spec.selects(path) or spec.selects_embedding(path)
+        ):
             if spec.quantizes_module(path, module):
                 result.quantized.append(path)
                 return True

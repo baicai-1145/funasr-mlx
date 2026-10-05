@@ -140,6 +140,46 @@ def test_quantized_module_parameters_are_the_three_expected_names():
     assert "embed_tokens.weight" in names
 
 
+def test_embedding_needs_an_explicit_target():
+    """``nn.Embedding`` is not an ``nn.Linear``: the Linear rule cannot reach it.
+
+    Regression guard for a real bug in this task: the first version of the
+    "decoder + head" variant silently quantized nothing, because
+    ``isinstance(nn.Embedding(...), nn.Linear)`` is False and the embedding
+    target prefix was ignored. Both predicates must select it.
+    """
+    model = _Tiny()
+    decoder_only = _spec(targets=["layers."])
+    assert not decoder_only.selects_embedding("embed_tokens")
+    assert not decoder_only.quantizes_tensor("embed_tokens.weight", (64, 128))
+    apply_quantization(model, decoder_only)
+    assert isinstance(model.embed_tokens, nn.Embedding)
+
+    model = _Tiny()
+    with_embedding = _spec(targets=["layers.", "embed_tokens"])
+    assert with_embedding.selects_embedding("embed_tokens")
+    assert with_embedding.quantizes_tensor("embed_tokens.weight", (64, 128))
+    # An untied lm_head is still never selected by the embedding prefix.
+    assert not with_embedding.quantizes_tensor("lm_head.weight", (64, 128))
+    result = apply_quantization(model, with_embedding)
+    assert isinstance(model.embed_tokens, nn.QuantizedEmbedding)
+    assert "embed_tokens" in result.quantized
+    assert isinstance(model.lm_head, nn.Linear)
+
+
+def test_quantized_embedding_forward_and_as_linear_agree():
+    """The tied head path (``embed_tokens.as_linear``) must work quantized."""
+    model = _Tiny()
+    apply_quantization(model, _spec(targets=["layers.", "embed_tokens"]))
+    tokens = mx.array([[1, 2, 3]])
+    embedded = model.embed_tokens(tokens)
+    mx.eval(embedded)
+    assert embedded.shape == (1, 3, 128)
+    head = model.embed_tokens.as_linear(mx.zeros((1, 128)))
+    mx.eval(head)
+    assert head.shape == (1, 64)
+
+
 def test_non_linear_weight_names_stay_unquantized():
     """The converter's exclusion list and the model predicate must agree."""
     spec = QuantizationSpec.from_dict(_spec(targets=["layers."]))

@@ -58,12 +58,19 @@ TOKENIZER_FILES = (
 )
 
 
-def native_config(job: str, source: Path) -> dict:
+def native_config(job: str, source: Path, *, native_source: bool = False) -> dict:
     """The config slice ``create_model`` needs for ``job``.
 
     Each family's model class reads a different part of the upstream config, so
     the native ``config.json`` carries exactly that part.
+
+    ``native_source`` re-emits an already-converted native checkpoint: its
+    ``config.json`` is already in native form, so it is passed through verbatim
+    rather than rebuilt from the upstream layout (whose ``config.yaml`` for
+    fun-asr-nano does not exist in a native directory).
     """
+    if native_source:
+        return json.loads((source / "config.json").read_text())
     if job == "fun-asr-nano":
         import yaml
 
@@ -163,7 +170,7 @@ def main() -> int:
     source = args.source
     if not source.exists():
         raise SystemExit(f"Source checkpoint not found: {source}")
-    config = native_config(args.family, source)
+    config = native_config(args.family, source, native_source=args.native_source)
     quantization = None
     if args.quantize != "none":
         quantization = quantization_config(
