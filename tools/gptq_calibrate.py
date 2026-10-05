@@ -114,7 +114,13 @@ def build_prefill(family: str, key: str, model, config, directory: Path, sample:
     raw, _ = sf.read(sample["audio_path"], dtype="float32")
 
     if key == "qwen3":
-        dtype = model.thinker.model.embed_tokens.weight.dtype
+        # The mel feeds the audio TOWER, so it must follow the tower's dtype.
+        # Reading ``embed_tokens.weight.dtype`` here was wrong twice over: it is
+        # the decoder's dtype (a different subgraph), and for a quantized
+        # embedding it is the packed-code uint32, which turns the mel into
+        # integers.  ``encode_audio`` casts to the tower dtype itself, so this
+        # cast is only here to keep the front-end and tower consistent.
+        dtype = model._tower_dtype()
         mel = log_mel_spectrogram(mx.array(raw[None, :]), n_mels=128)
         mel = mx.transpose(mel[0], (1, 0)).astype(dtype)
         mx.eval(mel)
@@ -143,7 +149,9 @@ def build_prefill(family: str, key: str, model, config, directory: Path, sample:
     if key == "nano":
         from funasr_mlx.frontend import FbankConfig, WavFrontend
 
-        dtype = model.llm.model.embed_tokens.weight.dtype
+        # The fbank features feed the audio encoder; follow ITS dtype, not the
+        # decoder embedding's (see the qwen3 branch for why).
+        dtype = model.audio_encoder._weight_dtype()
         fcfg = FbankConfig(
             frame_length=25.0,
             frame_shift=10.0,
@@ -191,7 +199,9 @@ def build_prefill(family: str, key: str, model, config, directory: Path, sample:
         return prefill
 
     if key == "glm":
-        dtype = model.language_model.model.embed_tokens.weight.dtype
+        # The mel feeds the audio tower; follow the tower's dtype, not the
+        # decoder embedding's (see the qwen3 branch for why).
+        dtype = model._tower_dtype()
         mel = log_mel_spectrogram(mx.array(raw)[None], n_mels=128)[0]
         mel = mx.transpose(mel.astype(dtype), (1, 0))
         mx.eval(mel)
@@ -394,8 +404,12 @@ def convert(args) -> int:
     gptq = GptqWeight(
         hessians={head_weight: hessian},
         configs={head_weight: gptq_config.to_dict()},
+        method=args.method,
     )
-    print(f"GPTQ target: {head_weight} {hessian.shape} {gptq_config.to_dict()}")
+    print(
+        f"{args.method.upper()} target: {head_weight} {hessian.shape} "
+        f"{gptq_config.to_dict()}"
+    )
 
     info = convert_checkpoint(
         source,
@@ -456,6 +470,16 @@ def main() -> int:
     parser.add_argument("--report", type=Path, default=None)
     parser.add_argument("--quantization", type=json.loads, default=None)
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument(
+        "--method",
+        choices=("gptq", "rtn"),
+        default="gptq",
+        help=(
+            "How to compute the stored values for the selected matrices. Both "
+            "go through the identical packing and layout, so this isolates the "
+            "algorithm: it is what makes an rtn-vs-gptq comparison honest."
+        ),
+    )
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--storage", default="bfloat16")
     parser.add_argument("--damp-percent", type=float, default=0.01)

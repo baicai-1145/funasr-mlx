@@ -255,6 +255,14 @@ class GptqWeight:
     hessians: Mapping[str, np.ndarray]
     configs: Mapping[str, Any] = field(default_factory=dict)
     default_config: Any = None
+    #: ``gptq`` runs Hessian-based error compensation; ``rtn`` runs plain
+    #: round-to-nearest **through this same code path**, using the identical
+    #: packing, side-tensor layout and dtype handling.  That is what makes an
+    #: rtn-vs-gptq comparison honest: both arms differ only in how the stored
+    #: values were computed, so any measured difference is the algorithm's.
+    #: ``rtn`` still requires a Hessian entry (the matrix is what marks a tensor
+    #: as GPTQ-path); pass an identity if none was collected.
+    method: str = "gptq"
     #: Per-tensor reported outcome, filled in as tensors are quantized.
     outcomes: dict[str, dict] = field(default_factory=dict)
 
@@ -273,11 +281,13 @@ class GptqWeight:
     def quantize_tensor(
         self, name: str, weight, *, bits: int, group_size: int
     ) -> tuple:
-        """Run GPTQ for one tensor and return MLX tensors in the usual layout."""
+        """Quantize one tensor and return MLX tensors in the usual layout."""
         import mlx.core as mx
 
-        from .models.llm.gptq import gptq_quantize
+        from .models.llm.gptq import gptq_quantize, rtn_quantize
 
+        if self.method not in ("gptq", "rtn"):
+            raise ValueError(f"Unknown quantization method: {self.method}")
         hessian = self.hessians.get(name)
         if hessian is None:
             raise ValueError(f"No GPTQ Hessian was collected for {name}")
@@ -303,7 +313,10 @@ class GptqWeight:
         # ``np.asarray`` is a no-op when the Hessian is already float32, which is
         # how the calibrator writes it; a copy here would double it for nothing.
         hessian32 = np.asarray(hessian, dtype=np.float32)
-        outcome = gptq_quantize(source, hessian32, config)
+        if self.method == "rtn":
+            outcome = rtn_quantize(source, config, hessian32)
+        else:
+            outcome = gptq_quantize(source, hessian32, config)
         del source, hessian32
         self.outcomes[name] = outcome.to_json()
         # Side tensors must land in the checkpoint dtype (bfloat16/float16), the

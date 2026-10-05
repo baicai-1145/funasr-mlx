@@ -100,7 +100,9 @@ def build_decode(family: str, model, config, tokenizer_dir: Path, *, steps: int)
     )["input_ids"]
     pad_id = config.audio_pad_token_id
     n_layers = config.text.num_hidden_layers
-    dtype = model.thinker.model.embed_tokens.weight.dtype
+    # The mel feeds the audio TOWER; follow the tower's dtype, not the decoder
+    # embedding's (for a quantized embedding that is the packed-code uint32).
+    dtype = model._tower_dtype()
 
     def prepare(sample):
         raw, _ = sf.read(sample["audio_path"], dtype="float32")

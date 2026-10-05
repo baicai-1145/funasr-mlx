@@ -158,7 +158,12 @@ def build_driver(
         )["input_ids"]
         pad_id = config.audio_pad_token_id
         n_layers = config.text.num_hidden_layers
-        dtype = model.thinker.model.embed_tokens.weight.dtype
+        # The mel feeds the audio TOWER, so follow the tower's dtype.  Reading
+        # ``embed_tokens.weight.dtype`` was wrong twice over: it is the decoder's
+        # dtype, and for a quantized embedding it is the packed-code uint32, so
+        # ``mel.astype(uint32)`` destroyed the audio before the tower ever saw
+        # it.  This produced correct-looking runs whose transcripts were garbage.
+        dtype = model._tower_dtype()
 
         def decode(sample):
             raw, _ = sf.read(sample["audio_path"], dtype="float32")
