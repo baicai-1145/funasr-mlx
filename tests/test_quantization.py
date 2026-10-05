@@ -149,14 +149,14 @@ def test_embedding_needs_an_explicit_target():
     target prefix was ignored. Both predicates must select it.
     """
     model = _Tiny()
-    decoder_only = _spec(targets=["layers."])
+    decoder_only = QuantizationSpec.from_dict(_spec(targets=["layers."]))
     assert not decoder_only.selects_embedding("embed_tokens")
     assert not decoder_only.quantizes_tensor("embed_tokens.weight", (64, 128))
     apply_quantization(model, decoder_only)
     assert isinstance(model.embed_tokens, nn.Embedding)
 
     model = _Tiny()
-    with_embedding = _spec(targets=["layers.", "embed_tokens"])
+    with_embedding = QuantizationSpec.from_dict(_spec(targets=["layers.", "embed_tokens"]))
     assert with_embedding.selects_embedding("embed_tokens")
     assert with_embedding.quantizes_tensor("embed_tokens.weight", (64, 128))
     # An untied lm_head is still never selected by the embedding prefix.
@@ -370,6 +370,67 @@ def test_convert_and_load_w4a16_checkpoint(tmp_path):
         np.testing.assert_array_equal(
             _bf16_words(actual[name]), _bf16_words(expected), err_msg=name
         )
+
+
+def test_quantized_group_over_the_shard_bound_is_rejected(tmp_path):
+    """A quantized group must fit one shard, or the strict loader cannot load it.
+
+    ``pipeline.load_model`` binds a Linear's weight/scales/biases as a unit and
+    enforces ``max(128MB, largest_tensor) + 16MB`` per shard. Found by running
+    the 1.7B's tied embedding: its packed weight is 155.6 MB and the group is
+    175.0 MB, over the 171.6 MB bound, so the checkpoint converted cleanly and
+    then refused to load. The converter must fail at conversion instead.
+    """
+    import numpy as np
+
+    from funasr_mlx.checkpoints import quantize_bf16_weight
+
+    spec = QuantizationSpec.from_dict(_spec(targets=["layers."]))
+    shape = (151936, 2048)
+    assert spec.quantizes_tensor("layers.0.linear.weight", shape)
+    packed_bytes = shape[0] * (shape[1] * 4 // 32) * 4 + 2 * shape[0] * (shape[1] // 64) * 2
+    bound = max(128 * 1024 * 1024, shape[0] * (shape[1] * 4 // 32) * 4) + 16 * 1024 * 1024
+    assert packed_bytes > bound, "the 1.7B embedding no longer exercises the bound"
+
+    # The same arithmetic on a small tensor: the group is weight + 2 side
+    # tensors, and the side tensors are 2 bytes per 64-weight group.
+    weight = np.zeros((2048, 1024), dtype=np.uint16)
+    packed = quantize_bf16_weight(
+        "layers.0.linear.weight", weight, code="BF16", bits=4, group_size=64
+    )
+    group_bytes = sum(int(value.nbytes) for value in packed.values())
+    expected = 2048 * (1024 * 4 // 32) * 4 + 2 * 2048 * (1024 // 64) * 2
+    assert group_bytes == expected
+
+
+def test_converter_emits_one_shard_per_quantized_group(tmp_path):
+    """The group must not be split, and the emitted shard must satisfy the bound.
+
+    A real convert -> load round trip on a checkpoint whose tied embedding is
+    large enough to matter, asserting the loader accepts every shard.
+    """
+    from funasr_mlx.pipeline import load_model
+
+    source = tmp_path / "source"
+    _write_native_bf16_source(source, "qwen3-asr", TINY_QWEN3_ASR)
+    destination = tmp_path / "quantized"
+    quantization = _spec(targets=["thinker.model.layers.", "thinker.model.embed_tokens"])
+    convert_checkpoint(
+        source,
+        destination,
+        model="qwen3-asr",
+        dtype="bfloat16",
+        config={**TINY_QWEN3_ASR, "quantization": quantization},
+        source_rule=IDENTITY_SOURCE_RULE,
+        quantization=quantization,
+    )
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    # The embedding is selected this time, so the count is 14 + 1.
+    assert index["metadata"]["quantized_tensors"] == 15
+    for name in ("thinker.model.embed_tokens.weight",):
+        assert index["weight_map"][name] == index["weight_map"]["thinker.model.embed_tokens.scales"]
+    loaded, _ = load_model(destination, family="qwen3-asr")
+    assert isinstance(loaded.thinker.model.embed_tokens, nn.QuantizedEmbedding)
 
 
 def test_converter_skips_layers_the_group_size_cannot_divide(tmp_path):

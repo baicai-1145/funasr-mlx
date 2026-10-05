@@ -795,6 +795,14 @@ def _convert_safetensors_source(
                 # to the requested precision here, on the host.
                 keep_bf16 = code == "BF16" and dtype == "bfloat16"
                 if spec is not None and spec.quantizes_tensor(native, array.shape):
+                    # A quantized Linear must land in ONE shard together with its
+                    # scales/biases: `pipeline.load_model` binds the group as a
+                    # unit, and splitting it across shards is not supported. So
+                    # flush whatever is buffered, then check the group itself
+                    # against the loader's per-shard bound -- `max(128MB,
+                    # largest_tensor) + 16MB` -- and fail loudly rather than
+                    # emit a checkpoint that cannot be loaded.
+                    flush_quantized()
                     packed = quantize_bf16_weight(
                         native,
                         array,
@@ -806,13 +814,23 @@ def _convert_safetensors_source(
                     del array
                     side_code = "BF16" if keep_bf16 else "F16"
                     module = native[: -len(".weight")]
+                    group_bytes = sum(int(value.nbytes) for value in packed.values())
+                    shard_bound = (
+                        max(128 * 1024 * 1024, int(packed[native].nbytes)) + 16 * 1024 * 1024
+                    )
+                    if group_bytes > shard_bound:
+                        raise ValueError(
+                            f"Quantized group for {native} is {group_bytes / 1e6:.1f} MB, over "
+                            f"the {shard_bound / 1e6:.1f} MB per-shard bound the strict loader "
+                            "enforces; use a smaller group size or a wider bit width"
+                        )
                     quant_pending[native] = packed[native]
                     quant_pending[module + ".scales"] = packed[module + ".scales"]
                     quant_pending[module + ".biases"] = packed[module + ".biases"]
                     quant_codes[native] = "U32"
                     quant_codes[module + ".scales"] = side_code
                     quant_codes[module + ".biases"] = side_code
-                    quant_buffered += sum(int(value.nbytes) for value in packed.values())
+                    quant_buffered += group_bytes
                     quantized_names.append(native)
                     del packed
                     if quant_buffered >= shard_bytes:

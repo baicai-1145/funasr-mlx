@@ -73,6 +73,8 @@ class QuantizationSpec:
 
     @classmethod
     def from_dict(cls, data: Any) -> "QuantizationSpec":
+        if isinstance(data, cls):
+            return data
         if not isinstance(data, dict):
             raise ValueError("Quantization configuration must be a mapping")
         bits = data.get("bits", DEFAULT_BITS)
