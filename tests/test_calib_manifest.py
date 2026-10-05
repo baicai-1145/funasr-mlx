@@ -359,7 +359,7 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
         manifest = tmp_path / "unused.json"
         hessian = tmp_path / "h.npz"
         destination = tmp_path / "out"
-        report = None
+        report = tmp_path / "report.json"
         config = None
         dtype = "bfloat16"
         storage = "bfloat16"
@@ -387,3 +387,11 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
     # ... and the GPTQ hyper-parameters went to GptqWeight, not config.json.
     assert "bits" in seen["gptq"].configs["thinker.model.embed_tokens.weight"]
     assert "quantization" not in seen["gptq"].configs["thinker.model.embed_tokens.weight"]
+
+    # The report must actually be written.  An earlier version referenced the
+    # renamed local here and crashed *after* a successful conversion, so the
+    # checkpoint existed but the run reported failure.
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["gptq"]["thinker.model.embed_tokens.weight"]["method"] == "gptq"
+    assert report["gptq_config"]["bits"] == 4
+    assert report["targets"] == ["thinker.model.embed_tokens"]

@@ -418,7 +418,12 @@ def convert(args) -> int:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(
             json.dumps(
-                {"gptq": gptq.outcomes, "info": info.__dict__, "config": config.to_dict()},
+                {
+                    "gptq": gptq.outcomes,
+                    "info": info.__dict__,
+                    "gptq_config": gptq_config.to_dict(),
+                    "targets": list(spec.targets),
+                },
                 indent=2,
             )
             + "\n"
