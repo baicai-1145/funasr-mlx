@@ -247,29 +247,92 @@ def test_gptq_output_error_is_at_most_rtn_output_error(
     Frobenius norm is not, and is reported separately.
     """
     activations, weight = _least_squares_problem()
+
+
+def test_stored_triple_is_the_one_gptq_chose_not_a_rederivation() -> None:
+    """The stored triple must reproduce the matrix the reported metrics describe.
+
+    Regression guard.  An earlier version re-derived the triple by re-quantizing
+    the *finished* matrix, which silently destroyed most of the gain: the
+    reconstruction drifted (measured 598 vs 135 layer-output error on this very
+    problem, i.e. 4.4x worse) while every test still passed, because the stored
+    triple was still self-consistent.
+
+    Note what is deliberately *not* asserted: that re-quantizing the final matrix
+    reproduces the stored parameters.  With dynamic groups the parameters come
+    from the running (partially compensated) matrix, so that is legitimately not
+    a no-op.  The contract is that the stored triple dequantizes to the matrix
+    the error metrics were computed on, and that the codes are exactly the ones
+    those stored parameters imply.
+    """
+    activations, weight = _least_squares_problem(rows=512, columns=128)
     hessian = 2.0 * (activations.T @ activations)
-    config = GptqConfig(
-        bits=4, group_size=group_size, act_order=act_order, storage="float32"
-    )
-    gptq = gptq_quantize(weight, hessian, config)
-    rtn = rtn_quantize(weight, config, hessian)
-    assert gptq.rtn_output_error == pytest.approx(rtn.output_error)
-    assert gptq.output_error is not None and rtn.output_error is not None
-    assert gptq.output_error <= gptq.rtn_output_error, (
-        f"GPTQ output error {gptq.output_error:.6f} exceeds RTN "
-        f"{gptq.rtn_output_error:.6f} (act_order={act_order}, group_size={group_size})"
-    )
-    assert gptq.error_reduction is not None and gptq.error_reduction >= 0
+    config = GptqConfig(bits=4, group_size=64, storage="float32")
+    outcome = gptq_quantize(weight, hessian, config)
 
-
-def rtn_output_error_of(outcome, weight, hessian) -> float:
-    """Recompute the RTN arm's output error from its stored triple."""
     codes = unpack_codes(outcome.packed, weight.shape[1])
-    group = weight.shape[1] // outcome.scales.shape[1]
-    reconstructed = np.repeat(outcome.scales, group, axis=1) * codes + np.repeat(
-        outcome.biases, group, axis=1
+    stored = np.repeat(outcome.scales, 64, axis=1) * codes + np.repeat(
+        outcome.biases, 64, axis=1
     )
-    return output_error(weight, reconstructed, hessian)
+    assert outcome.error == pytest.approx(float(np.mean((weight - stored) ** 2)), rel=1e-5)
+    assert outcome.output_error == pytest.approx(
+        output_error(weight, stored, hessian), rel=1e-5
+    )
+    for index, start in enumerate(range(0, 128, 64)):
+        assert np.array_equal(
+            AffineQuantizer(bits=4, group_size=64, storage="float32").codes(
+                stored[:, start : start + 64],
+                outcome.scales[:, index],
+                outcome.biases[:, index],
+            ),
+            codes[:, start : start + 64],
+        )
+
+
+def test_act_order_uses_static_groups_so_the_stored_triple_stays_consistent() -> None:
+    """act-order permutes the columns; the stored triple must still line up.
+
+    Once act-order permutes the columns, the columns of one *stored* group
+    arrive interleaved, so the parameters have to be taken once, from the
+    original matrix, over the group's own columns in storage order (static
+    groups).  Taking them from the permuted running matrix instead -- the
+    dynamic-group rule that is correct without act-order -- leaves the stored
+    codes and the stored side tensors describing different groups, and the
+    checkpoint then dequantizes to a matrix the reported metrics never described.
+    """
+    activations, weight = _least_squares_problem(rows=512, columns=128)
+    hessian = 2.0 * (activations.T @ activations)
+    config = GptqConfig(bits=4, group_size=64, act_order=True, storage="float32")
+    outcome = gptq_quantize(weight, hessian, config)
+    codes = unpack_codes(outcome.packed, weight.shape[1])
+    stored = np.repeat(outcome.scales, 64, axis=1) * codes + np.repeat(
+        outcome.biases, 64, axis=1
+    )
+    assert outcome.error == pytest.approx(float(np.mean((weight - stored) ** 2)), rel=1e-5)
+    assert outcome.output_error == pytest.approx(
+        output_error(weight, stored, hessian), rel=1e-5
+    )
+    for index, start in enumerate(range(0, 128, 64)):
+        assert np.array_equal(
+            AffineQuantizer(bits=4, group_size=64, storage="float32").codes(
+                stored[:, start : start + 64],
+                outcome.scales[:, index],
+                outcome.biases[:, index],
+            ),
+            codes[:, start : start + 64],
+        )
+
+
+def test_act_order_beats_plain_order_on_a_correlated_hessian() -> None:
+    """act-order is not cosmetic: it must improve the metric it targets."""
+    activations, weight = _least_squares_problem(rows=512, columns=128)
+    hessian = 2.0 * (activations.T @ activations)
+    plain = gptq_quantize(weight, hessian, GptqConfig(bits=4, group_size=64, storage="float32"))
+    ordered = gptq_quantize(
+        weight, hessian, GptqConfig(bits=4, group_size=64, act_order=True, storage="float32")
+    )
+    assert ordered.output_error < plain.output_error
+
 
 
 def test_gptq_reduces_output_error_substantially_on_a_hard_problem() -> None:

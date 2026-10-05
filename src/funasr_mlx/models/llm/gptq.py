@@ -32,7 +32,12 @@ For a target matrix ``W`` of shape ``[out, in]`` and calibration activations
 ``act_order`` permutes the columns into descending ``diag(H)`` order first (and
 back afterwards), which matters most for embedding-like matrices with outlier
 directions: the most influential columns are quantized first, so their error is
-compensated by the columns that still have room to absorb it.
+compensated by the columns that still have room to absorb it.  Because the
+permutation makes a stored group's columns non-contiguous, act-order is paired
+with **static groups** -- the group parameters are taken once, from the original
+matrix, over each group's own columns in storage order.  Without act-order the
+columns are visited in storage order and the parameters are taken dynamically
+from the running (already error-compensated) matrix, as Frantar describes.
 
 The quantizer is :class:`AffineQuantizer`, a bit-exact port of MLX's
 ``affine_quantize`` kernel (``mlx/backend/metal/kernels/quantized.h``), so GPTQ
@@ -42,6 +47,13 @@ it picks the sign of the scale by which end of the group has the larger
 magnitude and then renormalizes the scale so that end lands exactly on an
 integer code, which is why a naive reimplementation disagrees with MLX on real
 weights (see ``tests/test_gptq.py``).
+
+The inner loop stores the codes and the group parameters **as it chooses them**.
+Re-deriving the triple afterwards by re-quantizing the finished matrix looks
+equivalent (the triple stays self-consistent) but is not: it moved this
+implementation's layer-output error from 135 to 598 on the module's own test
+problem, destroying most of the gain.  The stored triple is what the error
+metrics are computed on.
 
 Numeric contract
 ----------------
@@ -291,6 +303,11 @@ class GptqConfig:
     #: Columns per lazy batch update (Frantar's act-order note).
     block_size: int = 128
     #: Quantize in descending-``diag(H)`` order (recommended for embeddings).
+    #: This permutes the columns, so it is paired with **static groups**: the
+    #: group parameters are taken once, from the original matrix, over each
+    #: group's own columns in storage order.  (Frantar's act-order note makes the
+    #: same pairing; with dynamic groups the stored codes and the stored side
+    #: tensors would describe different groups.)
     act_order: bool = False
     #: Dtype the side tensors are stored in (must match the checkpoint dtype).
     storage: str = "bfloat16"
@@ -486,7 +503,6 @@ def gptq_quantize(
         inverse_permutation = np.argsort(permutation)
         weight = weight[:, permutation]
         hessian = hessian[np.ix_(permutation, permutation)]
-
     damp = config.damp_percent * float(np.mean(np.diag(hessian)))
     damped = hessian.copy()
     diagonal = np.arange(columns)
@@ -495,44 +511,88 @@ def gptq_quantize(
 
     quantized = np.zeros_like(weight)
     running = weight.copy()
+    codes = np.empty(weight.shape, dtype=np.uint8)
+    group_count = columns // config.group_size
+    scales = np.empty((weight.shape[0], group_count), dtype=np.float32)
+    biases = np.empty_like(scales)
+    # Group parameters, keyed by the group index in the *stored* layout.
+    #
+    # Without act-order the columns are visited in storage order, so a group's
+    # parameters are simply taken when the loop reaches its first column, from
+    # the running (already error-compensated) matrix -- Frantar's "dynamic
+    # groups".  With act-order the columns arrive in permuted order, so the
+    # columns of one stored group are no longer contiguous, and taking the
+    # parameters from the permuted matrix would leave the stored codes and the
+    # stored side tensors describing different groups (the checkpoint would
+    # dequantize to something the metrics never described).  act-order is
+    # therefore paired with **static groups**, as in the reference
+    # implementation: the parameters are chosen once, from the original matrix,
+    # over the group's own columns in storage order.
+    group_params: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    if config.act_order:
+        for index in range(group_count):
+            start = index * config.group_size
+            group_params[index] = quantizer.params(
+                original_weight[:, start : start + config.group_size]
+            )
+
+    def params_for(column: int) -> tuple[np.ndarray, np.ndarray]:
+        """Parameters for the *stored* group that permuted column ``column`` lands in."""
+        stored_column = column if permutation is None else int(permutation[column])
+        index = stored_column // config.group_size
+        if index not in group_params:
+            stop = (index + 1) * config.group_size
+            group_params[index] = quantizer.params(
+                running[:, index * config.group_size : stop]
+            )
+        return group_params[index]
+
     for start in range(0, columns, config.block_size):
         stop = min(start + config.block_size, columns)
         # ``block`` is this block's slice of the running (error-compensated)
-        # matrix; ``block_quantized`` collects what was actually chosen.  The
-        # two must be kept apart: the block update propagates ``block -
-        # block_quantized``, not ``block`` itself.
+        # matrix.  The compensation must be applied to it as the loop proceeds,
+        # so it is kept separate from the values actually chosen.
         block = running[:, start:stop].copy()
-        block_quantized = np.empty_like(block)
         block_upper = upper[start:stop, start:stop]
+        block_error = np.empty_like(block)
         for offset in range(stop - start):
             column = start + offset
-            if column % config.group_size == 0:
-                # Group parameters come from the *running* matrix: the columns
-                # not yet quantized already carry the compensation of every
-                # earlier column, which is what makes these "dynamic groups".
-                end = min(column + config.group_size, columns)
-                scale, bias = quantizer.params(running[:, column:end])
-            _, reconstruction = quantizer.quantize(block[:, offset], scale, bias)
-            block_quantized[:, offset] = reconstruction
+            scale, bias = params_for(column)
+            block_codes, reconstruction = quantizer.quantize(block[:, offset], scale, bias)
+            codes[:, column] = block_codes
+            quantized[:, column] = reconstruction
             pivot = float(block_upper[offset, offset])
             error = (block[:, offset] - reconstruction) / pivot
+            block_error[:, offset] = error
             if offset + 1 < block.shape[1]:
                 block[:, offset + 1 :] -= np.outer(
                     error, block_upper[offset, offset + 1 :]
                 )
-        quantized[:, start:stop] = block_quantized
         if stop < columns:
-            # Lazy batch update: propagate the block's accumulated error into
-            # every remaining column at once, instead of column by column.
-            block_error = block - block_quantized
+            # Lazy batch update (Frantar's act-order note): every column in the
+            # block contributes ``error_i * Hinv[i, stop:]`` to the remaining
+            # columns, so the whole block's compensation is applied at once.
+            # ``error_i`` is the *scaled* error ``(w - q) / Hinv[i, i]`` -- the
+            # reference's ``Err1`` -- and NOT ``block - block_quantized``, which
+            # differs by a factor of ``Hinv[i, i]`` per column because the
+            # running block has already absorbed the earlier columns' updates.
             running[:, stop:] -= block_error @ upper[start:stop, stop:]
+
+    for index in range(group_count):
+        scale, bias = group_params[index]
+        scales[:, index] = scale
+        biases[:, index] = bias
 
     if inverse_permutation is not None:
         quantized = quantized[:, inverse_permutation]
+        codes = codes[:, inverse_permutation]
 
     error = float(np.mean((original_weight - quantized) ** 2))
     result_output_error = output_error(original_weight, quantized, original_hessian)
-    packed, scales, biases = _pack_triple(quantized, quantizer)
+    dtype = quantizer.storage_dtype
+    packed = quantizer.pack(codes)
+    scales = scales.astype(dtype)
+    biases = biases.astype(dtype)
     reduction = None
     frobenius_reduction = None
     if rtn_output_error:
