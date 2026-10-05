@@ -513,9 +513,21 @@ def convert(args) -> int:
         tensor_limit=args.tensor_limit,
     )
     if not gptq.outcomes:
-        raise SystemExit(
-            f"No tensor was quantized with GPTQ -- is {head_weight} selected by "
-            f"targets {spec.targets}?"
+        # Not an error when the head is deliberately out of scope: the tower/
+        # decoder-only configuration is a supported arm (t9's known-safe scope),
+        # and it quantizes only Linears, which go through mx.quantize rather than
+        # the GPTQ path.  Failing here would make the fallback arm impossible to
+        # build with this tool.  It IS an error if the head was selected and
+        # nothing happened, which is the silent-miss case the original check was
+        # for -- so the distinction is made on whether the head is in targets.
+        if any(head_path.startswith(target) or target.startswith(head_path) for target in spec.targets):
+            raise SystemExit(
+                f"No tensor was quantized with GPTQ -- is {head_weight} selected by "
+                f"targets {spec.targets}?"
+            )
+        print(
+            f"note: {head_path} is out of scope for targets {list(spec.targets)}; "
+            "the head stays at the checkpoint dtype (decoder/tower-only arm)"
         )
     print(json.dumps({"gptq": gptq.outcomes, "info": info.__dict__}, indent=2))
     if args.report:
