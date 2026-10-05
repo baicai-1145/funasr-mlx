@@ -358,6 +358,17 @@ def convert(args) -> int:
     native_dir, family, head_path, _key = FAMILIES[args.family]
     source = args.native_root / native_dir
     spec = QuantizationSpec.from_dict(args.quantization)
+    # The converter writes the destination's ``config.json`` from what it is
+    # handed, and ``pipeline.load_model`` refuses to guess a configuration, so
+    # the source's own config is what has to be passed through -- with the
+    # quantization section added so the loader knows to rebuild the quantized
+    # modules.  Without this the emitted checkpoint has no config.json at all
+    # and cannot be loaded.
+    if args.config is not None:
+        checkpoint_config = json.loads(Path(args.config).read_text())
+    else:
+        checkpoint_config = json.loads((source / "config.json").read_text())
+    checkpoint_config["quantization"] = spec.to_dict()
 
     accumulator = HessianAccumulator.load(args.hessian)
     # The Hessian file is keyed by language; rebuild the balanced Hessian.
@@ -366,7 +377,11 @@ def convert(args) -> int:
     # 1024x1024 float32 matrix is only 4 MB but the accumulator holds ten of
     # them; drop the source so the peak is the balanced copy alone.
     del accumulator
-    config = GptqConfig(
+    # NB: named ``gptq_config``, not ``config`` -- the model's own config is
+    # ``checkpoint_config`` above, and an earlier version let the GPTQ
+    # hyper-parameters overwrite it, which wrote a GptqConfig object into the
+    # destination's config.json (and crashed on the way).
+    gptq_config = GptqConfig(
         bits=spec.bits,
         group_size=spec.group_size,
         damp_percent=args.damp_percent,
@@ -378,16 +393,16 @@ def convert(args) -> int:
     head_weight = head_path + ".weight"
     gptq = GptqWeight(
         hessians={head_weight: hessian},
-        configs={head_weight: config.to_dict()},
+        configs={head_weight: gptq_config.to_dict()},
     )
-    print(f"GPTQ target: {head_weight} {hessian.shape} {config.to_dict()}")
+    print(f"GPTQ target: {head_weight} {hessian.shape} {gptq_config.to_dict()}")
 
     info = convert_checkpoint(
         source,
         args.destination,
         model=family,
         dtype=args.dtype,
-        config=args.config,
+        config=checkpoint_config,
         source_rule="native",
         quantization=spec.to_dict(),
         gptq=gptq,
@@ -456,8 +471,6 @@ def main() -> int:
         args.destination = (
             Path("/Volumes/2T/funasr-mlx-alignment/native-llm") / f"{args.family}-w4a16-gptq"
         )
-    if args.config is None:
-        args.config = None
     if args.quantization is None:
         # Default scope: the whole stack plus the tied head -- the point of GPTQ
         # is that the head is now safe to quantize.

@@ -291,3 +291,99 @@ def test_digest_matches_hashlib(tmp_path):
     path = tmp_path / "x.bin"
     path.write_bytes(b"calibration")
     assert manifest.digest(path) == hashlib.sha256(b"calibration").hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# the conversion tool's config pass-through
+# --------------------------------------------------------------------------- #
+def test_convert_tool_passes_the_source_config_with_the_quantization_section(
+    tmp_path, monkeypatch
+):
+    """The emitted checkpoint must carry a loadable ``config.json``.
+
+    ``pipeline.load_model`` refuses to guess a configuration, and the converter
+    writes the destination's ``config.json`` from whatever it is handed.  An
+    earlier version of the tool passed ``config=None`` and produced a checkpoint
+    with no ``config.json`` at all: the conversion reported success and the
+    checkpoint could not be loaded.  A later version then let the GPTQ
+    hyper-parameters (also called ``config``) overwrite the model config, so
+    ``config.json`` got a ``GptqConfig`` object.  Both are guarded here.
+    """
+    import json
+
+    from tools import gptq_calibrate
+
+    source = tmp_path / "native-llm" / "qwen3-asr-0.6b"
+    source.mkdir(parents=True)
+    (source / "config.json").write_text(json.dumps({"thinker_config": {"a": 1}}))
+
+    seen = {}
+
+    class Info:
+        files: tuple = ()
+        tensor_count = 0
+        tensor_bytes = 0
+        largest_tensor_bytes = 0
+        dtypes: dict = {}
+
+    def fake_convert(source_path, destination, **kwargs):
+        seen.update(kwargs)
+        seen["source"] = source_path
+        return Info()
+
+    class FakeGptq:
+        def __init__(self, hessians, configs):
+            self.hessians = hessians
+            self.configs = configs
+            self.outcomes = {"thinker.model.embed_tokens.weight": {"method": "gptq"}}
+
+    class FakeAccumulator:
+        @classmethod
+        def load(cls, path):
+            return cls()
+
+        def hessian(self, balance=True):
+            return np.eye(4, dtype=np.float32)
+
+    monkeypatch.setattr("funasr_mlx.checkpoints.convert_checkpoint", fake_convert)
+    monkeypatch.setattr("funasr_mlx.checkpoints.GptqWeight", FakeGptq)
+    monkeypatch.setattr(
+        "funasr_mlx.models.llm.gptq.HessianAccumulator.load", FakeAccumulator.load
+    )
+    monkeypatch.setattr("funasr_mlx.memory.guarded_child_active", lambda: True)
+
+    class Args:
+        family = "qwen3-asr-0.6b"
+        phase = "convert"
+        native_root = tmp_path / "native-llm"
+        manifest = tmp_path / "unused.json"
+        hessian = tmp_path / "h.npz"
+        destination = tmp_path / "out"
+        report = None
+        config = None
+        dtype = "bfloat16"
+        storage = "bfloat16"
+        quantization = {
+            "bits": 4,
+            "group_size": 64,
+            "mode": "affine",
+            "targets": ["thinker.model.embed_tokens"],
+            "method": "gptq",
+        }
+        damp_percent = 0.01
+        block_size = 128
+        no_act_order = False
+        tensor_limit = 1_000_000
+
+    assert gptq_calibrate.convert(Args()) == 0
+
+    # The model's own config came through untouched ...
+    assert seen["config"]["thinker_config"] == {"a": 1}
+    # ... and is a plain JSON-able mapping, not a GptqConfig object.
+    assert isinstance(seen["config"], dict)
+    json.dumps(seen["config"])
+    # ... with the quantization section the loader needs.
+    assert seen["config"]["quantization"]["method"] == "gptq"
+    # ... and the GPTQ hyper-parameters went to GptqWeight, not config.json.
+    assert "bits" in seen["gptq"].configs["thinker.model.embed_tokens.weight"]
+    assert "quantization" not in seen["gptq"].configs["thinker.model.embed_tokens.weight"]
