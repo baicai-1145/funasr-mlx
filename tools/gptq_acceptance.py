@@ -56,11 +56,20 @@ SCRIPT_STRIP_LANGUAGES = {"zh", "ja", "ko", "th"}
 _PUNCTUATION = re.compile(r"[\s。，、！？；：「」『』（）【】《》…—～·,.!?;:'\"()\[\]{}<>|/\\-]+")
 
 
+#: The guide prefix qwen3-asr emits before the transcript.  It is checked on its
+#: own by :func:`guide_span_ok` and must NOT be part of the transcript
+#: comparison -- otherwise a perfectly correct transcript never equals the
+#: reference, which is what made ``baseline_matches_expected`` read 0/80 while
+#: the baseline transcripts were visibly correct.
+_GUIDE = re.compile(r"^\s*language\s+[A-Za-z]+\s*")
+
+
 def normalize(text: str, language: str) -> str:
-    """Comparison form of a transcript: case-folded, punctuation stripped."""
+    """Comparison form of a transcript: guide prefix removed, punctuation stripped."""
     if text is None:
         return ""
     text = text.replace("<asr_text>", "").replace("<|im_end|>", "").replace("<|endoftext|>", "")
+    text = _GUIDE.sub("", text)
     text = text.casefold()
     if language in SCRIPT_STRIP_LANGUAGES:
         return _PUNCTUATION.sub("", text)

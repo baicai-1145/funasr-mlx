@@ -141,6 +141,25 @@ def test_normalize_keeps_distinct_words_distinct():
     assert normalize("hello world", "en") != normalize("hello there", "en")
 
 
+def test_normalize_strips_the_language_guide_prefix():
+    """The guide prefix is checked separately and must not break the comparison.
+
+    qwen3-asr emits ``language Chinese<asr_text>`` before the transcript.  Left
+    in, a correct transcript never equals the reference string and every row
+    reads as a mismatch -- which is exactly what happened: the acceptance report
+    showed ``baseline_matches_expected`` 0/80 while the baseline transcripts were
+    visibly correct.
+    """
+    assert normalize("language Chinese<asr_text>你好", "zh") == normalize("你好", "zh")
+    assert normalize("language English hello", "en") == normalize("hello", "en")
+    assert normalize("language Thai สวัสดี", "th") == normalize("สวัสดี", "th")
+
+
+def test_normalize_only_strips_a_leading_guide():
+    """A transcript that merely mentions 'language' must keep it."""
+    assert "language" in normalize("the language model works", "en")
+
+
 def test_normalize_handles_none():
     assert normalize(None, "en") == ""
 
