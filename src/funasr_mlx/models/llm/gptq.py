@@ -868,26 +868,47 @@ class HessianAccumulator:
                     "language_weights names languages with no activations: "
                     f"{sorted(unknown)}"
                 )
-            weights = self._apply_language_weights(weights, language_weights)
+            weights = self._apply_language_weights(
+                language_weights, balance=balance, cap_fraction=cap_fraction
+            )
         total = np.zeros((self.columns, self.columns), dtype=np.float32)
         for language, product in self.sums.items():
             total += product * np.float32(weights[language])
         return 2.0 * total
 
-    @staticmethod
-    def _apply_language_weights(
-        weights: Mapping[str, float], language_weights: Mapping[str, float]
+    def _weighted_effective_rows(
+        self, language_weights: Mapping[str, float], *, balance: bool, cap_fraction
     ) -> dict[str, float]:
-        """Multiply per-language weights and renormalise, preserving the total."""
+        """Per-language effective rows after weighting, total preserved.
+
+        The renormalisation is done in EFFECTIVE-ROW space, which is the space
+        the 30% guard is stated in and the only one where "total mass" is
+        meaningful.  An earlier version renormalised the multipliers instead,
+        which silently changed the overall scale of the Hessian and therefore the
+        damping (defined relative to the mean diagonal).
+        """
+        effective = self._effective_rows(balance=balance, cap_fraction=cap_fraction)
         scaled = {
             name: value * float(language_weights.get(name, 1.0))
-            for name, value in weights.items()
+            for name, value in effective.items()
         }
-        before = sum(weights.values())
-        after = sum(scaled.values())
+        before, after = sum(effective.values()), sum(scaled.values())
         if after > 0 and before > 0:
             scaled = {name: value * before / after for name, value in scaled.items()}
         return scaled
+
+    def _apply_language_weights(
+        self,
+        language_weights: Mapping[str, float],
+        *,
+        balance: bool,
+        cap_fraction,
+    ) -> dict[str, float]:
+        """Multipliers to apply to the raw ``X^T X`` sums, after weighting."""
+        weighted = self._weighted_effective_rows(
+            language_weights, balance=balance, cap_fraction=cap_fraction
+        )
+        return {name: weighted[name] / self.rows[name] for name in weighted}
 
     def language_mass_with(
         self,
@@ -902,8 +923,9 @@ class HessianAccumulator:
         against it before the Hessian is built -- otherwise a rebalance can push
         a language past the bound and only surface as a failed run much later.
         """
-        weights = self._row_weights(balance=balance, cap_fraction=cap_fraction)
-        scaled = self._apply_language_weights(weights, language_weights)
+        scaled = self._weighted_effective_rows(
+            language_weights, balance=balance, cap_fraction=cap_fraction
+        )
         total = sum(scaled.values())
         return {name: value / total for name, value in scaled.items()}
 

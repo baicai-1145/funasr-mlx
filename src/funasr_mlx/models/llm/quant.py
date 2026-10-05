@@ -85,6 +85,28 @@ class QuantizationSpec:
     mode: str = "affine"
     targets: tuple[str, ...] = ()
     method: str = DEFAULT_METHOD
+    #: Optional per-target bit widths, e.g. ``{"thinker.model.embed_tokens": 8}``.
+    #: The LONGEST matching target prefix wins, so a specific module can differ
+    #: from the general rule.  This exists because the tied embedding and the
+    #: decoder Linears do not have the same sensitivity: measured on
+    #: qwen3-asr-0.6b, a w4 head costs ~10% mean span token edit rate while the
+    #: decoder Linears at w4 are fine, so spending 8 bits on the head and 4 on
+    #: the stack is a better use of the budget than 4 bits on both.
+    target_bits: tuple[tuple[str, int], ...] = ()
+
+    def bits_for(self, module_path: str) -> int:
+        """Bit width for ``module_path``: longest matching override, else ``bits``."""
+        best_prefix = ""
+        best_bits = self.bits
+        for prefix, value in self.target_bits:
+            if module_path.startswith(prefix) and len(prefix) > len(best_prefix):
+                best_prefix, best_bits = prefix, value
+        return best_bits
+
+    def bits_for_weight(self, name: str) -> int:
+        """Bit width for checkpoint tensor ``name`` (strips the ``.weight`` tail)."""
+        module = name[: -len(".weight")] if name.endswith(".weight") else name
+        return self.bits_for(module)
 
     @classmethod
     def from_dict(cls, data: Any) -> "QuantizationSpec":
@@ -97,6 +119,7 @@ class QuantizationSpec:
         mode = data.get("mode", "affine")
         targets = data.get("targets", ())
         method = data.get("method", DEFAULT_METHOD)
+        raw_target_bits = data.get("target_bits", {}) or {}
         if bits not in (2, 3, 4, 5, 6, 8):
             raise ValueError(f"Unsupported quantization bit width: {bits}")
         if group_size not in (32, 64, 128):
@@ -113,18 +136,38 @@ class QuantizationSpec:
             or not all(isinstance(entry, str) and entry for entry in targets)
         ):
             raise ValueError("Quantization targets must be a nonempty list of module paths")
+        if not isinstance(raw_target_bits, dict):
+            raise ValueError("target_bits must be a mapping of prefix -> bit width")
+        target_bits = []
+        for prefix, value in raw_target_bits.items():
+            if not isinstance(prefix, str) or not prefix:
+                raise ValueError("target_bits keys must be nonempty module paths")
+            if value not in (2, 3, 4, 5, 6, 8):
+                raise ValueError(f"Unsupported bit width for {prefix!r}: {value}")
+            target_bits.append((prefix, int(value)))
+        # Sorted longest-first so the tie-break is deterministic regardless of
+        # dict order; bits_for() also compares lengths, this is belt-and-braces.
+        target_bits.sort(key=lambda entry: (-len(entry[0]), entry[0]))
         return cls(
-            bits=bits, group_size=group_size, mode=mode, targets=tuple(targets), method=method
+            bits=bits,
+            group_size=group_size,
+            mode=mode,
+            targets=tuple(targets),
+            method=method,
+            target_bits=tuple(target_bits),
         )
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "bits": self.bits,
             "group_size": self.group_size,
             "mode": self.mode,
             "targets": list(self.targets),
             "method": self.method,
         }
+        if self.target_bits:
+            payload["target_bits"] = dict(self.target_bits)
+        return payload
 
     def selects(self, module_path: str) -> bool:
         """Whether ``module_path`` sits under one of the declared prefixes."""
@@ -190,7 +233,13 @@ class QuantizationSpec:
             return True
         if not self.is_linear_weight(name, shape):
             return False
-        return tuple(shape)[1] % self.group_size == 0
+        # The group size must divide the input dimension; the pack factor must
+        # too, and it follows from the per-tensor bit width (8 bits packs 4 per
+        # uint32 word, 4 bits packs 8), so a per-target override has to be
+        # checked here rather than against the default width.
+        columns = tuple(shape)[1]
+        bits = self.bits_for_weight(name)
+        return columns % self.group_size == 0 and columns % (32 // bits) == 0
 
     def quantizes_module(self, module_path: str, module: nn.Module) -> bool:
         """Whether ``module`` (a live ``nn.Module``) should become quantized.
@@ -225,9 +274,14 @@ class QuantizationResult:
     targets: tuple[str, ...]
     quantized: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    #: Modules quantized at a width other than ``bits`` (see
+    #: :meth:`QuantizationSpec.bits_for`), recorded so a report shows the plan
+    #: that was actually applied rather than only the default.
+    overrides: dict[str, int] = field(default_factory=dict)
+    target_bits: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> dict:
-        return {
+        payload = {
             "bits": self.bits,
             "group_size": self.group_size,
             "mode": self.mode,
@@ -235,6 +289,9 @@ class QuantizationResult:
             "linear_layers_quantized": len(self.quantized),
             "linear_layers_skipped": len(self.skipped),
         }
+        if self.overrides:
+            payload["bit_width_overrides"] = dict(self.overrides)
+        return payload
 
 
 def activation_dtype(module: nn.Module) -> mx.Dtype:
@@ -285,8 +342,10 @@ def apply_quantization(model: nn.Module, data: Any) -> QuantizationResult | None
     result = QuantizationResult(
         bits=spec.bits, group_size=spec.group_size, mode=spec.mode, targets=spec.targets
     )
+    if spec.target_bits:
+        result.target_bits = dict(spec.target_bits)
 
-    def predicate(path: str, module: nn.Module) -> bool:
+    def predicate(path: str, module: nn.Module):
         # Only the two weight-bearing module kinds the scheme supports are
         # considered; everything else (norms, convs, position tables) is left
         # at the checkpoint dtype and is not reported as a skip.
@@ -295,6 +354,14 @@ def apply_quantization(model: nn.Module, data: Any) -> QuantizationResult | None
         ):
             if spec.quantizes_module(path, module):
                 result.quantized.append(path)
+                bits = spec.bits_for(path)
+                if bits != spec.bits:
+                    result.overrides[path] = bits
+                    # Returning a dict is nn.quantize's per-module escape hatch.
+                    # The bit width must be honoured here, at load time, or the
+                    # module is built at the wrong width and the strict loader
+                    # rejects the checkpoint's shapes -- so this is not cosmetic.
+                    return {"group_size": spec.group_size, "bits": bits, "mode": spec.mode}
                 return True
             result.skipped.append(path)
         return False

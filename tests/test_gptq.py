@@ -611,13 +611,30 @@ def test_language_weights_shift_mass_without_changing_the_total():
     assert sum(unweighted.values()) == pytest.approx(1.0)
 
 
-def test_language_weights_change_the_hessian_but_not_its_scale():
+def test_language_weights_preserve_the_total_effective_rows():
+    """The renormalisation must happen in effective-row space.
+
+    "Total mass" is only meaningful in effective rows -- the space the 30% guard
+    is stated in.  An earlier version renormalised the per-language MULTIPLIERS
+    instead, which changed the overall scale of the Hessian and therefore the
+    damping (defined relative to the mean diagonal).  This pins the invariant that
+    actually holds; note the trace is NOT preserved, because
+    trace(X_i^T X_i) / rows_i differs by language, so preserving effective rows
+    does not preserve the trace.  Asserting trace-invariance was wrong and the
+    test failed when it was written that way.
+    """
     accumulator = _accumulator_with_languages({"zh": 400, "ja": 100})
+    before = accumulator._effective_rows(balance=True)
+    for weights in ({"ja": 4.0}, {"zh": 2.0}, {"ja": 3.0, "zh": 0.5}):
+        after = accumulator._weighted_effective_rows(
+            weights, balance=True, cap_fraction=None
+        )
+        assert sum(after.values()) == pytest.approx(sum(before.values()))
+        assert sum(accumulator.language_mass_with(weights).values()) == pytest.approx(1.0)
+    # And the Hessian genuinely changes.
     plain = accumulator.hessian(balance=True)
     weighted = accumulator.hessian(balance=True, language_weights={"ja": 4.0})
     assert not np.allclose(plain, weighted)
-    # Same trace to within the redistribution: the total mass is preserved.
-    assert float(np.trace(weighted)) == pytest.approx(float(np.trace(plain)), rel=1e-5)
 
 
 def test_language_weights_reject_an_unknown_language():

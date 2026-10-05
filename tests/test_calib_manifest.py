@@ -332,9 +332,10 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
         return Info()
 
     class FakeGptq:
-        def __init__(self, hessians, configs):
+        def __init__(self, hessians, configs, method="gptq"):
             self.hessians = hessians
             self.configs = configs
+            self.method = method
             self.outcomes = {"thinker.model.embed_tokens.weight": {"method": "gptq"}}
 
     class FakeAccumulator:
@@ -342,14 +343,19 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
         def load(cls, path):
             return cls()
 
-        def hessian(self, balance=True):
+        def hessian(self, balance=True, language_weights=None):
             return np.eye(4, dtype=np.float32)
+
+        def language_mass_with(self, language_weights, balance=True):
+            return {}
 
     monkeypatch.setattr("funasr_mlx.checkpoints.convert_checkpoint", fake_convert)
     monkeypatch.setattr("funasr_mlx.checkpoints.GptqWeight", FakeGptq)
     monkeypatch.setattr(
         "funasr_mlx.models.llm.gptq.HessianAccumulator.load", FakeAccumulator.load
     )
+    # The tool imports it inside the function, so patch it on the module the
+    # tool imports FROM (funasr_mlx.memory), which is what the local import sees.
     monkeypatch.setattr("funasr_mlx.memory.guarded_child_active", lambda: True)
 
     class Args:
@@ -370,6 +376,9 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
             "targets": ["thinker.model.embed_tokens"],
             "method": "gptq",
         }
+        method = "gptq"
+        language_weights = None
+        max_language_mass = 0.30
         damp_percent = 0.01
         block_size = 128
         no_act_order = False

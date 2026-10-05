@@ -723,15 +723,15 @@ def test_no_dtype_helper_reads_a_quantizable_weight_directly():
     )
 
     helpers = [
-        (qwen3_asr_thinker.Qwen3ASRThinker, "_decoder_dtype"),
-        (qwen3_asr_thinker.Qwen3ASRThinker, "_tower_dtype"),
+        (qwen3_asr_thinker.Qwen3ASR, "_decoder_dtype"),
+        (qwen3_asr_thinker.Qwen3ASR, "_tower_dtype"),
         (glm_asr_thinker.GlmAsrThinker, "_decoder_dtype"),
         (glm_asr_thinker.GlmAsrThinker, "_tower_dtype"),
         (moss_transcribe.MossTranscribeDiarize, "_decoder_dtype"),
         (sensevoice.SenseVoiceEncoderSmall, "_weight_dtype"),
         (whisper.AudioEncoder, "_weight_dtype"),
         (whisper.TextDecoder, "_weight_dtype"),
-        (emotion2vec.Emotion2vec, "_weight_dtype"),
+        (emotion2vec.AudioEncoder, "_weight_dtype"),
     ]
     for owner, name in helpers:
         source = inspect.getsource(getattr(owner, name))
@@ -740,3 +740,93 @@ def test_no_dtype_helper_reads_a_quantizable_weight_directly():
             "weight is ever quantized the cast becomes a uint32 cast. Route it "
             "through funasr_mlx.models.llm.quant.activation_dtype."
         )
+
+
+# --------------------------------------------------------------------------- #
+# per-target bit widths (a w8 head beside a w4 stack)
+# --------------------------------------------------------------------------- #
+def test_bits_for_uses_the_longest_matching_prefix():
+    from funasr_mlx.models.llm.quant import QuantizationSpec
+
+    spec = QuantizationSpec.from_dict(
+        {
+            "bits": 4,
+            "group_size": 64,
+            "mode": "affine",
+            "targets": ["thinker.model.layers.", "thinker.model.embed_tokens"],
+            "target_bits": {"thinker.model.embed_tokens": 8},
+        }
+    )
+    assert spec.bits == 4
+    assert spec.bits_for("thinker.model.embed_tokens") == 8
+    assert spec.bits_for("thinker.model.layers.0.self_attn.q_proj") == 4
+    # A nested override wins over the broader one it sits inside.
+    nested = QuantizationSpec.from_dict(
+        {
+            "bits": 4,
+            "group_size": 64,
+            "targets": ["thinker.model.layers."],
+            "target_bits": {
+                "thinker.model.layers.": 8,
+                "thinker.model.layers.0.": 4,
+            },
+        }
+    )
+    assert nested.bits_for("thinker.model.layers.0.mlp.up_proj") == 4
+    assert nested.bits_for("thinker.model.layers.1.mlp.up_proj") == 8
+
+
+def test_target_bits_round_trip_and_validate():
+    from funasr_mlx.models.llm.quant import QuantizationSpec
+
+    spec = QuantizationSpec.from_dict(
+        {
+            "bits": 4,
+            "group_size": 64,
+            "targets": ["a."],
+            "target_bits": {"a.embed": 8},
+        }
+    )
+    assert spec.to_dict()["target_bits"] == {"a.embed": 8}
+    assert QuantizationSpec.from_dict(spec.to_dict()).bits_for("a.embed") == 8
+    # A spec with no overrides must not grow a target_bits key.
+    plain = QuantizationSpec.from_dict({"bits": 4, "group_size": 64, "targets": ["a."]})
+    assert "target_bits" not in plain.to_dict()
+    with pytest.raises(ValueError, match="Unsupported bit width"):
+        QuantizationSpec.from_dict(
+            {"bits": 4, "group_size": 64, "targets": ["a."], "target_bits": {"a.": 7}}
+        )
+    with pytest.raises(ValueError, match="target_bits must be a mapping"):
+        QuantizationSpec.from_dict(
+            {"bits": 4, "group_size": 64, "targets": ["a."], "target_bits": [8]}
+        )
+
+
+def test_a_w8_head_beside_a_w4_stack_loads_strictly():
+    """The override must be honoured at LOAD time, not just in the report.
+
+    If apply_quantization built the head at the spec's default width, the strict
+    loader would reject the checkpoint's shapes. This is the end-to-end check
+    that the per-target width reaches the module construction.
+    """
+    model = create_model("qwen3-asr", TINY_QWEN3_ASR)
+    quantization = {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+        "method": "gptq",
+        "targets": ["thinker.model.layers.", "thinker.model.embed_tokens"],
+        "target_bits": {"thinker.model.embed_tokens": 8},
+    }
+    result = apply_quantization(model, quantization)
+    assert result is not None
+    head = model.thinker.model.embed_tokens
+    assert isinstance(head, nn.QuantizedEmbedding)
+    # 8 bits -> 4 codes per uint32 word; the hidden size is 64 in the tiny config.
+    assert head.bits == 8
+    assert head["weight"].shape[-1] == 64 // 4
+    # The decoder Linears keep the default width.
+    layer = model.thinker.model.layers[0].self_attn.q_proj
+    assert isinstance(layer, nn.QuantizedLinear)
+    assert layer.bits == 4
+    assert result.overrides == {"thinker.model.embed_tokens": 8}

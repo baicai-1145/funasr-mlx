@@ -476,8 +476,13 @@ def convert(args) -> int:
     # ``checkpoint_config`` above, and an earlier version let the GPTQ
     # hyper-parameters overwrite it, which wrote a GptqConfig object into the
     # destination's config.json (and crashed on the way).
+    #
+    # The bit width comes from the HEAD's own override, not from the spec default:
+    # a w8 head beside a w4 stack is exactly the case this supports, and the
+    # converter cross-checks this config against the width it packs the tensor at.
+    head_bits = spec.bits_for_weight(head_path + ".weight")
     gptq_config = GptqConfig(
-        bits=spec.bits,
+        bits=head_bits,
         group_size=spec.group_size,
         damp_percent=args.damp_percent,
         block_size=args.block_size,

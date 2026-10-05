@@ -925,11 +925,16 @@ def _convert_safetensors_source(
                     # largest_tensor) + 16MB` -- and fail loudly rather than
                     # emit a checkpoint that cannot be loaded.
                     flush_quantized()
+                    # Per-target bit width: a w8 head beside a w4 stack (see
+                    # QuantizationSpec.bits_for).  This must match what
+                    # apply_quantization builds at load time or the strict
+                    # loader rejects the shapes.
+                    tensor_bits = spec.bits_for_weight(native)
                     packed = quantize_bf16_weight(
                         native,
                         array,
                         code="BF16" if keep_bf16 else "F16",
-                        bits=spec.bits,
+                        bits=tensor_bits,
                         group_size=spec.group_size,
                         mode=spec.mode,
                         gptq=gptq if (gptq is not None and gptq.has(native)) else None,
