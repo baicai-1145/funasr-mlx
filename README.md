@@ -64,6 +64,42 @@ funasr-mlx infer /path/to/checkpoint-dir --model sensevoice --audio recording.wa
 funasr-mlx infer /path/to/checkpoint-dir --model ct-punc --text "hello world" --tokens /path/to/tokens.txt
 ```
 
+## W4A16 quantization
+
+4-bit weights with 16-bit activations for the LLM-ASR decoders, using MLX
+affine group quantization (group size 64). At batch size 1 the decode step
+streams the weights once per step, so reading 4x fewer bytes is the largest
+remaining lever; measured on an M4 it cuts peak inference memory 41-59% and
+decode time up to 2.7x across the five families.
+
+Convert a native checkpoint, then load it exactly as an unquantized one:
+
+```sh
+python3 tools/convert_llm_checkpoints.py --family qwen3-asr-0.6b \
+    --source /path/to/qwen3-asr-0.6b --destination /path/to/qwen3-asr-0.6b-w4a16 \
+    --native-source --quantize tower
+```
+
+`--quantize` picks how much is quantized, and the choice is not cosmetic:
+
+| scope | reaches | buys |
+|---|---|---|
+| `decoder` | decoder Linear layers | decode time |
+| `tower` | + the audio tower | peak memory; the tower runs once per utterance, so no decode cost |
+| `all` | + the tied token embedding | removes the per-step LM-head read, but only some families survive it |
+
+The token embedding is the tied LM head, so quantizing it injects 4-bit error
+directly into every step's logits. It is safe for `fun-asr-nano` (tokens fully
+identical) and destroys the transcript for `qwen3-asr-0.6b` and `glm-asr-nano`,
+so `all` is opt-in per family rather than a default. `lm_head`, position tables,
+convolutions and norms are never quantized. Loading is strict: the config
+records `quantized_tensors` and `quantization_skipped`, and a key that should
+have been quantized but was not is an error, not a silent fallback.
+
+Per-family scope, checkpoint sizes, measured speedups and peak-memory drops are
+in `.tmp/t9/RESULTS.md`; the scheme and its failure modes are in
+`.tmp/t9/LEDGER.md`.
+
 ## Memory Policy
 
 The hard ceiling is 10 GB (decimal) for project processes. Numerical jobs
@@ -85,8 +121,9 @@ PYTHONPATH=src PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m funasr_mlx.runtime \
   python3 -m pytest -q --tb=short --basetemp=.tmp/pytest-check
 ```
 
-468 tests pass in the guarded suite. Real-checkpoint accuracy, quantized
-variants, and latency/RTF figures are documented in `PROGRESS.md`.
+503 tests pass in the guarded suite. Real-checkpoint accuracy, quantized
+variants, and latency/RTF figures are documented in `PROGRESS.md`; the W4A16
+per-family numbers are in `.tmp/t9/RESULTS.md`.
 
 ## Attribution
 
