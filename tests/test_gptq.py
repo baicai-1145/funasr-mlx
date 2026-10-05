@@ -581,3 +581,60 @@ def test_row_chunk_accepts_a_single_row_and_the_whole_matrix() -> None:
 def test_row_chunk_must_not_be_negative() -> None:
     with pytest.raises(ValueError, match="row_chunk"):
         GptqConfig(row_chunk=-1)
+
+
+# --------------------------------------------------------------------------- #
+# per-language Hessian reweighting
+# --------------------------------------------------------------------------- #
+def _accumulator_with_languages(rows_by_language):
+    accumulator = HessianAccumulator(columns=8)
+    for language, count in rows_by_language.items():
+        accumulator.add(np.random.RandomState(len(language)).randn(count, 8).astype(np.float32), language)
+    return accumulator
+
+
+def test_uniform_language_mass_is_the_default():
+    accumulator = _accumulator_with_languages({"zh": 500, "ja": 100, "th": 100})
+    shares = accumulator.language_mass(balance=True)
+    assert shares == pytest.approx({"zh": 1 / 3, "ja": 1 / 3, "th": 1 / 3})
+
+
+def test_language_weights_shift_mass_without_changing_the_total():
+    accumulator = _accumulator_with_languages({"zh": 500, "ja": 100, "th": 100})
+    weighted = accumulator.language_mass_with({"ja": 3.0})
+    assert sum(weighted.values()) == pytest.approx(1.0)
+    assert weighted["ja"] > weighted["zh"]
+    # The total effective rows must be unchanged: reweighting redistributes,
+    # it does not change the scale (the damping is relative to the mean
+    # diagonal, so a scale change would silently alter the regularisation).
+    unweighted = accumulator.language_mass(balance=True)
+    assert sum(unweighted.values()) == pytest.approx(1.0)
+
+
+def test_language_weights_change_the_hessian_but_not_its_scale():
+    accumulator = _accumulator_with_languages({"zh": 400, "ja": 100})
+    plain = accumulator.hessian(balance=True)
+    weighted = accumulator.hessian(balance=True, language_weights={"ja": 4.0})
+    assert not np.allclose(plain, weighted)
+    # Same trace to within the redistribution: the total mass is preserved.
+    assert float(np.trace(weighted)) == pytest.approx(float(np.trace(plain)), rel=1e-5)
+
+
+def test_language_weights_reject_an_unknown_language():
+    accumulator = _accumulator_with_languages({"zh": 10, "ja": 10})
+    with pytest.raises(ValueError, match="no activations"):
+        accumulator.hessian(balance=True, language_weights={"ko": 2.0})
+
+
+def test_an_empty_language_weights_mapping_is_a_no_op():
+    accumulator = _accumulator_with_languages({"zh": 10, "ja": 10})
+    plain = accumulator.hessian(balance=True)
+    assert np.allclose(plain, accumulator.hessian(balance=True, language_weights={}))
+
+
+def test_language_weights_can_be_checked_before_building_the_hessian():
+    """The guard is on the share, so it must be checkable up front."""
+    accumulator = _accumulator_with_languages({"zh": 100, "ja": 100, "th": 100})
+    shares = accumulator.language_mass_with({"ja": 100.0})
+    assert max(shares.values()) > 0.30
+    assert shares["ja"] == pytest.approx(max(shares.values()))

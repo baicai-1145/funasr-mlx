@@ -71,6 +71,18 @@ def load_arm(family: str, directory: Path):
     return model, getattr(model, "config", config)
 
 
+def _audio_dtype(dtype, *, what: str = "audio input"):
+    """Refuse to cast audio to an integer dtype (see gptq_calibrate.audio_dtype)."""
+    import mlx.core as mx
+
+    if not mx.issubdtype(dtype, mx.floating):
+        raise ValueError(
+            f"Refusing to cast {what} to {dtype}: an integer dtype here means a "
+            "quantized weight's packed codes were read as an activation dtype."
+        )
+    return dtype
+
+
 def build_decode(family: str, model, config, tokenizer_dir: Path, *, steps: int):
     """Return ``(prepare(sample), decode(prepared, steps))`` for one arm.
 
@@ -102,7 +114,7 @@ def build_decode(family: str, model, config, tokenizer_dir: Path, *, steps: int)
     n_layers = config.text.num_hidden_layers
     # The mel feeds the audio TOWER; follow the tower's dtype, not the decoder
     # embedding's (for a quantized embedding that is the packed-code uint32).
-    dtype = model._tower_dtype()
+    dtype = _audio_dtype(model._tower_dtype(), what="the mel (qwen3-asr)")
 
     def prepare(sample):
         raw, _ = sf.read(sample["audio_path"], dtype="float32")

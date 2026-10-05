@@ -126,6 +126,25 @@ def guide_span_ok(transcript: str, prompt_language: str) -> bool:
 # --------------------------------------------------------------------------- #
 # per-family drivers (mirroring tools/gptq_calibrate.py's prefill builders)
 # --------------------------------------------------------------------------- #
+def _audio_dtype(dtype, *, what: str = "audio input"):
+    """Refuse to cast audio to an integer dtype (see gptq_calibrate.audio_dtype).
+
+    The mel was once cast with ``embed_tokens.weight.dtype``, which for a
+    quantized embedding is the packed-code uint32 -- destroying the audio before
+    the tower saw it and producing garbage transcripts that looked like a
+    precision problem. Duplicated here rather than imported so the tool stays
+    runnable on its own; the guard is the point.
+    """
+    import mlx.core as mx
+
+    if not mx.issubdtype(dtype, mx.floating):
+        raise ValueError(
+            f"Refusing to cast {what} to {dtype}: an integer dtype here means a "
+            "quantized weight's packed codes were read as an activation dtype."
+        )
+    return dtype
+
+
 def build_driver(
     family: str, model, config, directory: Path, *, tokenizer_dir: Path, decode_steps: int = 96
 ):
@@ -163,7 +182,7 @@ def build_driver(
         # dtype, and for a quantized embedding it is the packed-code uint32, so
         # ``mel.astype(uint32)`` destroyed the audio before the tower ever saw
         # it.  This produced correct-looking runs whose transcripts were garbage.
-        dtype = model._tower_dtype()
+        dtype = _audio_dtype(model._tower_dtype(), what="the mel (qwen3-asr)")
 
         def decode(sample):
             raw, _ = sf.read(sample["audio_path"], dtype="float32")

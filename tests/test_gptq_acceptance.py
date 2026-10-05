@@ -301,3 +301,42 @@ def test_decode_bench_sample_selection_is_language_balanced():
     assert set(MODEL_FAMILY) >= {"qwen3-asr-0.6b", "qwen3-asr-1.7b"}
     assert MODEL_FAMILY["qwen3-asr-0.6b"] == "qwen3-asr"
     assert MODEL_FAMILY["qwen3-asr-1.7b"] == "qwen3-asr"
+
+
+# --------------------------------------------------------------------------- #
+# the tool-side audio-dtype guard
+# --------------------------------------------------------------------------- #
+def test_tools_refuse_to_cast_audio_to_an_integer_dtype():
+    """The uint32 trap must fail loudly in the TOOLS, not just the model.
+
+    The model-side helpers were fixed first, but the tools had their own copy of
+    the same bug (they cast the mel with ``embed_tokens.weight.dtype``), and that
+    produced a complete, plausible-looking acceptance run whose transcripts were
+    garbage. The model-side structural guard cannot see tool code, so each tool
+    carries its own assertion. All three are checked here.
+    """
+    import mlx.core as mx
+
+    from tools.gptq_acceptance import _audio_dtype as acceptance_guard
+    from tools.gptq_calibrate import audio_dtype as calibrate_guard
+    from tools.gptq_decode_bench import _audio_dtype as bench_guard
+
+    for guard in (calibrate_guard, acceptance_guard, bench_guard):
+        # Real dtypes pass through unchanged.
+        assert guard(mx.bfloat16) == mx.bfloat16
+        assert guard(mx.float16) == mx.float16
+        assert guard(mx.float32) == mx.float32
+        # The trap: packed codes are uint32, and uint8/uint16/int32 too.
+        for bad in (mx.uint32, mx.uint8, mx.uint16, mx.int32, mx.int8):
+            with pytest.raises(ValueError, match="integer dtype"):
+                guard(bad)
+
+
+def test_the_guard_names_what_it_was_casting():
+    """The error must say which tensor, or a failure is hard to localise."""
+    import mlx.core as mx
+
+    from tools.gptq_calibrate import audio_dtype
+
+    with pytest.raises(ValueError, match="the mel"):
+        audio_dtype(mx.uint32, what="the mel")

@@ -53,6 +53,33 @@ FAMILIES = {
 }
 
 
+def audio_dtype(dtype, *, what: str = "audio input"):
+    """The dtype to cast an audio tensor to, refusing an integer dtype.
+
+    Every tool here casts the mel/fbank before it reaches the tower, and the
+    dtype used to be read as ``embed_tokens.weight.dtype``.  That is wrong twice
+    over: it is the DECODER's dtype while the mel feeds the audio tower (a
+    different subgraph), and once the embedding is quantized it is the packed
+    uint32 codes, so ``mel.astype(uint32)`` silently destroyed the audio before
+    the tower saw it.  The failure mode is the dangerous kind: the run completes,
+    the transcripts are garbage, and it looks exactly like "4-bit is too coarse".
+
+    So the dtype is passed through this helper, which refuses anything that is
+    not a floating type.  A future edit that reintroduces a ``weight.dtype`` read
+    fails loudly at driver-construction time instead of producing a
+    plausible-looking wrong answer.
+    """
+    import mlx.core as mx
+
+    if not mx.issubdtype(dtype, mx.floating):
+        raise ValueError(
+            f"Refusing to cast {what} to {dtype}: an integer dtype here means a "
+            "quantized weight's packed codes were read as an activation dtype. "
+            "Use activation_dtype()/_tower_dtype()."
+        )
+    return dtype
+
+
 def _tokenizer(directory: Path):
     from transformers import AutoTokenizer
 
@@ -120,7 +147,7 @@ def build_prefill(family: str, key: str, model, config, directory: Path, sample:
         # embedding it is the packed-code uint32, which turns the mel into
         # integers.  ``encode_audio`` casts to the tower dtype itself, so this
         # cast is only here to keep the front-end and tower consistent.
-        dtype = model._tower_dtype()
+        dtype = audio_dtype(model._tower_dtype(), what="the mel (qwen3-asr)")
         mel = log_mel_spectrogram(mx.array(raw[None, :]), n_mels=128)
         mel = mx.transpose(mel[0], (1, 0)).astype(dtype)
         mx.eval(mel)
@@ -151,7 +178,7 @@ def build_prefill(family: str, key: str, model, config, directory: Path, sample:
 
         # The fbank features feed the audio encoder; follow ITS dtype, not the
         # decoder embedding's (see the qwen3 branch for why).
-        dtype = model.audio_encoder._weight_dtype()
+        dtype = audio_dtype(model.audio_encoder._weight_dtype(), what="the fbank (nano)")
         fcfg = FbankConfig(
             frame_length=25.0,
             frame_shift=10.0,
@@ -201,7 +228,7 @@ def build_prefill(family: str, key: str, model, config, directory: Path, sample:
     if key == "glm":
         # The mel feeds the audio tower; follow the tower's dtype, not the
         # decoder embedding's (see the qwen3 branch for why).
-        dtype = model._tower_dtype()
+        dtype = audio_dtype(model._tower_dtype(), what="the mel (glm)")
         mel = log_mel_spectrogram(mx.array(raw)[None], n_mels=128)[0]
         mel = mx.transpose(mel.astype(dtype), (1, 0))
         mx.eval(mel)
