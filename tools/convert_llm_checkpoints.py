@@ -118,7 +118,19 @@ DECODER_QUANT_TARGETS = {
     "moss-transcribe-diarize": ("language_model.model.layers.",),
 }
 
-#: Audio-tower prefixes, for the (memory-only) full-stack variant.
+#: Token-embedding module paths. Only the *tied* embedding is worth naming: it
+#: is also the LM head, so at bs=1 it is streamed once per step. Measured to
+#: break transcripts on qwen3-asr-0.6b, so it is available but not default.
+EMBEDDING_QUANT_TARGETS = {
+    "fun-asr-nano": ("llm.model.embed_tokens",),
+    "qwen3-asr": ("thinker.model.embed_tokens",),
+    "qwen3-asr-0.6b": ("thinker.model.embed_tokens",),
+    "qwen3-asr-1.7b": ("thinker.model.embed_tokens",),
+    "glm-asr-nano": ("language_model.model.embed_tokens",),
+    "moss-transcribe-diarize": ("language_model.model.embed_tokens",),
+}
+
+#: Audio-tower prefixes, for the (memory-only) tower/full variants.
 AUDIO_QUANT_TARGETS = {
     "fun-asr-nano": ("audio_encoder.", "audio_adaptor."),
     "qwen3-asr": ("audio_tower.",),
@@ -132,14 +144,25 @@ AUDIO_QUANT_TARGETS = {
 def quantization_config(job: str, scope: str, *, bits: int = 4, group_size: int = 64) -> dict:
     """The ``quantization`` section written into the native ``config.json``.
 
-    ``scope`` is ``decoder`` (the default: decode-time win) or ``all``
-    (decoder + audio tower: also the memory win for the audio stack).
+    Scopes, in increasing order of what they reach:
+
+    ``decoder``  decoder Linears only. The decode-time win: at bs=1 the decoder
+                 weights stream once per step.
+    ``tower``    decoder + audio tower Linears, embeddings untouched. Adds the
+                 memory win for the audio stack; the tower runs once per
+                 utterance, so it buys no decode time.
+    ``all``      ``tower`` + the tied token embedding. Maximum memory win, and
+                 the only scope that also shrinks the per-step LM-head read --
+                 but it is measured to break transcripts, so it is NOT a
+                 supported configuration (see .tmp/t9/LEDGER.md).
     """
-    if scope not in ("decoder", "all"):
+    if scope not in ("decoder", "tower", "all"):
         raise ValueError(f"Unknown quantization scope: {scope}")
     targets = list(DECODER_QUANT_TARGETS[job])
-    if scope == "all":
+    if scope in ("tower", "all"):
         targets += list(AUDIO_QUANT_TARGETS[job])
+    if scope == "all":
+        targets += list(EMBEDDING_QUANT_TARGETS[job])
     return {"bits": bits, "group_size": group_size, "mode": "affine", "targets": targets}
 
 
@@ -152,7 +175,7 @@ def main() -> int:
     parser.add_argument("--tensor-limit", type=int, default=384_000_000)
     parser.add_argument(
         "--quantize",
-        choices=("none", "decoder", "all"),
+        choices=("none", "decoder", "tower", "all"),
         default="none",
         help="W4A16 group quantization: decoder only (default scope) or the whole stack",
     )
