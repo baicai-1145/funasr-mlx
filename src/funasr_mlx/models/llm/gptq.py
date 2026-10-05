@@ -831,7 +831,13 @@ class HessianAccumulator:
     def row_counts(self) -> dict[str, int]:
         return dict(self.rows)
 
-    def hessian(self, *, balance: bool = True, cap_fraction: float | None = None) -> np.ndarray:
+    def hessian(
+        self,
+        *,
+        balance: bool = True,
+        cap_fraction: float | None = None,
+        language_weights: Mapping[str, float] | None = None,
+    ) -> np.ndarray:
         """The combined ``H = 2 X^T X``, optionally language-balanced.
 
         ``balance=True`` scales each language's contribution to the smallest
@@ -840,14 +846,66 @@ class HessianAccumulator:
         caps the largest language's *share* at that fraction by lowering a
         common row threshold (see :meth:`_effective_rows`), which keeps more of
         a large corpus while still bounding the dominant language.
+
+        ``language_weights`` multiplies the balanced per-language contributions
+        by explicit factors.  Equal mass is the right *default* (it is what the
+        brief's 30% guard asks for), but it is not the right target when the
+        languages do not quantize equally well: if one language's transcripts
+        diverge far more than another's at the same bit width, equal mass is
+        under-weighting exactly the directions that are failing.  Weighting by
+        measured divergence spends a fixed bit budget where the error actually
+        shows up.  Weights are renormalised, so this redistributes mass between
+        languages without changing the total -- an overall scale would silently
+        alter the damping, which is defined relative to the mean diagonal.
         """
         if not self.sums:
             raise ValueError("No activations have been accumulated")
         weights = self._row_weights(balance=balance, cap_fraction=cap_fraction)
+        if language_weights:
+            unknown = set(language_weights) - set(self.sums)
+            if unknown:
+                raise ValueError(
+                    "language_weights names languages with no activations: "
+                    f"{sorted(unknown)}"
+                )
+            weights = self._apply_language_weights(weights, language_weights)
         total = np.zeros((self.columns, self.columns), dtype=np.float32)
         for language, product in self.sums.items():
             total += product * np.float32(weights[language])
         return 2.0 * total
+
+    @staticmethod
+    def _apply_language_weights(
+        weights: Mapping[str, float], language_weights: Mapping[str, float]
+    ) -> dict[str, float]:
+        """Multiply per-language weights and renormalise, preserving the total."""
+        scaled = {
+            name: value * float(language_weights.get(name, 1.0))
+            for name, value in weights.items()
+        }
+        before = sum(weights.values())
+        after = sum(scaled.values())
+        if after > 0 and before > 0:
+            scaled = {name: value * before / after for name, value in scaled.items()}
+        return scaled
+
+    def language_mass_with(
+        self,
+        language_weights: Mapping[str, float],
+        *,
+        balance: bool = True,
+        cap_fraction: float | None = None,
+    ) -> dict[str, float]:
+        """Per-language mass shares that ``language_weights`` would produce.
+
+        The brief's guard is on the *share*, so a reweighting has to be checked
+        against it before the Hessian is built -- otherwise a rebalance can push
+        a language past the bound and only surface as a failed run much later.
+        """
+        weights = self._row_weights(balance=balance, cap_fraction=cap_fraction)
+        scaled = self._apply_language_weights(weights, language_weights)
+        total = sum(scaled.values())
+        return {name: value / total for name, value in scaled.items()}
 
     def _effective_rows(
         self, *, balance: bool = True, cap_fraction: float | None = None

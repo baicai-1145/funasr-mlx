@@ -293,6 +293,31 @@ def load_manifest(path: Path, split: str, languages: list[str], per_language: in
     return chosen
 
 
+def parse_language_weights(spec: str | None) -> dict[str, float]:
+    """Parse ``--language-weights zh=1,ja=3`` into a mapping.
+
+    Kept as a plain function so the format is testable without a model.
+    """
+    if not spec:
+        return {}
+    weights: dict[str, float] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(f"--language-weights entries must be lang=weight, got {part!r}")
+        name, _, value = part.partition("=")
+        try:
+            weight = float(value)
+        except ValueError as error:
+            raise SystemExit(f"Invalid weight for {name!r}: {value!r}") from error
+        if not weight > 0:
+            raise SystemExit(f"Weight for {name!r} must be positive, got {weight}")
+        weights[name.strip()] = weight
+    return weights
+
+
 def calibrate(args) -> int:
     from funasr_mlx.memory import guarded_child_active
     from funasr_mlx.models.llm.calibrate import HeadActivationCollector, HeadTarget
@@ -328,17 +353,28 @@ def calibrate(args) -> int:
     report["family"] = args.family
     report["manifest"] = str(args.manifest)
     report["samples"] = len(samples)
-    mass = report["language_mass_balanced"]
+    language_weights = parse_language_weights(args.language_weights)
+    if language_weights:
+        # Equal per-language mass is the default, but it is not the right target
+        # when the languages do not quantize equally well.  The weights are
+        # reported with their resulting shares so the run is reproducible from
+        # its own report, and the guard is re-checked against the SHARES the
+        # reweighting actually produces.
+        mass = collector.accumulator.language_mass_with(language_weights, balance=True)
+        report["language_weights"] = language_weights
+    else:
+        mass = report["language_mass_balanced"]
+    report["language_mass_effective"] = mass
     worst = max(mass.values())
     report["max_language_mass"] = worst
-    print(f"balanced language mass: max {worst:.3f} ({max(mass, key=mass.get)})")
+    print(f"language mass: max {worst:.3f} ({max(mass, key=mass.get)})")
     if worst > args.max_language_mass:
         raise SystemExit(
             f"Language balance guard failed: {max(mass, key=mass.get)} holds "
             f"{worst:.3f} of the Hessian mass, over the {args.max_language_mass} bound"
         )
 
-    hessian = collector.hessian(balance=True)
+    hessian = collector.hessian(balance=True, language_weights=language_weights or None)
     if not np_all_finite(hessian):
         raise SystemExit("Calibration Hessian is not finite")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -379,10 +415,32 @@ def convert(args) -> int:
     else:
         checkpoint_config = json.loads((source / "config.json").read_text())
     checkpoint_config["quantization"] = spec.to_dict()
+    # ``--method`` is the authority on how the values were computed; the spec's
+    # own ``method`` field only records what was asked for on the command line.
+    # Without this an rtn run shipped a config.json claiming method=gptq, which is
+    # exactly the kind of provenance error that makes a later comparison
+    # untrustworthy.
+    checkpoint_config["quantization"]["method"] = args.method
 
     accumulator = HessianAccumulator.load(args.hessian)
-    # The Hessian file is keyed by language; rebuild the balanced Hessian.
-    hessian = accumulator.hessian(balance=True)
+    # The file stores RAW per-language ``X^T X``, so reweighting is a pure
+    # post-processing step: changing the balance does not require re-running the
+    # (expensive) calibration forward passes at all, only the conversion.
+    language_weights = parse_language_weights(args.language_weights)
+    if language_weights:
+        shares = accumulator.language_mass_with(language_weights, balance=True)
+        worst = max(shares.values())
+        print(
+            f"language weights {language_weights} -> max share {worst:.3f} "
+            f"({max(shares, key=shares.get)})"
+        )
+        if worst > args.max_language_mass:
+            raise SystemExit(
+                f"Reweighting pushes {max(shares, key=shares.get)} to {worst:.3f} "
+                f"of the Hessian mass, over the {args.max_language_mass} bound"
+            )
+    # The Hessian file is keyed by language; rebuild the (weighted) Hessian.
+    hessian = accumulator.hessian(balance=True, language_weights=language_weights or None)
     # The per-language sums are dead once the balanced Hessian exists, and a
     # 1024x1024 float32 matrix is only 4 MB but the accumulator holds ten of
     # them; drop the source so the peak is the balanced copy alone.
@@ -437,6 +495,7 @@ def convert(args) -> int:
                     "info": info.__dict__,
                     "gptq_config": gptq_config.to_dict(),
                     "targets": list(spec.targets),
+                    "language_weights": language_weights or None,
                 },
                 indent=2,
             )
@@ -464,6 +523,16 @@ def main() -> int:
         help="comma-separated language tags to calibrate on",
     )
     parser.add_argument("--max-language-mass", type=float, default=0.30)
+    parser.add_argument(
+        "--language-weights",
+        default=None,
+        help=(
+            "Optional per-language Hessian weights, e.g. 'ja=3,th=3,vi=2'. "
+            "Equal mass is the default; use this when measured per-language "
+            "divergence shows some languages need more of the bit budget. "
+            "Weights are renormalised so the total mass is unchanged."
+        ),
+    )
     parser.add_argument("--hessian", type=Path, default=None)
     parser.add_argument("--destination", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
