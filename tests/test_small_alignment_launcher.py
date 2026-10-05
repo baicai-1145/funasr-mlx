@@ -9,7 +9,7 @@ def test_model_policy_preserves_project_ceiling_and_system_reserve():
     for family in ("fsmn-vad", "campplus", "whisper"):
         for mode in ("reference", "native"):
             policy = model_policy(family, mode)
-            assert policy.project_limit == 8_000_000_000
+            assert policy.project_limit == 10_000_000_000
             assert policy.min_available == 3_000_000_000
             assert policy.headroom == 500_000_000
 

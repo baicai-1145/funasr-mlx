@@ -1,6 +1,6 @@
 """Conservative memory admission and serialized process supervision.
 
-The 10 GB ceiling applies to this project, not unrelated applications.
+The 12 GB ceiling applies to this project, not unrelated applications.
 RSS includes resident unified memory; MLX limits add an allocator-side bound.
 A watchdog is a secondary defense, not a substitute for input shape limits.
 """
@@ -21,7 +21,7 @@ import sys
 import time
 from typing import Sequence
 
-HARD_CEILING = 10_000_000_000
+HARD_CEILING = 12_000_000_000
 MB = 1_000_000
 GB = 1_000_000_000
 
@@ -33,7 +33,7 @@ class MemoryBudgetExceeded(RuntimeError):
 @dataclass(frozen=True)
 class MemoryPolicy:
     process_limit: int = 2 * GB
-    project_limit: int = 8 * GB
+    project_limit: int = 10 * GB
     mlx_limit: int = 1_250 * MB
     cache_limit: int = 32 * MB
     min_available: int = 3 * GB
@@ -50,7 +50,7 @@ class MemoryPolicy:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive byte count")
         if self.project_limit + self.headroom >= HARD_CEILING:
-            raise ValueError("Project budget plus headroom must remain below 10 GB")
+            raise ValueError("Project budget plus headroom must remain below 12 GB")
         if self.process_limit + self.headroom > self.project_limit:
             raise ValueError("Process budget leaves insufficient project headroom")
         if not 0 <= self.cache_limit < self.mlx_limit < self.process_limit:

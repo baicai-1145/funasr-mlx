@@ -16,8 +16,8 @@ def test_default_budget_leaves_room_below_ceiling():
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"project_limit": 10 * GB},
-        {"process_limit": 9 * GB},
+        {"project_limit": 12 * GB},
+        {"process_limit": 11 * GB},
         {"mlx_limit": 3 * GB},
         {"cache_limit": -1},
         {"poll_seconds": float("nan")},
@@ -69,7 +69,7 @@ def test_high_project_memory_refuses_job(monkeypatch, tmp_path):
         "_psutil",
         lambda: SimpleNamespace(virtual_memory=lambda: SimpleNamespace(available=12 * GB)),
     )
-    monkeypatch.setattr(memory, "project_rss", lambda root: 7 * GB)
+    monkeypatch.setattr(memory, "project_rss", lambda root: 9 * GB)
     with pytest.raises(MemoryBudgetExceeded, match="Project RSS"):
         preflight(tmp_path, MemoryPolicy())
 

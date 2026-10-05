@@ -102,9 +102,9 @@ in `.tmp/t9/RESULTS.md`; the scheme and its failure modes are in
 
 ## Memory Policy
 
-The hard ceiling is 10 GB (decimal) for project processes. Numerical jobs
+The hard ceiling is 12 GB (decimal) for project processes. Numerical jobs
 are serialized with a git-common-directory lock. Default job budget 2 GB,
-project stop threshold 8 GB, minimum host reserve 3 GB. Bounded
+project stop threshold 10 GB, minimum host reserve 3 GB. Bounded
 input/shards, admission checks, MLX allocation/cache guidelines, an
 external RSS watchdog and supervisor-liveness pipe work together. No
 automatic downloads or simultaneous model loading.

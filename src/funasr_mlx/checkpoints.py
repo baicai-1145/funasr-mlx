@@ -540,7 +540,7 @@ def convert_checkpoint(
     has_shards = bool(tuple(source.glob("*.safetensors")))
     if not source_is_file and not (has_index or has_shards):
         raise ValueError("Missing source checkpoint")
-    if source_is_file and source.stat().st_size > 8_000_000_000:
+    if source_is_file and source.stat().st_size > 10_000_000_000:
         raise ValueError("Oversized source checkpoint")
     if destination.exists():
         raise FileExistsError("Conversion destination must not already exist")
