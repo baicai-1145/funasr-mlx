@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import math
 from pathlib import Path
 import struct
 import zipfile
-from typing import Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -171,6 +171,7 @@ def quantize_bf16_weight(
     bits: int,
     group_size: int,
     mode: str = "affine",
+    gptq: "GptqWeight | None" = None,
 ) -> dict[str, np.ndarray]:
     """Pack one 16-bit weight with MLX group quantization.
 
@@ -186,6 +187,13 @@ def quantize_bf16_weight(
     is the only implementation guaranteed to agree bit-for-bit with
     ``mx.quantized_matmul``'s expectations; the input is freed before the
     packed copy is materialised on the host.
+
+    ``gptq`` switches the *values* to Hessian-based error compensation while
+    keeping the layout identical.  It is a :class:`GptqWeight`: the matrix's
+    ``H = 2 X^T X`` plus the GPTQ hyper-parameters, keyed by native tensor name
+    so a converter can pass one mapping for every quantized tensor it meets.
+    The packing still goes through the same bit order, so nothing downstream
+    changes.
     """
     import mlx.core as mx
 
@@ -200,7 +208,16 @@ def quantize_bf16_weight(
         weight = mx.array(array).astype(mx.float16)
     else:  # pragma: no cover - guarded above
         raise ValueError(f"Quantization requires a 16-bit source weight, got {code}")
-    packed, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits, mode=mode)
+    if gptq is None:
+        packed, scales, biases = mx.quantize(
+            weight, group_size=group_size, bits=bits, mode=mode
+        )
+    else:
+        if mode != "affine":
+            raise ValueError("GPTQ is only defined for affine group quantization")
+        packed, scales, biases = gptq.quantize_tensor(
+            name, weight, bits=bits, group_size=group_size
+        )
     mx.eval(packed, scales, biases)
     del weight
     if biases is None:
@@ -219,6 +236,69 @@ def quantize_bf16_weight(
     }
     del packed, scales, biases
     return result
+
+
+@dataclass(frozen=True)
+class GptqWeight:
+    """Per-tensor GPTQ calibration state, keyed by native tensor name.
+
+    ``hessians`` maps a native ``<module>.weight`` name to that matrix's
+    ``H = 2 X^T X`` (float32).  ``configs`` maps the same name to the
+    :class:`~funasr_mlx.models.llm.gptq.GptqConfig` to use, so different
+    matrices can carry different hyper-parameters.  A name with a Hessian but no
+    explicit config uses ``default_config``.
+
+    Kept as a plain data holder (no MLX import at module scope) so the converter
+    can accept it without pulling the runtime in.
+    """
+
+    hessians: Mapping[str, np.ndarray]
+    configs: Mapping[str, Any] = field(default_factory=dict)
+    default_config: Any = None
+    #: Per-tensor reported outcome, filled in as tensors are quantized.
+    outcomes: dict[str, dict] = field(default_factory=dict)
+
+    def has(self, name: str) -> bool:
+        return name in self.hessians
+
+    def config_for(self, name: str):
+        from .models.llm.gptq import GptqConfig
+
+        if name in self.configs:
+            return GptqConfig.from_dict(self.configs[name])
+        if self.default_config is not None:
+            return GptqConfig.from_dict(self.default_config)
+        return GptqConfig()
+
+    def quantize_tensor(
+        self, name: str, weight, *, bits: int, group_size: int
+    ) -> tuple:
+        """Run GPTQ for one tensor and return MLX tensors in the usual layout."""
+        import mlx.core as mx
+
+        from .models.llm.gptq import gptq_quantize
+
+        hessian = self.hessians.get(name)
+        if hessian is None:
+            raise ValueError(f"No GPTQ Hessian was collected for {name}")
+        config = self.config_for(name)
+        if config.bits != bits or config.group_size != group_size:
+            raise ValueError(
+                f"GPTQ config for {name} uses bits={config.bits} "
+                f"group_size={config.group_size}, but the converter asked for "
+                f"bits={bits} group_size={group_size}"
+            )
+        source = np.array(weight.astype(mx.float32))
+        outcome = gptq_quantize(source, np.asarray(hessian, dtype=np.float32), config)
+        self.outcomes[name] = outcome.to_json()
+        # Side tensors must land in the checkpoint dtype (bfloat16/float16), the
+        # same as mx.quantize would produce, or the runtime would promote.
+        dtype = weight.dtype
+        return (
+            mx.array(outcome.packed),
+            mx.array(outcome.scales).astype(dtype),
+            mx.array(outcome.biases).astype(dtype),
+        )
 
 
 @dataclass(frozen=True)
@@ -380,6 +460,7 @@ def convert_checkpoint(
     allowed_source_keys: tuple[str, ...] | None = None,
     source_rule: str | None = None,
     quantization: Mapping | None = None,
+    gptq: "GptqWeight | None" = None,
 ) -> CheckpointInfo:
     """Convert a local checkpoint to the native layout, one tensor at a time.
 
@@ -392,6 +473,10 @@ def convert_checkpoint(
     renames keys and (via :func:`convert_tensor`) fixes tensor layout. A
     safetensors source without a rule keeps its parameter names unchanged, so
     the family's model class must expect exactly those names.
+
+    ``gptq`` supplies per-tensor Hessians (:class:`GptqWeight`) so the selected
+    matrices get Hessian-compensated values instead of round-to-nearest.  The
+    output layout is unchanged either way.
 
     Only call inside the guarded launcher. No network or pickle fallback.
     Strict inference loading later checks the architecture's keys and shapes.
@@ -443,6 +528,7 @@ def convert_checkpoint(
             config=config,
             source_rule=source_rule,
             quantization=quantization,
+            gptq=gptq,
         )
 
     import torch
@@ -669,6 +755,7 @@ def _convert_safetensors_source(
     config: Mapping | None,
     source_rule: str | None,
     quantization: Mapping | None = None,
+    gptq: "GptqWeight | None" = None,
 ) -> CheckpointInfo:
     """One-tensor-at-a-time conversion of a safetensors source.
 
@@ -810,6 +897,7 @@ def _convert_safetensors_source(
                         bits=spec.bits,
                         group_size=spec.group_size,
                         mode=spec.mode,
+                        gptq=gptq if (gptq is not None and gptq.has(native)) else None,
                     )
                     del array
                     side_code = "BF16" if keep_bf16 else "F16"
@@ -891,6 +979,7 @@ def _convert_safetensors_source(
             "quantization": spec.to_dict() if spec is not None else None,
             "quantized_tensors": len(quantized_names),
             "quantization_skipped": sorted(skipped_quantization),
+            "gptq": gptq.outcomes if gptq is not None else None,
         },
         "weight_map": weight_map,
     }

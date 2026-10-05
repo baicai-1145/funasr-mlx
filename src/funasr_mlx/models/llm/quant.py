@@ -47,6 +47,11 @@ __all__ = [
 DEFAULT_BITS = 4
 DEFAULT_GROUP_SIZE = 64
 
+#: How the stored quantization values were computed. ``rtn`` is ``mx.quantize``'s
+#: own round-to-nearest; ``gptq`` is Hessian-based error compensation. Both
+#: produce the identical runtime layout, so this is provenance, not behaviour.
+DEFAULT_METHOD = "rtn"
+
 #: Substrings that mark a rank-2 ``.weight`` tensor which must NOT be quantized
 #: through the ``nn.Linear`` path, even when it sits under a quantized prefix:
 #: the untied ``lm_head``, a learned position table, or the sinusoidal table the
@@ -64,12 +69,21 @@ NON_LINEAR_WEIGHT_NAMES = (
 
 @dataclass(frozen=True)
 class QuantizationSpec:
-    """One family's quantization plan, as declared in ``config.json``."""
+    """One family's quantization plan, as declared in ``config.json``.
+
+    ``method`` records *how* the stored ``scales``/``biases``/codes were
+    computed: ``rtn`` is ``mx.quantize``'s round-to-nearest, ``gptq`` is
+    Hessian-based error compensation (:mod:`funasr_mlx.models.llm.gptq`).  The
+    runtime layout is identical either way -- ``nn.QuantizedLinear`` and
+    ``mx.quantized_matmul`` cannot tell them apart -- so the loader ignores it
+    and it exists purely as provenance in the checkpoint's ``config.json``.
+    """
 
     bits: int = DEFAULT_BITS
     group_size: int = DEFAULT_GROUP_SIZE
     mode: str = "affine"
     targets: tuple[str, ...] = ()
+    method: str = DEFAULT_METHOD
 
     @classmethod
     def from_dict(cls, data: Any) -> "QuantizationSpec":
@@ -81,12 +95,15 @@ class QuantizationSpec:
         group_size = data.get("group_size", DEFAULT_GROUP_SIZE)
         mode = data.get("mode", "affine")
         targets = data.get("targets", ())
+        method = data.get("method", DEFAULT_METHOD)
         if bits not in (2, 3, 4, 5, 6, 8):
             raise ValueError(f"Unsupported quantization bit width: {bits}")
         if group_size not in (32, 64, 128):
             raise ValueError(f"Unsupported quantization group size: {group_size}")
         if mode not in ("affine", "mxfp4", "nvfp4"):
             raise ValueError(f"Unsupported quantization mode: {mode}")
+        if method not in ("rtn", "gptq"):
+            raise ValueError(f"Unsupported quantization method: {method}")
         if isinstance(targets, str):
             targets = (targets,)
         if (
@@ -95,7 +112,9 @@ class QuantizationSpec:
             or not all(isinstance(entry, str) and entry for entry in targets)
         ):
             raise ValueError("Quantization targets must be a nonempty list of module paths")
-        return cls(bits=bits, group_size=group_size, mode=mode, targets=tuple(targets))
+        return cls(
+            bits=bits, group_size=group_size, mode=mode, targets=tuple(targets), method=method
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +122,7 @@ class QuantizationSpec:
             "group_size": self.group_size,
             "mode": self.mode,
             "targets": list(self.targets),
+            "method": self.method,
         }
 
     def selects(self, module_path: str) -> bool:
