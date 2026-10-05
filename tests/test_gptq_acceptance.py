@@ -232,3 +232,53 @@ def test_garbage_output_fails_the_budget_immediately():
     baseline = [11528, 8453, 151704, 100636, 151645]
     quantized = [1048, 271, 271, 271, 271, 271]
     assert _row(quantized, baseline) > 0.02
+
+
+# --------------------------------------------------------------------------- #
+# the paired decode benchmark's statistics
+# --------------------------------------------------------------------------- #
+def test_bootstrap_ci_brackets_the_mean_for_a_shifted_sample():
+    from tools.gptq_decode_bench import bootstrap_ci
+
+    deltas = [0.10 + 0.001 * i for i in range(100)]
+    lo, hi = bootstrap_ci(deltas)
+    mean = sum(deltas) / len(deltas)
+    assert lo < mean < hi
+    # A tight, one-signed sample must not produce a CI containing zero: that is
+    # the difference between "the quantized arm is faster" and "we cannot tell".
+    assert lo > 0
+
+
+def test_bootstrap_ci_contains_zero_for_a_centred_sample():
+    from tools.gptq_decode_bench import bootstrap_ci
+
+    deltas = [(-1) ** i * 0.01 for i in range(100)]
+    lo, hi = bootstrap_ci(deltas)
+    assert lo < 0 < hi
+
+
+def test_bootstrap_ci_handles_an_empty_sample():
+    from tools.gptq_decode_bench import bootstrap_ci
+
+    assert bootstrap_ci([]) == (None, None)
+
+
+def test_bootstrap_ci_is_deterministic_for_a_fixed_seed():
+    from tools.gptq_decode_bench import bootstrap_ci
+
+    deltas = [0.05, 0.07, 0.06, 0.09, 0.04]
+    assert bootstrap_ci(deltas) == bootstrap_ci(deltas)
+
+
+def test_decode_bench_sample_selection_is_language_balanced():
+    """The bench's own sample picker must spread across languages.
+
+    Taking the first N rows of the manifest would concentrate on whichever
+    language was written first, which would make the timing a measurement of that
+    language's utterance lengths rather than of the checkpoint.
+    """
+    from tools.gptq_decode_bench import MODEL_FAMILY
+
+    assert set(MODEL_FAMILY) >= {"qwen3-asr-0.6b", "qwen3-asr-1.7b"}
+    assert MODEL_FAMILY["qwen3-asr-0.6b"] == "qwen3-asr"
+    assert MODEL_FAMILY["qwen3-asr-1.7b"] == "qwen3-asr"

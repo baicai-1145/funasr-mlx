@@ -117,8 +117,19 @@ def guide_span_ok(transcript: str, prompt_language: str) -> bool:
 # --------------------------------------------------------------------------- #
 # per-family drivers (mirroring tools/gptq_calibrate.py's prefill builders)
 # --------------------------------------------------------------------------- #
-def build_driver(family: str, model, config, directory: Path, *, decode_steps: int = 96):
-    """Return ``decode(sample) -> (tokens, transcript)`` for one arm."""
+def build_driver(
+    family: str, model, config, directory: Path, *, tokenizer_dir: Path, decode_steps: int = 96
+):
+    """Return ``decode(sample) -> (tokens, transcript)`` for one arm.
+
+    ``directory`` is the arm's checkpoint (where the weights come from) and
+    ``tokenizer_dir`` is where the tokenizer lives.  They are separate because a
+    converted checkpoint carries weights and ``config.json`` only -- the
+    converter does not copy the tokenizer -- while the two arms of an A/B are by
+    construction the same model and therefore the same tokenizer.  Reading the
+    tokenizer from the bf16 source keeps the two arms on one identical tokenizer
+    rather than letting a missing file become a silent difference.
+    """
     import mlx.core as mx
     import soundfile as sf
 
@@ -128,7 +139,7 @@ def build_driver(family: str, model, config, directory: Path, *, decode_steps: i
     from transformers import AutoTokenizer
 
     if family == "qwen3-asr":
-        tok = AutoTokenizer.from_pretrained(str(directory), use_fast=False)
+        tok = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=False)
         prefix_ids = tok(
             "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>",
             add_special_tokens=False,
@@ -225,8 +236,12 @@ def main() -> int:
     # order alternated) so thermal drift hits both arms equally.
     bf16_model, bf16_config = load_arm(model_family, args.bf16_dir)
     quant_model, quant_config = load_arm(model_family, args.quant_dir)
-    bf16_decode = build_driver(model_family, bf16_model, bf16_config, args.bf16_dir)
-    quant_decode = build_driver(model_family, quant_model, quant_config, args.quant_dir)
+    bf16_decode = build_driver(
+        model_family, bf16_model, bf16_config, args.bf16_dir, tokenizer_dir=args.bf16_dir
+    )
+    quant_decode = build_driver(
+        model_family, quant_model, quant_config, args.quant_dir, tokenizer_dir=args.bf16_dir
+    )
 
     for index, sample in enumerate(samples):
         language = sample["lang"]
