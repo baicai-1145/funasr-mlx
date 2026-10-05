@@ -830,3 +830,38 @@ def test_a_w8_head_beside_a_w4_stack_loads_strictly():
     assert isinstance(layer, nn.QuantizedLinear)
     assert layer.bits == 4
     assert result.overrides == {"thinker.model.embed_tokens": 8}
+
+
+def test_quantizes_tensor_matches_mlx_divisibility_for_every_bit_width():
+    """The converter predicate must agree with what mx.quantize actually accepts.
+
+    MLX's only divisibility requirement is that the GROUP SIZE divides the input
+    dimension; the pack factor (codes per uint32 word) is not a constraint on the
+    columns. An earlier version of the predicate also required
+    ``columns % (32 // bits) == 0``, which was wrong in both directions: it
+    rejected w3/w5/w6 at 64 columns (MLX accepts them) and accepted w2 at 96
+    columns (MLX rejects it, because 64 does not divide 96). Over-strict is the
+    dangerous direction -- it silently skips tensors that should be quantized.
+    """
+    from funasr_mlx.models.llm.quant import QuantizationSpec
+
+    for bits in (2, 3, 4, 5, 6, 8):
+        spec = QuantizationSpec.from_dict(
+            {
+                "bits": bits,
+                "group_size": 64,
+                "targets": ["a."],
+                "target_bits": {"a.": bits},
+            }
+        )
+        for columns in (64, 96, 128, 160, 192, 256):
+            predicted = spec.quantizes_tensor("a.w.weight", (8, columns))
+            try:
+                mx.eval(mx.quantize(mx.random.normal((8, columns)), group_size=64, bits=bits))
+                accepted = True
+            except Exception:
+                accepted = False
+            assert predicted == accepted, (
+                f"bits={bits} columns={columns}: predicate says {predicted}, "
+                f"mx.quantize says {accepted}"
+            )

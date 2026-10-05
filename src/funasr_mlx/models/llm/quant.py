@@ -233,13 +233,17 @@ class QuantizationSpec:
             return True
         if not self.is_linear_weight(name, shape):
             return False
-        # The group size must divide the input dimension; the pack factor must
-        # too, and it follows from the per-tensor bit width (8 bits packs 4 per
-        # uint32 word, 4 bits packs 8), so a per-target override has to be
-        # checked here rather than against the default width.
-        columns = tuple(shape)[1]
-        bits = self.bits_for_weight(name)
-        return columns % self.group_size == 0 and columns % (32 // bits) == 0
+        # The only divisibility MLX requires is that the GROUP SIZE divides the
+        # input dimension.  The pack factor (codes per uint32 word) is MLX's own
+        # business and is not a divisibility requirement on the columns: verified
+        # against mx.quantize for bits in {2,3,4,5,6,8} x cols in {64..256}, every
+        # width packs any column count that the group size divides.  An earlier
+        # version of this predicate ALSO required ``columns % (32 // bits) == 0``,
+        # which is wrong in both directions -- it rejected w3/w5/w6 at 64 columns
+        # (which MLX accepts) and accepted w2 at 96 columns (which it rejects, for
+        # the group-size reason).  Over-strict here silently skips tensors that
+        # should be quantized.
+        return tuple(shape)[1] % self.group_size == 0
 
     def quantizes_module(self, module_path: str, module: nn.Module) -> bool:
         """Whether ``module`` (a live ``nn.Module``) should become quantized.
