@@ -418,12 +418,22 @@ def output_error(weight: np.ndarray, reconstructed: np.ndarray, hessian: np.ndar
 
     so no activations are needed once the Hessian exists -- which is what makes
     this reportable for a matrix whose calibration set is 600 utterances long.
+
+    Computed in row blocks.  ``trace(D M D^T)`` decomposes as a sum over the
+    ROWS of ``D`` (the ``i``-th row contributes ``D[i] M D[i]^T``), so this is
+    exact -- and it has to be blocked, because materialising ``D @ M @ D.T`` for
+    a 151936-row head needs a 151936x151936 intermediate.
     """
     difference = np.asarray(weight, dtype=np.float32) - np.asarray(
         reconstructed, dtype=np.float32
     )
     half = 0.5 * np.asarray(hessian, dtype=np.float32)
-    return float(np.trace(difference @ half @ difference.T))
+    total = 0.0
+    block = 4096
+    for start in range(0, difference.shape[0], block):
+        piece = difference[start : start + block]
+        total += float(np.sum((piece @ half) * piece))
+    return total
 
 
 def _upper_cholesky_inverse(hessian: np.ndarray) -> np.ndarray:
@@ -639,19 +649,36 @@ def gptq_quantize(
     packed = quantizer.pack(codes)
     scales = scales.astype(dtype)
     biases = biases.astype(dtype)
-    # The metrics are computed from the STORED triple, not accumulated per chunk.
-    # ``trace(D (H/2) D^T)`` does not decompose into per-row-block terms -- the
-    # off-diagonal blocks of ``D`` couple the chunks -- so summing chunk-local
-    # traces silently undercounts (measured 628M against the true 392.6 on the
-    # module's own test problem).  Rebuilding the reconstruction is cheap next to
-    # the quantization itself and makes the reported numbers describe exactly
-    # what a reader of the checkpoint would get.
-    reconstruction = np.repeat(scales, config.group_size, axis=1) * codes + np.repeat(
-        biases, config.group_size, axis=1
-    )
-    error = float(np.mean((original_weight - reconstruction) ** 2))
-    result_output_error = output_error(original_weight, reconstruction, original_hessian)
-    del reconstruction, codes
+    # The metrics are computed from the STORED triple, not accumulated from the
+    # inner loop's own arrays.  Those are not the same object -- the loop's
+    # per-chunk reconstruction is built from the running (error-compensated)
+    # matrix, while the checkpoint stores codes and side tensors that are read
+    # back through a different path -- and accumulating chunk-local traces of it
+    # did not reproduce the stored triple's metric (measured 1112899.59 against
+    # the true 392.65 on the module's own test problem).  Rebuilding the
+    # reconstruction from the stored triple, in row blocks so no full float32
+    # copy is materialised, makes the reported numbers describe exactly what a
+    # reader of the checkpoint would get.
+    #
+    # ``trace(D (H/2) D^T)`` does decompose over the rows of ``D`` (row ``i``
+    # contributes ``D[i] (H/2) D[i]^T``), so blocking it is exact, not an
+    # approximation.
+    error = 0.0
+    result_output_error = 0.0
+    half = 0.5 * original_hessian
+    for start in range(0, weight.shape[0], chunk):
+        stop = min(start + chunk, weight.shape[0])
+        piece = (
+            np.repeat(scales[start:stop], config.group_size, axis=1)
+            * codes[start:stop]
+            + np.repeat(biases[start:stop], config.group_size, axis=1)
+        )
+        difference = original_weight[start:stop] - piece
+        error += float(np.sum(difference**2))
+        result_output_error += float(np.sum((difference @ half) * difference))
+        del piece, difference
+    error /= weight.shape[0] * columns
+    del codes
     reduction = None
     frobenius_reduction = None
     if rtn_output_error:

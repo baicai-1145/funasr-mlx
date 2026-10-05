@@ -362,6 +362,10 @@ def convert(args) -> int:
     accumulator = HessianAccumulator.load(args.hessian)
     # The Hessian file is keyed by language; rebuild the balanced Hessian.
     hessian = accumulator.hessian(balance=True)
+    # The per-language sums are dead once the balanced Hessian exists, and a
+    # 1024x1024 float32 matrix is only 4 MB but the accumulator holds ten of
+    # them; drop the source so the peak is the balanced copy alone.
+    del accumulator
     config = GptqConfig(
         bits=spec.bits,
         group_size=spec.group_size,

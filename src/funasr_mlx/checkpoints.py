@@ -288,17 +288,35 @@ class GptqWeight:
                 f"group_size={config.group_size}, but the converter asked for "
                 f"bits={bits} group_size={group_size}"
             )
-        source = np.array(weight.astype(mx.float32))
-        outcome = gptq_quantize(source, np.asarray(hessian, dtype=np.float32), config)
+        # Convert to float32 in row blocks.  ``weight.astype(mx.float32)`` on a
+        # 151936x1024 head would materialise a 622 MB float32 array on the device
+        # and ``np.array`` a second 622 MB one on the host, on top of the
+        # bfloat16 original -- enough to push the conversion past the guard's
+        # budget on its own.  Blocked conversion keeps a few tens of MB live at a
+        # time, and the host array it fills is the one GPTQ consumes.
+        rows, width = int(weight.shape[0]), int(weight.shape[1])
+        source = np.empty((rows, width), dtype=np.float32)
+        step = max(int(config.row_chunk) or rows, 1)
+        for start in range(0, rows, step):
+            stop = min(start + step, rows)
+            source[start:stop] = np.array(weight[start:stop].astype(mx.float32))
+        # ``np.asarray`` is a no-op when the Hessian is already float32, which is
+        # how the calibrator writes it; a copy here would double it for nothing.
+        hessian32 = np.asarray(hessian, dtype=np.float32)
+        outcome = gptq_quantize(source, hessian32, config)
+        del source, hessian32
         self.outcomes[name] = outcome.to_json()
         # Side tensors must land in the checkpoint dtype (bfloat16/float16), the
         # same as mx.quantize would produce, or the runtime would promote.
         dtype = weight.dtype
-        return (
-            mx.array(outcome.packed),
-            mx.array(outcome.scales).astype(dtype),
-            mx.array(outcome.biases).astype(dtype),
-        )
+        # ``mx.array`` copies straight into the device buffer, so the host arrays
+        # are dropped as soon as the tensors are evaluated.
+        packed = mx.array(outcome.packed)
+        scales = mx.array(outcome.scales).astype(dtype)
+        biases = mx.array(outcome.biases).astype(dtype)
+        mx.eval(packed, scales, biases)
+        del outcome
+        return packed, scales, biases
 
 
 @dataclass(frozen=True)
@@ -773,6 +791,10 @@ def _convert_safetensors_source(
 
     from .models.llm.quant import QuantizationSpec
 
+    # Bound here rather than at module scope: ``checkpoints`` is imported by the
+    # package root, and the runtime requires MLX imports to stay lazy.
+    import mlx.core as mx
+
     spec = QuantizationSpec.from_dict(quantization) if quantization is not None else None
     if spec is not None and dtype not in ("bfloat16", "float16"):
         raise ValueError("W4A16 quantization requires a 16-bit checkpoint dtype")
@@ -900,6 +922,12 @@ def _convert_safetensors_source(
                         gptq=gptq if (gptq is not None and gptq.has(native)) else None,
                     )
                     del array
+                    # A GPTQ pass on a large head allocates several hundred MB of
+                    # host scratch.  MLX's allocator is capped by the policy but
+                    # keeps freed blocks in its cache, so hand them back before
+                    # the next tensor rather than letting the cache grow to its
+                    # limit on top of the Python-side peak.
+                    mx.clear_cache()
                     side_code = "BF16" if keep_bf16 else "F16"
                     module = native[: -len(".weight")]
                     group_bytes = sum(int(value.nbytes) for value in packed.values())
