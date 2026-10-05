@@ -58,13 +58,15 @@ class GlmAsrThinker(mxnn.Module):
         self.language_model = LlamaForCausalLM(cfg.text)
 
     def _decoder_dtype(self) -> mx.Dtype:
-        """Dtype of the decoder's checkpoint weights (``embed_tokens``).
+        """Dtype the decoder activations must follow.
 
-        This is the dtype the decoder activations must follow: the token
-        embedding produces it, so splicing anything else into the stream
-        promotes every Linear in the stack (see :meth:`forward_with_audio`).
+        Read through :func:`activation_dtype`, not ``weight.dtype``: a quantized
+        embedding stores packed ``uint32`` codes in ``weight``, and casting the
+        spliced audio embeddings to ``uint32`` destroys them.
         """
-        return self.language_model.model.embed_tokens.weight.dtype
+        from .llm.quant import activation_dtype
+
+        return activation_dtype(self.language_model.model.embed_tokens)
 
     def _tower_dtype(self) -> mx.Dtype:
         """Dtype of the audio tower's checkpoint weights (first conv)."""

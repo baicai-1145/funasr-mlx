@@ -622,3 +622,74 @@ def test_quantization_spec_records_the_method_and_rejects_unknown_ones():
     assert QuantizationSpec.from_dict(_spec(method="gptq")).to_dict()["method"] == "gptq"
     with pytest.raises(ValueError, match="Unsupported quantization method"):
         QuantizationSpec.from_dict(_spec(method="magic"))
+
+
+# --------------------------------------------------------------------------- #
+# the activation-dtype bug: quantized codes are not activations
+# --------------------------------------------------------------------------- #
+def test_activation_dtype_is_not_the_packed_code_dtype():
+    """The dtype activations must follow is the OUTPUT dtype, not ``weight``'s.
+
+    ``QuantizedEmbedding`` stores ``weight`` as packed ``uint32`` codes.  Every
+    family splices the audio tower's output into the token stream and casts it to
+    ``embed_tokens``'s dtype -- read as ``weight.dtype``, that is ``uint32``, so
+    the cast turned every audio embedding into an integer and destroyed the
+    transcript from step 0.
+
+    The failure looked exactly like "4-bit is too coarse for the tied embedding"
+    (garbage from step 0, bf16 perfect), so it was chased as an accuracy problem
+    across GPTQ, act-order, w8 and mixed Hessians before the cast was found.  No
+    quantization scheme can fix it, which is why this test pins the helper rather
+    than any scheme.
+    """
+    from funasr_mlx.models.llm.quant import activation_dtype
+
+    plain = nn.Embedding(64, 32)
+    assert activation_dtype(plain) == plain.weight.dtype
+
+    quantized = nn.QuantizedEmbedding(64, 32, group_size=32, bits=4)
+    assert quantized.weight.dtype == mx.uint32  # the trap
+    assert activation_dtype(quantized) == quantized.scales.dtype
+    assert activation_dtype(quantized) != mx.uint32
+    # And it must agree with what the module actually emits.
+    out = quantized(mx.array([[1, 2, 3]]))
+    mx.eval(out)
+    assert activation_dtype(quantized) == out.dtype
+
+
+def test_activation_dtype_handles_quantized_linear():
+    from funasr_mlx.models.llm.quant import activation_dtype
+
+    layer = nn.Linear(32, 16, bias=False)
+    quantized = nn.QuantizedLinear.from_linear(layer, group_size=32, bits=4)
+    assert quantized.weight.dtype == mx.uint32
+    assert activation_dtype(quantized) == quantized.scales.dtype
+
+
+def test_activation_dtype_rejects_a_weightless_module():
+    from funasr_mlx.models.llm.quant import activation_dtype
+
+    class NoWeight(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+    with pytest.raises(ValueError, match="no weight"):
+        activation_dtype(NoWeight())
+
+
+def test_a_quantized_decoder_reports_a_floating_activation_dtype():
+    """End to end: the family helper must never return an integer dtype.
+
+    This is the assertion that would have caught the bug at its source instead of
+    ten languages of garbage transcripts later.
+    """
+    model = create_model("qwen3-asr", TINY_QWEN3_ASR)
+    quantization = _spec(targets=["thinker.model.embed_tokens"])
+    result = apply_quantization(model, quantization)
+    assert result is not None and result.quantized
+    dtype = model._decoder_dtype()
+    assert dtype in (mx.bfloat16, mx.float16, mx.float32), (
+        f"qwen3-asr reported {dtype} as the decoder activation dtype after "
+        "quantizing the tied embedding"
+    )
+    assert dtype != mx.uint32

@@ -41,6 +41,7 @@ __all__ = [
     "DEFAULT_GROUP_SIZE",
     "NON_LINEAR_WEIGHT_NAMES",
     "QuantizationSpec",
+    "activation_dtype",
     "apply_quantization",
 ]
 
@@ -234,6 +235,37 @@ class QuantizationResult:
             "linear_layers_quantized": len(self.quantized),
             "linear_layers_skipped": len(self.skipped),
         }
+
+
+def activation_dtype(module: nn.Module) -> mx.Dtype:
+    """The dtype a weight-bearing module emits, for activations to follow.
+
+    A family splices the audio tower's output into the decoder's token stream,
+    and has to cast it to the dtype the decoder expects; every such site reads
+    it off ``embed_tokens``.  For a plain module that is ``weight.dtype``.
+
+    That is WRONG once the module is quantized: ``QuantizedEmbedding`` (and
+    ``QuantizedLinear``) store ``weight`` as packed ``uint32`` *codes*, so
+    ``weight.dtype`` is ``uint32`` and the cast turns the audio embeddings into
+    integers -- silently destroying every one of them before the first decoder
+    layer.  The dtype that actually flows out is the side tensor's (``scales``),
+    which the converter writes in the checkpoint's 16-bit dtype.
+
+    This was a real, hard-to-see failure: a quantized checkpoint produced
+    garbage from step 0 (``'language None<|im_start|><|im_end|>'``) while the
+    bf16 checkpoint was perfect, and it looked exactly like "4-bit is too coarse
+    for the tied embedding" -- so it was chased as an accuracy problem across
+    GPTQ, act-order, w8, and mixed Hessians before the cast was found.  No
+    quantization scheme can fix it; the bug is in the cast.
+    """
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        raise ValueError("Module has no weight to read an activation dtype from")
+    if isinstance(module, (nn.QuantizedEmbedding, nn.QuantizedLinear)):
+        scales = getattr(module, "scales", None)
+        if scales is not None:
+            return scales.dtype
+    return weight.dtype
 
 
 def apply_quantization(model: nn.Module, data: Any) -> QuantizationResult | None:

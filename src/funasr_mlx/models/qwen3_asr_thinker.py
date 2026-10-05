@@ -66,13 +66,17 @@ class Qwen3ASR(mxnn.Module):
         self.thinker = Qwen3ForCausalLM(config.text)
 
     def _decoder_dtype(self) -> mx.Dtype:
-        """Dtype of the decoder's checkpoint weights (``embed_tokens``).
+        """Dtype the decoder activations must follow.
 
-        This is the dtype the decoder activations must follow: the token
-        embedding produces it, so splicing anything else into the stream
-        promotes every Linear in the stack (see :meth:`forward_with_audio`).
+        The token embedding produces the activations the decoder consumes, so
+        its OUTPUT dtype is the one to cast spliced audio to.  Read through
+        :func:`activation_dtype`, not ``weight.dtype``: a quantized embedding
+        stores packed ``uint32`` codes in ``weight``, and casting the audio
+        embeddings to ``uint32`` destroys them (see the helper's docstring).
         """
-        return self.thinker.model.embed_tokens.weight.dtype
+        from .llm.quant import activation_dtype
+
+        return activation_dtype(self.thinker.model.embed_tokens)
 
     def _tower_dtype(self) -> mx.Dtype:
         """Dtype of the audio tower's checkpoint weights (first conv)."""
