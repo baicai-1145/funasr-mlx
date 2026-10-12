@@ -67,6 +67,24 @@ def calibrate(args) -> int:
     print(f"{args.family}: {len(blocks)} decoder blocks")
 
     samples = load_manifest(args.manifest, "calibration", args.languages, args.per_language)
+    if args.skip_missing_audio:
+        import os
+
+        total = len(samples)
+        samples = [s for s in samples if os.path.isfile(s["audio_path"])]
+        if len(samples) < total:
+            from collections import Counter
+
+            missing_by_lang = Counter(
+                s["lang"] for s in samples if not os.path.isfile(s["audio_path"])
+            )
+            print(
+                f"WARNING: skipping {total - len(samples)} utterances with missing "
+                f"audio: {dict(missing_by_lang)}",
+                flush=True,
+            )
+    if not samples:
+        raise SystemExit("No calibration utterances with readable audio")
     print(f"AWQ calibration utterances: {len(samples)}")
 
     bits, group = args.bits, args.group_size
@@ -76,14 +94,23 @@ def calibrate(args) -> int:
         return mx.dequantize(*wq, bits=bits, group_size=group)
 
     awq_cfg = AwqConfig(n_grid=args.n_grid, max_shrink=args.max_shrink)
-    report_blocks = []
+    # ONE dataset pass captures every block's inputs (the per-block re-run of
+    # the whole model is what made the first attempt ~575s/block).
+    from funasr_mlx.models.llm.awq import MultiBlockCapture
+
+    blocks = list(blocks)
     started = time.perf_counter()
+    with MultiBlockCapture(blocks, row_cap=args.row_cap) as capture:
+        for index, sample in enumerate(samples):
+            prefill_for = build_prefill(family, key, model, config, source, sample)
+            capture.observe(prefill_for)
+            if index % 40 == 0 or index == len(samples) - 1:
+                print(f"  capture [{index + 1}/{len(samples)}]", flush=True)
+    print(f"capture done in {time.perf_counter() - started:.0f}s", flush=True)
+
+    report_blocks = []
     for index, block in enumerate(blocks):
         quantizer = AwqBlockQuantizer(block, awq_cfg)
-        # capture inputs for this block over every utterance
-        for sample in samples:
-            prefill_for = build_prefill(family, key, model, config, source, sample)
-            quantizer.capture(prefill_for)
         stats = quantizer.optimize(quantize_func, do_clip=not args.no_clip)
         stats["block"] = index
         report_blocks.append(stats)
@@ -96,44 +123,37 @@ def calibrate(args) -> int:
                 flush=True,
             )
         # free captured activations before the next block
-        for _, module in block.leaf_modules().items():
-            if hasattr(module, "input_feat"):
-                delattr(module, "input_feat")
+        for _, module in dict(block.named_modules()).items():
+            for attr in ("input_feat", "block_input"):
+                if hasattr(module, attr):
+                    delattr(module, attr)
         mx.eval(block.parameters())
         mx.clear_cache()
 
-    # save the AWQ-adjusted weights as a plain bf16 checkpoint
+    # Save the live model's (AWQ-adjusted) parameters directly as the new
+    # bf16 checkpoint: names/layout are unchanged, so this is just another
+    # native bf16 checkpoint the existing converter/loader can consume.
     destination = args.destination
     destination.mkdir(parents=True, exist_ok=True)
     from mlx.utils import tree_flatten
 
-    # Reuse the converter's writer: an identity-rule conversion with no
-    # quantization section copies the (adjusted) tensors into the native
-    # layout, sharded, with config passthrough.
-    from funasr_mlx.checkpoints import convert_checkpoint
-
-    info = convert_checkpoint(
-        source,
-        destination,
-        model=family,
-        dtype="bfloat16",
-        config=raw_config if isinstance(raw_config, dict) else None,
-        source_rule="native",
-        tensor_limit=args.tensor_limit,
-    )
-    # The converter re-reads the SOURCE weights, which discards the AWQ
-    # adjustments -- so overwrite the destination tensors with the live
-    # model's parameters directly instead.
-    destination2 = destination
-    import shutil
-
-    shutil.rmtree(destination2)
-    mx.save_safetensors(
-        str(destination2 / "model.safetensors"),
-        dict(tree_flatten(model.parameters())),
-    )
-    (destination2 / "config.json").write_text(json.dumps(raw_config, indent=2))
-    print(f"wrote AWQ-adjusted bf16 checkpoint to {destination2}")
+    # float16, not bfloat16: the strict converter reads safetensors through
+    # numpy, which has no bfloat16 dtype -- f16 carries the AWQ adjustments
+    # losslessly enough (they are small scale/clip perturbations of bf16
+    # weights) and every downstream path understands it.
+    params = {
+        k: (v.astype(mx.float16) if getattr(v, "dtype", None) == mx.bfloat16 else v)
+        for k, v in tree_flatten(model.parameters())
+    }
+    # Drop DERIVED constants the native checkpoints never carry: the audio
+    # tower's sinusoidal table is rebuilt at construction (``_Sinusoids``),
+    # and the strict loader rejects keys the reference checkpoints do not
+    # have.  Keep the drop list explicit, mirroring the converter's own.
+    derived_drop = "audio_tower.positional_embedding.table"
+    params.pop(derived_drop, None)
+    mx.save_safetensors(str(destination / "model.safetensors"), params)
+    (destination / "config.json").write_text(json.dumps(raw_config, indent=2))
+    print(f"wrote AWQ-adjusted f16 checkpoint to {destination}")
 
     payload = {
         "family": args.family,
@@ -171,7 +191,12 @@ def main() -> int:
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--max-shrink", type=float, default=0.5)
     parser.add_argument("--no-clip", action="store_true")
-    parser.add_argument("--tensor-limit", type=int, default=384_000_000)
+    parser.add_argument(
+        "--skip-missing-audio",
+        action="store_true",
+        help="Drop calibration utterances whose audio file is unreadable instead of failing",
+    )
+    parser.add_argument("--row-cap", type=int, default=1536)
     parser.add_argument(
         "--destination", type=Path, default=None, help="AWQ-adjusted bf16 output directory"
     )

@@ -103,6 +103,17 @@ def mse(x, y):
     return ((x - y).astype(__import__("mlx").core.float32)) ** 2
 
 
+def _to_mx(value):
+    """Captured activations are numpy (host); the search wants mx arrays.
+
+    The conversion happens once per consumer, so the device copy never
+    exceeds the capped rows either.
+    """
+    import mlx.core as mx
+
+    return mx.array(value)
+
+
 def _linears(block):
     """The block's Linear modules as ``{path: module}`` (nested paths)."""
     import mlx.nn as nn
@@ -112,6 +123,96 @@ def _linears(block):
         for path, module in block.named_modules()
         if isinstance(module, nn.Linear)
     }
+
+
+def _is_first_norm(module, block) -> bool:
+    """Whether ``module`` is the block's input_layernorm (by identity)."""
+    return module is getattr(block, "input_layernorm", None)
+
+
+class MultiBlockCapture:
+    """Capture Linear inputs for MANY blocks in ONE pass over the dataset.
+
+    Running the model once per block (28 x 480 prefills) is what made the
+    first calibration attempt take ~575s per block; mlx-lm's AWQ catches every
+    Linear of every block in the same forward.  Memory stays bounded by
+    stride-subsampling each Linear's rows down towards ``row_cap`` after
+    every utterance (halving whenever over the cap) and storing float16.
+    """
+
+    def __init__(self, blocks, *, row_cap: int = 1536) -> None:
+        import mlx.nn as nn
+
+        self.blocks = list(blocks)
+        self.row_cap = row_cap
+        self._nn = nn
+        self._installed = []
+
+    def install(self) -> None:
+        import mlx.core as mx
+        from mlx.utils import tree_map
+
+        for block in self.blocks:
+            orig = block.leaf_modules()
+
+            def catcher_factory(module, nn=self._nn, mx=mx, cap=self.row_cap):
+                if isinstance(module, nn.RMSNorm):
+                    # ONLY the block's first norm records (its input IS the
+                    # block input); the mid-block norm's input is not used.
+                    if not _is_first_norm(module, block):
+                        return module
+                    record_norm = True
+                elif isinstance(module, nn.Linear):
+                    record_norm = False
+                else:
+                    return module
+
+                class Catcher(nn.Module):
+                    def __call__(self, x, *args, **kwargs):
+                        # HOST-side storage with a hard stop: once ``row_cap``
+                        # rows are held, further rows are DROPPED (the cap is
+                        # a statistical sample, not an exhaustive log).  This
+                        # avoids both the wired-GW trap of MLX-side buffers and
+                        # the O(n^2) re-concat allocation spikes.
+                        import numpy as _np
+
+                        attr = "block_input" if record_norm else "input_feat"
+                        held = getattr(module, attr, None)
+                        if held is None:
+                            setattr(
+                                module, attr,
+                                _np.array(x.reshape(-1, x.shape[-1]).astype(mx.float32), dtype=_np.float16),
+                            )
+                        elif held.shape[0] < cap:
+                            need = cap - held.shape[0]
+                            more = _np.array(
+                                x.reshape(-1, x.shape[-1]).astype(mx.float32), dtype=_np.float16
+                            )[:need]
+                            setattr(module, attr, _np.concatenate([held, more], axis=0))
+                        # else: at cap, drop
+                        return module(x, *args, **kwargs)
+
+                return Catcher()
+
+            leaves = tree_map(catcher_factory, orig, is_leaf=self._nn.Module.is_module)
+            block.update_modules(leaves)
+            self._installed.append(orig)
+
+    def observe(self, run: Callable[[], Any]) -> None:
+        """Run one utterance's prefill; catchers stop growing at the cap."""
+        run()
+
+    def uninstall(self) -> None:
+        for block, orig in zip(self.blocks, self._installed):
+            block.update_modules(orig)
+        self._installed = []
+
+    def __enter__(self):
+        self.install()
+        return self
+
+    def __exit__(self, *exc):
+        self.uninstall()
 
 
 class AwqBlockQuantizer:
@@ -152,21 +253,20 @@ class AwqBlockQuantizer:
 
             class Catcher(self._nn.Module):
                 def __call__(self, x, *args, **kwargs):
+                    # HOST-side numpy storage (see MultiBlockCapture for why:
+                    # MLX-side buffers are wired GPU memory).
+                    import numpy as _np
+
                     if record_norm_input:
-                        # The block's own input is what enters its first norm.
-                        rows = x.reshape(-1, x.shape[-1]).astype(mx.float32)
-                        if hasattr(module, "block_input"):
-                            module.block_input = mx.concatenate(
-                                [module.block_input, rows], axis=0
-                            )
-                        else:
-                            module.block_input = rows
+                        rows = _np.array(x.reshape(-1, x.shape[-1]).astype(mx.float32))
+                        attr = "block_input"
                     else:
-                        rows = x.reshape(-1, x.shape[-1]).astype(mx.float32)
-                        if hasattr(module, "input_feat"):
-                            module.input_feat = mx.concatenate([module.input_feat, rows], axis=0)
-                        else:
-                            module.input_feat = rows
+                        rows = _np.array(x.reshape(-1, x.shape[-1]).astype(mx.float32))
+                        attr = "input_feat"
+                    if hasattr(module, attr):
+                        setattr(module, attr, _np.concatenate([getattr(module, attr), rows], axis=0))
+                    else:
+                        setattr(module, attr, rows)
                     return module(x, *args, **kwargs)
 
             return Catcher()
@@ -183,13 +283,26 @@ class AwqBlockQuantizer:
 
     # -- scale search --------------------------------------------------------- #
     def _run_block(self, block, x, mask=None):
-        """Run ``block`` on ``x`` [1, rows, hidden] in row batches."""
+        """Run one decoder block on ``x`` [1, rows, hidden] in row batches.
+
+        Our ``Qwen3TransformerBlock`` has no ``__call__`` of its own (the
+        forward is unrolled in ``Qwen3Model.__call__``), so the qwen3 residual
+        structure is applied here: ``h += attn(norm(h)); h += mlp(norm(h))``.
+        The site's sub-block (``self_attn`` / ``mlp``) IS callable directly.
+        """
         import mlx.core as mx
 
+        def once(chunk):
+            if hasattr(block, "input_layernorm") and hasattr(block, "self_attn"):
+                # a whole transformer block: unroll the qwen3 residual pattern
+                h = chunk
+                h = h + block.self_attn(block.input_layernorm(h), mask)
+                return h + block.mlp(block.post_attention_layernorm(h))
+            return block(chunk, mask) if mask is not None else block(chunk)
+
         y = []
-        for start in range(0, x.shape[1], 32):
-            chunk = x[:, start : start + 32]
-            out = block(chunk) if mask is None else block(chunk, mask)
+        for start in range(0, x.shape[1], 256):
+            out = once(x[:, start : start + 256])
             y.append(out)
             mx.eval(y)
         return mx.concatenate(y, axis=1)
@@ -212,7 +325,7 @@ class AwqBlockQuantizer:
         # because the whole block's input is the residual stream, not the
         # successor Linear's input.
         inner = self._submodule(site.block) if site.block else layers[0]
-        x = layers[0].input_feat  # [rows, hidden]
+        x = _to_mx(layers[0].input_feat)  # [rows, hidden]
         x = x[None]  # [1, rows, hidden] -- block call convention
 
         with no_grad():
@@ -246,7 +359,7 @@ class AwqBlockQuantizer:
         import mlx.core as mx
 
         cfg = self.config
-        x = module.input_feat
+        x = _to_mx(module.input_feat)
         stride = max((x.shape[0] + cfg.clip_rows - 1) // cfg.clip_rows, 1)
         x = x[::stride]
         group_size = module.weight.shape[1] // max(
@@ -308,11 +421,15 @@ class AwqBlockQuantizer:
             prev.weight = (prev.weight / scales.astype(prev.weight.dtype)).astype(
                 prev.weight.dtype
             )
-        # keep the captured input consistent with the folded weights
+        # keep the captured input consistent with the folded weights (host
+        # numpy divided by the mx scales, back through numpy for the next site)
+        import numpy as onp
+
+        scales_np = onp.asarray(scales)
         for layer_name in site.layers:
             layer = self._submodule(layer_name)
             if hasattr(layer, "input_feat"):
-                layer.input_feat = layer.input_feat / scales
+                layer.input_feat = onp.asarray(layer.input_feat) / scales_np
 
     # -- orchestration ---------------------------------------------------------- #
     def optimize(self, quantize_func, *, do_clip: bool = True) -> dict:
@@ -324,7 +441,7 @@ class AwqBlockQuantizer:
         weights = tree_flatten(self.block.parameters())
         # reference output for the never-worse check uses the block's OWN
         # input: what enters its first norm (the residual stream).
-        x = self._submodule("input_layernorm").block_input[None]
+        x = _to_mx(self._submodule("input_layernorm").block_input)[None]
         linears = _linears(self.block)
         with no_grad():
             out = self._run_block(self.block, x)

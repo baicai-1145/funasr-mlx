@@ -429,7 +429,7 @@ def convert(args) -> int:
         raise RuntimeError("Conversion must run under the memory guard")
 
     native_dir, family, head_path, _key = FAMILIES[args.family]
-    source = args.native_root / native_dir
+    source = args.source_dir if args.source_dir is not None else args.native_root / native_dir
     spec = QuantizationSpec.from_dict(args.quantization)
     # The converter writes the destination's ``config.json`` from what it is
     # handed, and ``pipeline.load_model`` refuses to guess a configuration, so
@@ -595,6 +595,15 @@ def main() -> int:
         ),
     )
     parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument(
+        "--source-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Override the conversion source directory (e.g. an AWQ-adjusted "
+            "bf16 checkpoint) instead of <native-root>/<family dir>"
+        ),
+    )
     parser.add_argument("--storage", default="bfloat16")
     parser.add_argument("--damp-percent", type=float, default=0.01)
     parser.add_argument("--block-size", type=int, default=128)
