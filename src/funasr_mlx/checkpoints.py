@@ -930,12 +930,13 @@ def _convert_safetensors_source(
                     # apply_quantization builds at load time or the strict
                     # loader rejects the shapes.
                     tensor_bits = spec.bits_for_weight(native)
+                    tensor_group = spec.group_for(native[: -len(".weight")])
                     packed = quantize_bf16_weight(
                         native,
                         array,
                         code="BF16" if keep_bf16 else "F16",
                         bits=tensor_bits,
-                        group_size=spec.group_size,
+                        group_size=tensor_group,
                         mode=spec.mode,
                         gptq=gptq if (gptq is not None and gptq.has(native)) else None,
                     )

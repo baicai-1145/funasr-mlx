@@ -802,6 +802,74 @@ def test_target_bits_round_trip_and_validate():
         )
 
 
+def test_target_groups_use_the_longest_matching_prefix():
+    """Per-target group sizes mirror target_bits (mlx-lm's AWQ default: a
+    g32 tied embedding beside a g64 stack)."""
+    from funasr_mlx.models.llm.quant import QuantizationSpec
+
+    spec = QuantizationSpec.from_dict(
+        {
+            "bits": 4,
+            "group_size": 64,
+            "targets": ["thinker.model.layers.", "thinker.model.embed_tokens"],
+            "target_groups": {"thinker.model.embed_tokens": 32},
+        }
+    )
+    assert spec.group_for("thinker.model.embed_tokens") == 32
+    assert spec.group_for("thinker.model.layers.0.self_attn.q_proj") == 64
+    assert spec.group_for("thinker.model.embed_tokens") != spec.group_size
+    # Nested prefix wins, same rule as bits_for.
+    nested = QuantizationSpec.from_dict(
+        {
+            "bits": 4,
+            "group_size": 64,
+            "targets": ["a."],
+            "target_groups": {"a.": 128, "a.head.": 32},
+        }
+    )
+    assert nested.group_for("a.head.linear") == 32
+    assert nested.group_for("a.other.linear") == 128
+    assert spec.to_dict()["target_groups"] == {"thinker.model.embed_tokens": 32}
+    plain = QuantizationSpec.from_dict({"bits": 4, "group_size": 64, "targets": ["a."]})
+    assert "target_groups" not in plain.to_dict()
+    with pytest.raises(ValueError, match="Unsupported group size"):
+        QuantizationSpec.from_dict(
+            {"bits": 4, "group_size": 64, "targets": ["a."], "target_groups": {"a.": 48}}
+        )
+
+
+def test_a_g32_head_beside_a_g64_stack_loads_strictly():
+    """The group override must be honoured at LOAD time, like the bit override.
+
+    A g32 QuantizedEmbedding has twice as many groups, so its scales/biases
+    shapes differ from a g64 one; building it at the spec default would make
+    the strict loader reject the checkpoint's shapes.
+    """
+    model = create_model("qwen3-asr", TINY_QWEN3_ASR)
+    quantization = {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "affine",
+        "method": "gptq",
+        "targets": ["thinker.model.layers.", "thinker.model.embed_tokens"],
+        "target_groups": {"thinker.model.embed_tokens": 32},
+    }
+    result = apply_quantization(model, quantization)
+    assert result is not None
+    head = model.thinker.model.embed_tokens
+    assert isinstance(head, nn.QuantizedEmbedding)
+    # 32-wide groups: the tiny config's hidden size is 64 -> 2 groups (g64
+    # would give 1), and the scales side tensor carries one entry per group.
+    assert head.group_size == 32
+    assert head.scales.shape[1] == 64 // 32
+    # The decoder Linears keep the default group.
+    layer = model.thinker.model.layers[0].self_attn.q_proj
+    assert isinstance(layer, nn.QuantizedLinear)
+    assert layer.group_size == 64
+    assert result.group_overrides == {"thinker.model.embed_tokens": 32}
+
+
+
 def test_a_w8_head_beside_a_w4_stack_loads_strictly():
     """The override must be honoured at LOAD time, not just in the report.
 

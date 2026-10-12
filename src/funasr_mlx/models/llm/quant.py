@@ -93,6 +93,12 @@ class QuantizationSpec:
     #: decoder Linears at w4 are fine, so spending 8 bits on the head and 4 on
     #: the stack is a better use of the budget than 4 bits on both.
     target_bits: tuple[tuple[str, int], ...] = ()
+    #: Optional per-target group sizes, e.g. ``{"thinker.model.embed_tokens": 32}``.
+    #: Same longest-prefix rule as ``target_bits``.  This is mlx-lm's AWQ
+    #: default for the tied embedding (``embed_group_size=32`` beside a g64
+    #: stack): the embedding's side tensors are what its w4 accuracy needs,
+    #: not the stack's.
+    target_groups: tuple[tuple[str, int], ...] = ()
 
     def bits_for(self, module_path: str) -> int:
         """Bit width for ``module_path``: longest matching override, else ``bits``."""
@@ -102,6 +108,15 @@ class QuantizationSpec:
             if module_path.startswith(prefix) and len(prefix) > len(best_prefix):
                 best_prefix, best_bits = prefix, value
         return best_bits
+
+    def group_for(self, module_path: str) -> int:
+        """Group size for ``module_path``: longest matching override, else the default."""
+        best_prefix = ""
+        best_group = self.group_size
+        for prefix, value in self.target_groups:
+            if module_path.startswith(prefix) and len(prefix) > len(best_prefix):
+                best_prefix, best_group = prefix, value
+        return best_group
 
     def bits_for_weight(self, name: str) -> int:
         """Bit width for checkpoint tensor ``name`` (strips the ``.weight`` tail)."""
@@ -120,6 +135,7 @@ class QuantizationSpec:
         targets = data.get("targets", ())
         method = data.get("method", DEFAULT_METHOD)
         raw_target_bits = data.get("target_bits", {}) or {}
+        raw_target_groups = data.get("target_groups", {}) or {}
         if bits not in (2, 3, 4, 5, 6, 8):
             raise ValueError(f"Unsupported quantization bit width: {bits}")
         if group_size not in (32, 64, 128):
@@ -148,6 +164,14 @@ class QuantizationSpec:
         # Sorted longest-first so the tie-break is deterministic regardless of
         # dict order; bits_for() also compares lengths, this is belt-and-braces.
         target_bits.sort(key=lambda entry: (-len(entry[0]), entry[0]))
+        target_groups = []
+        for prefix, value in raw_target_groups.items():
+            if not isinstance(prefix, str) or not prefix:
+                raise ValueError("target_groups keys must be nonempty module paths")
+            if value not in (16, 32, 64, 128):
+                raise ValueError(f"Unsupported group size for {prefix!r}: {value}")
+            target_groups.append((prefix, int(value)))
+        target_groups.sort(key=lambda entry: (-len(entry[0]), entry[0]))
         return cls(
             bits=bits,
             group_size=group_size,
@@ -155,6 +179,7 @@ class QuantizationSpec:
             targets=tuple(targets),
             method=method,
             target_bits=tuple(target_bits),
+            target_groups=tuple(target_groups),
         )
 
     def to_dict(self) -> dict:
@@ -167,6 +192,8 @@ class QuantizationSpec:
         }
         if self.target_bits:
             payload["target_bits"] = dict(self.target_bits)
+        if self.target_groups:
+            payload["target_groups"] = dict(self.target_groups)
         return payload
 
     def selects(self, module_path: str) -> bool:
@@ -283,6 +310,10 @@ class QuantizationResult:
     #: that was actually applied rather than only the default.
     overrides: dict[str, int] = field(default_factory=dict)
     target_bits: dict[str, int] = field(default_factory=dict)
+    #: Modules quantized at a group size other than ``group_size`` (see
+    #: :meth:`QuantizationSpec.group_for`).
+    group_overrides: dict[str, int] = field(default_factory=dict)
+    target_groups: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> dict:
         payload = {
@@ -295,6 +326,8 @@ class QuantizationResult:
         }
         if self.overrides:
             payload["bit_width_overrides"] = dict(self.overrides)
+        if self.group_overrides:
+            payload["group_size_overrides"] = dict(self.group_overrides)
         return payload
 
 
@@ -348,6 +381,8 @@ def apply_quantization(model: nn.Module, data: Any) -> QuantizationResult | None
     )
     if spec.target_bits:
         result.target_bits = dict(spec.target_bits)
+    if spec.target_groups:
+        result.target_groups = dict(spec.target_groups)
 
     def predicate(path: str, module: nn.Module):
         # Only the two weight-bearing module kinds the scheme supports are
@@ -359,13 +394,18 @@ def apply_quantization(model: nn.Module, data: Any) -> QuantizationResult | None
             if spec.quantizes_module(path, module):
                 result.quantized.append(path)
                 bits = spec.bits_for(path)
+                group = spec.group_for(path)
                 if bits != spec.bits:
                     result.overrides[path] = bits
+                if group != spec.group_size:
+                    result.group_overrides[path] = group
+                if bits != spec.bits or group != spec.group_size:
                     # Returning a dict is nn.quantize's per-module escape hatch.
-                    # The bit width must be honoured here, at load time, or the
-                    # module is built at the wrong width and the strict loader
-                    # rejects the checkpoint's shapes -- so this is not cosmetic.
-                    return {"group_size": spec.group_size, "bits": bits, "mode": spec.mode}
+                    # The override must be honoured here, at load time, or the
+                    # module is built at the wrong width/group and the strict
+                    # loader rejects the checkpoint's shapes -- so this is not
+                    # cosmetic.
+                    return {"group_size": group, "bits": bits, "mode": spec.mode}
                 return True
             result.skipped.append(path)
         return False

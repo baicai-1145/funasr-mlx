@@ -481,9 +481,10 @@ def convert(args) -> int:
     # a w8 head beside a w4 stack is exactly the case this supports, and the
     # converter cross-checks this config against the width it packs the tensor at.
     head_bits = spec.bits_for_weight(head_path + ".weight")
+    head_group = spec.group_for(head_path)
     gptq_config = GptqConfig(
         bits=head_bits,
-        group_size=spec.group_size,
+        group_size=head_group,
         damp_percent=args.damp_percent,
         block_size=args.block_size,
         act_order=not args.no_act_order,
