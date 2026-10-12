@@ -362,6 +362,7 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
         family = "qwen3-asr-0.6b"
         phase = "convert"
         native_root = tmp_path / "native-llm"
+        source_dir = None
         manifest = tmp_path / "unused.json"
         hessian = tmp_path / "h.npz"
         destination = tmp_path / "out"
