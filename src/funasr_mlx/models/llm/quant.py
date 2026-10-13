@@ -244,7 +244,16 @@ class QuantizationSpec:
         module_path = name[: -len(".weight")]
         if not self.selects(module_path):
             return False
-        if any(marker in module_path for marker in NON_LINEAR_WEIGHT_NAMES):
+        # An EXPLICIT target (the module path itself, not a prefix it sits
+        # under) overrides the non-Linear markers: glm's untied ``lm_head`` IS
+        # a real nn.Linear, and the marker exists for the tied families where
+        # the head is an Embedding handled by the embedding rule. Naming a
+        # module directly is the operator saying "quantize THIS", which must
+        # not be silently vetoed by a table written for another topology.
+        explicitly_named = module_path in self.targets
+        if not explicitly_named and any(
+            marker in module_path for marker in NON_LINEAR_WEIGHT_NAMES
+        ):
             return False
         return len(tuple(shape)) == 2
 
@@ -283,7 +292,13 @@ class QuantizationSpec:
             return self.selects_embedding(module_path) and self._fits(module)
         if not isinstance(module, nn.Linear):
             return False
-        if any(marker in module_path for marker in NON_LINEAR_WEIGHT_NAMES):
+        # An EXPLICITLY named target overrides the non-Linear markers (glm's
+        # untied lm_head is a real Linear; the marker exists for tied
+        # topologies where the head is the Embedding -- see is_linear_weight).
+        explicitly_named = module_path in self.targets
+        if not explicitly_named and any(
+            marker in module_path for marker in NON_LINEAR_WEIGHT_NAMES
+        ):
             return False
         if not self.selects(module_path):
             return False

@@ -238,6 +238,45 @@ def build_driver(
 
         return decode
 
+    if family == "glm-asr-nano":
+        # GLM's tokenizer.json declares ``TokenizersBackend``, which this
+        # transformers cannot instantiate -- so no transcript text is
+        # available; the A/B compares raw token-id sequences (same tokenizer
+        # on both arms, so the comparison stays exact).  The prompt/pad ids
+        # come from the t9 probe that validated this family's scopes.
+        prefix_ids = [59253, 10, 59261]
+        tail_ids = [59262, 10, 59254, 10]
+        pad_id = 59260
+        n_layers = config.text["num_hidden_layers"]
+        dtype = _audio_dtype(model._tower_dtype(), what="the mel (glm-asr-nano)")
+
+        def decode(sample):
+            raw, _ = sf.read(sample["audio_path"], dtype="float32")
+            mel = log_mel_spectrogram(mx.array(raw[None, :]), n_mels=128)
+            mel = mx.transpose(mel[0], (1, 0)).astype(dtype)
+            mx.eval(mel)
+            embeds = model.encode_audio(mel)
+            mx.eval(embeds)
+            n = int(embeds.shape[1])
+            ids = mx.array([prefix_ids + [pad_id] * n + tail_ids], dtype=mx.int32)
+            caches = [KVCache() for _ in range(n_layers)]
+            logits = model.forward_with_audio(ids, embeds, n, caches)
+            mx.eval(logits)
+            token = int(mx.argmax(logits[0, -1]).item())
+            tokens = [token]
+            for _ in range(decode_steps):
+                lg = model.language_model(mx.array([[token]], dtype=mx.int32), cache=caches)
+                mx.eval(lg)
+                token = int(mx.argmax(lg[0, -1]).item())
+                tokens.append(token)
+                if token in (59256, 151643, 151645):  # glm end-of-turn family
+                    break
+            # No tokenizer: report the ids joined; normalize() will reduce to
+            # a per-token comparison and CER degenerates to the id distance.
+            return tokens, " ".join(str(t) for t in tokens)
+
+        return decode
+
     raise ValueError(f"No acceptance driver for {family}")
 
 
