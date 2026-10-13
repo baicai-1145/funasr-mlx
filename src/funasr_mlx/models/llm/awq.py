@@ -475,6 +475,30 @@ class AwqBlockQuantizer:
             self.block.load_weights(weights)
 
         if after > before:
+            # NEVER-WORSE: if the AWQ-adjusted block quantizes WORSE than the
+            # untouched one, the adjustment is discarded and the block keeps
+            # its original weights. (The non-fallback path is the difference
+            # from the original port: it used to restore here unconditionally,
+            # which silently discarded every scale/clip the search had folded
+            # in -- the saved "AWQ" checkpoint was the raw weights in f16 and
+            # every downstream "AWQ vs RTN" comparison was two RTN runs.)
             self.block.load_weights(weights)
             return {"before": before, "after": after, "fallback": True}
+        # The adjustment helps: re-fold it. ``weights`` was captured before the
+        # search started, so the adjusted parameters must be re-applied --
+        # cheapest correct path is to re-run the same deterministic search on
+        # the pristine block (the captures are unchanged, so the search
+        # reproduces the same scales/clips) rather than stash a second tree.
+        for site in QWEN3_SCALE_SITES:
+            scales = self.search_scale(site, quantize_func)
+            self.apply_scale(site, scales)
+        if do_clip:
+            for path, module in _linears(self.block).items():
+                if isinstance(module, self._nn.Linear) and not any(
+                    key in path for key in QWEN3_NO_CLIP
+                ):
+                    module.weight = self.search_clip(path, module, quantize_func).astype(
+                        module.weight.dtype
+                    )
+        mx.eval(self.block.parameters())
         return {"before": before, "after": after, "fallback": False}

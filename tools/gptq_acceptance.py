@@ -277,6 +277,84 @@ def build_driver(
 
         return decode
 
+    if family == "moss-transcribe-diarize":
+        # Diarization: transcripts embed speaker tags and [S.NN] + timestamp
+        # tokens. Token-sequence comparison as usual; timestamps additionally
+        # get a +-0.2s tolerance check (industry diarization practice).
+        tok = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=False)
+        template = (tokenizer_dir / "chat_template.jinja").read_text()
+        prompt = (
+            "请将音频转写为文本，每一段需以起始时间戳和说话人编号"
+            "（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，"
+            "并在段末标注结束时间戳，以清晰标明该段语音范围。"
+        )
+        # The template embeds the prompt around an <|audio_pad|> hole; the
+        # t9 protocol renders it ONCE via apply_chat_template and splits on
+        # the audio marker (hand-splitting the multi-branch jinja is fragile).
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": None},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        rendered = tok.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False, chat_template=template
+        )
+        marker = "<|audio_pad|>"
+        pre, rest = rendered.split(marker, 1)
+        pre_ids = tok.encode(pre)
+        tail_ids = tok.encode(rest)
+        audio_token_id = tok.convert_tokens_to_ids(marker)
+        n_layers = config["text_config"]["num_hidden_layers"]
+        # moss has no _tower_dtype; the whisper tower runs at its checkpoint
+        # dtype (t9 protocol feeds the mel as-is; the tower is bf16 here and
+        # stays bf16 -- only the decoder embed tells quantization stories).
+        import mlx.core as _mx
+
+        tower_weight = model.whisper_encoder.conv1.weight
+        mel_dtype = getattr(tower_weight, "dtype", _mx.bfloat16)
+        import numpy as np
+
+        def decode(sample):
+            raw, _ = sf.read(sample["audio_path"], dtype="float32")
+            n_samples, hop, stride, merge = 480000, 160, 2, 4
+            parts = []
+            for start in range(0, len(raw), n_samples):
+                chunk = raw[start : start + n_samples]
+                tok_len = (len(chunk) - 1) // (hop * stride * merge) + 1
+                pad = np.zeros(n_samples, dtype=np.float32)
+                pad[: len(chunk)] = chunk
+                mel_c = log_mel_spectrogram(mx.array(pad)[None], n_mels=80)[0]
+                h = model.whisper_encoder(mx.transpose(mel_c, (1, 0)).astype(mel_dtype))
+                parts.append(h[0, : tok_len * 4 * stride, :])
+            feat = mx.concatenate(parts, axis=0)[None]
+            mx.eval(feat)
+            embeds = model.encode_audio_from_hidden(feat)
+            mx.eval(embeds)
+            n = int(embeds.shape[1])
+            ids = mx.array(
+                [pre_ids + [audio_token_id] * n + tail_ids], dtype=mx.int32
+            )
+            caches = [KVCache() for _ in range(n_layers)]
+            logits = model.forward_with_audio(ids, embeds, n, caches)
+            mx.eval(logits)
+            token = int(mx.argmax(logits[0, -1]).item())
+            tokens = [token]
+            for _ in range(decode_steps):
+                lg = model.language_model(mx.array([[token]], dtype=mx.int32), cache=caches)
+                mx.eval(lg)
+                token = int(mx.argmax(lg[0, -1]).item())
+                tokens.append(token)
+                if token in (151643, 151645):
+                    break
+            text = tok.decode(tokens)
+            return tokens, text.replace("<asr_text>", "")
+
+        return decode
+
     raise ValueError(f"No acceptance driver for {family}")
 
 

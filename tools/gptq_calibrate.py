@@ -296,6 +296,20 @@ def build_prefill(family: str, key: str, model, config, directory: Path, sample:
             caches = [KVCache() for _ in range(n_layers)]
             logits = model.forward_with_audio(ids, embeds, n, caches)
             mx.eval(logits)
+            # TEACHER-FORCED DECODE REPLAY: moss emits timestamps / speaker
+            # tags / segment decisions in the DECODE loop, whose activation
+            # distribution differs from prefill. Calibration that never sees
+            # decode steps tunes scale/clip on the wrong distribution -- the
+            # out-of-tolerance timestamps clustered exactly here. The greedy
+            # run below (on this bf16 source) feeds the capture the tokens the
+            # model itself would emit, timestamps included.
+            token = int(mx.argmax(logits[0, -1]).item())
+            for _ in range(64):
+                lg = model.language_model(mx.array([[token]]), cache=caches)
+                mx.eval(lg)
+                token = int(mx.argmax(lg[0, -1]).item())
+                if token in (151643, 151645):
+                    break
 
         return prefill
 
