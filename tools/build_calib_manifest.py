@@ -236,7 +236,7 @@ def fleurs_candidates(root: Path, language: str, split: str) -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=Path, default=Path("/Volumes/1T/funasr-mlx-models/calib"))
+    parser.add_argument("--root", type=Path, default=Path("/Volumes/2T/funasr-mlx-alignment/calib"))
     parser.add_argument(
         "--alignment-root", type=Path, default=Path("/Volumes/2T/funasr-mlx-alignment")
     )

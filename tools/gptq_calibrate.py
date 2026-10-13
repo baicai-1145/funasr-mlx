@@ -449,29 +449,40 @@ def convert(args) -> int:
     # untrustworthy.
     checkpoint_config["quantization"]["method"] = args.method
 
-    accumulator = HessianAccumulator.load(args.hessian)
+    # RTN never reads the Hessian: its values are round-to-nearest on the
+    # raw weights.  Loading (and requiring) the .npz for an rtn conversion
+    # made an rtn-only pipeline fail on a machine that never calibrated.
+    if args.method == "gptq":
+        accumulator = HessianAccumulator.load(args.hessian)
+    else:
+        accumulator = None
     # The file stores RAW per-language ``X^T X``, so reweighting is a pure
     # post-processing step: changing the balance does not require re-running the
     # (expensive) calibration forward passes at all, only the conversion.
     language_weights = parse_language_weights(args.language_weights)
-    if language_weights:
-        shares = accumulator.language_mass_with(language_weights, balance=True)
-        worst = max(shares.values())
-        print(
-            f"language weights {language_weights} -> max share {worst:.3f} "
-            f"({max(shares, key=shares.get)})"
-        )
-        if worst > args.max_language_mass:
-            raise SystemExit(
-                f"Reweighting pushes {max(shares, key=shares.get)} to {worst:.3f} "
-                f"of the Hessian mass, over the {args.max_language_mass} bound"
+    if accumulator is not None:
+        if language_weights:
+            shares = accumulator.language_mass_with(language_weights, balance=True)
+            worst = max(shares.values())
+            print(
+                f"language weights {language_weights} -> max share {worst:.3f} "
+                f"({max(shares, key=shares.get)})"
             )
-    # The Hessian file is keyed by language; rebuild the (weighted) Hessian.
-    hessian = accumulator.hessian(balance=True, language_weights=language_weights or None)
-    # The per-language sums are dead once the balanced Hessian exists, and a
-    # 1024x1024 float32 matrix is only 4 MB but the accumulator holds ten of
-    # them; drop the source so the peak is the balanced copy alone.
-    del accumulator
+            if worst > args.max_language_mass:
+                raise SystemExit(
+                    f"Reweighting pushes {max(shares, key=shares.get)} to {worst:.3f} "
+                    f"of the Hessian mass, over the {args.max_language_mass} bound"
+                )
+        # The Hessian file is keyed by language; rebuild the (weighted) Hessian.
+        hessian = accumulator.hessian(
+            balance=True, language_weights=language_weights or None
+        )
+        # The per-language sums are dead once the balanced Hessian exists, and a
+        # 1024x1024 float32 matrix is only 4 MB but the accumulator holds ten of
+        # them; drop the source so the peak is the balanced copy alone.
+        del accumulator
+    else:
+        hessian = None
     # NB: named ``gptq_config``, not ``config`` -- the model's own config is
     # ``checkpoint_config`` above, and an earlier version let the GPTQ
     # hyper-parameters overwrite it, which wrote a GptqConfig object into the
@@ -493,12 +504,13 @@ def convert(args) -> int:
     # The head's native tensor name is the head path plus ".weight".
     head_weight = head_path + ".weight"
     gptq = GptqWeight(
-        hessians={head_weight: hessian},
+        hessians={head_weight: hessian} if hessian is not None else {},
         configs={head_weight: gptq_config.to_dict()},
         method=args.method,
     )
     print(
-        f"{args.method.upper()} target: {head_weight} {hessian.shape} "
+        f"{args.method.upper()} target: {head_weight} "
+        f"{hessian.shape if hessian is not None else 'no-hessian(rtn)'} "
         f"{gptq_config.to_dict()}"
     )
 
@@ -517,19 +529,33 @@ def convert(args) -> int:
         # Not an error when the head is deliberately out of scope: the tower/
         # decoder-only configuration is a supported arm (t9's known-safe scope),
         # and it quantizes only Linears, which go through mx.quantize rather than
-        # the GPTQ path.  Failing here would make the fallback arm impossible to
-        # build with this tool.  It IS an error if the head was selected and
-        # nothing happened, which is the silent-miss case the original check was
-        # for -- so the distinction is made on whether the head is in targets.
-        if any(head_path.startswith(target) or target.startswith(head_path) for target in spec.targets):
+        # the GPTQ path.  It IS an error if the head was selected and nothing
+        # happened -- but "nothing" must be measured on what the CONVERTER
+        # packed, not on the GPTQ outcomes: an rtn conversion legitimately has
+        # zero GPTQ outcomes while the head packed fine through mx.quantize
+        # (its .scales landed in the emitted weight_map).
+        index_path = args.destination / "model.safetensors.index.json"
+        index = json.loads(index_path.read_text()) if index_path.is_file() else {}
+        weight_map = index.get("weight_map", {})
+        head_quantized = (head_weight[:-len(".weight")] + ".scales") in weight_map
+        if head_quantized:
+            print(
+                f"note: {head_path} packed via mx.quantize (rtn path), "
+                "no GPTQ outcomes to report"
+            )
+        elif any(
+            head_path.startswith(target) or target.startswith(head_path)
+            for target in spec.targets
+        ):
             raise SystemExit(
-                f"No tensor was quantized with GPTQ -- is {head_weight} selected by "
+                f"The head was not quantized -- is {head_weight} selected by "
                 f"targets {spec.targets}?"
             )
-        print(
-            f"note: {head_path} is out of scope for targets {list(spec.targets)}; "
-            "the head stays at the checkpoint dtype (decoder/tower-only arm)"
-        )
+        else:
+            print(
+                f"note: {head_path} is out of scope for targets {list(spec.targets)}; "
+                "the head stays at the checkpoint dtype (decoder/tower-only arm)"
+            )
     print(json.dumps({"gptq": gptq.outcomes, "info": info.__dict__}, indent=2))
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -559,7 +585,7 @@ def main() -> int:
     parser.add_argument(
         "--manifest",
         type=Path,
-        default=Path("/Volumes/1T/funasr-mlx-models/calib/calib-manifest.json"),
+        default=Path("/Volumes/2T/funasr-mlx-alignment/calib/calib-manifest.json"),
     )
     parser.add_argument("--per-language", type=int, default=48)
     parser.add_argument(
@@ -612,7 +638,10 @@ def main() -> int:
     args = parser.parse_args()
     args.languages = [part for part in args.languages.split(",") if part]
 
-    work = Path("/Volumes/1T/funasr-mlx-models/calib/gptq")
+    # Calibrated artifacts live on the 2T disk since the 1T USB drive proved
+    # unstable (repeated disconnects mid-copy). New runs write here; the old
+    # 1T location is read via --hessian/--output overrides if ever needed.
+    work = Path("/Volumes/2T/funasr-mlx-alignment/calib/gptq")
     if args.output is None:
         args.output = work / f"{args.family}-hessian.npz"
     if args.report is None:
