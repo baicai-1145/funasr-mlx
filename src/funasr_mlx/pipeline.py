@@ -118,7 +118,12 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     config_dict = config if isinstance(config, dict) else read_config(config)
     headers = {}
     files = tuple(checkpoint_files(checkpoint))
-    shard_bound = max(128 * MB, info.largest_tensor_bytes) + 16 * MB
+    # Same bound the converter enforces when packing quantized groups (see
+    # checkpoints.py): one shard bounds one mmap's wired swing.  256MB+32MB
+    # admits the largest single group a legal conversion can emit (a 1.7B
+    # tied embedding at w4/g64 is ~175MB) while keeping the per-file
+    # residency predictable on 16GB hosts.
+    shard_bound = max(256 * MB, info.largest_tensor_bytes) + 32 * MB
     for path in files:
         if path.stat().st_size > min(shard_bound, policy.mlx_limit - info.tensor_bytes):
             raise MemoryBudgetExceeded(

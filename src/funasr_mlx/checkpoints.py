@@ -921,9 +921,16 @@ def _convert_safetensors_source(
                     # scales/biases: `pipeline.load_model` binds the group as a
                     # unit, and splitting it across shards is not supported. So
                     # flush whatever is buffered, then check the group itself
-                    # against the loader's per-shard bound -- `max(128MB,
-                    # largest_tensor) + 16MB` -- and fail loudly rather than
-                    # emit a checkpoint that cannot be loaded.
+                    # against the loader's per-shard bound -- `max(256MB,
+                    # largest_tensor) + 32MB` -- and fail loudly rather than
+                    # emit a checkpoint that cannot be loaded.  The bound is
+                    # sized by the LARGEST group the conversion itself packs
+                    # (a 1.7B tied embedding at w4/g64 packs to ~175MB), so a
+                    # legal conversion can always be loaded on the machine
+                    # class the memory policy targets: one mmap's wired swing
+                    # is bounded by one shard, and the measured conversion
+                    # peak (~4.4GB on 16GB hosts) leaves 2x headroom to the
+                    # per-process wired limit.
                     flush_quantized()
                     # Per-target bit width: a w8 head beside a w4 stack (see
                     # QuantizationSpec.bits_for).  This must match what
@@ -951,7 +958,7 @@ def _convert_safetensors_source(
                     module = native[: -len(".weight")]
                     group_bytes = sum(int(value.nbytes) for value in packed.values())
                     shard_bound = (
-                        max(128 * 1024 * 1024, int(packed[native].nbytes)) + 16 * 1024 * 1024
+                        max(256 * 1024 * 1024, int(packed[native].nbytes)) + 32 * 1024 * 1024
                     )
                     if group_bytes > shard_bound:
                         raise ValueError(

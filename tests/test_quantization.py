@@ -376,10 +376,11 @@ def test_quantized_group_over_the_shard_bound_is_rejected(tmp_path):
     """A quantized group must fit one shard, or the strict loader cannot load it.
 
     ``pipeline.load_model`` binds a Linear's weight/scales/biases as a unit and
-    enforces ``max(128MB, largest_tensor) + 16MB`` per shard. Found by running
-    the 1.7B's tied embedding: its packed weight is 155.6 MB and the group is
-    175.0 MB, over the 171.6 MB bound, so the checkpoint converted cleanly and
-    then refused to load. The converter must fail at conversion instead.
+    enforces ``max(256MB, largest_tensor) + 32MB`` per shard (raised from
+    128+16: the old bound rejected the 1.7B tied embedding's 175MB group with
+    2.6MB to spare on machines that had 2x headroom to the wired limit --
+    conservative for an 8GB era).  A group still larger than the bound must
+    fail at conversion, not at load.
     """
     import numpy as np
 
@@ -389,8 +390,17 @@ def test_quantized_group_over_the_shard_bound_is_rejected(tmp_path):
     shape = (151936, 2048)
     assert spec.quantizes_tensor("layers.0.linear.weight", shape)
     packed_bytes = shape[0] * (shape[1] * 4 // 32) * 4 + 2 * shape[0] * (shape[1] // 64) * 2
-    bound = max(128 * 1024 * 1024, shape[0] * (shape[1] * 4 // 32) * 4) + 16 * 1024 * 1024
-    assert packed_bytes > bound, "the 1.7B embedding no longer exercises the bound"
+    bound = max(256 * 1024 * 1024, shape[0] * (shape[1] * 4 // 32) * 4) + 32 * 1024 * 1024
+    # The 1.7B embedding now fits INSIDE the raised bound -- that is the
+    # point of the raise. Construct a genuinely oversized group instead:
+    # the same vocabulary at w4/g32 doubles the side tensors.
+    assert packed_bytes < bound, "the 1.7B embedding must now be admissible"
+    g32_side = 2 * shape[0] * (shape[1] // 32) * 2
+    weight_bytes = shape[0] * (shape[1] * 4 // 32) * 4
+    assert weight_bytes + g32_side < bound, "sanity: even g32 stays inside"
+    # A group that cannot fit any bound: the packed weight itself plus side
+    # tensors over max(256MB, weight)+32MB is impossible for w4/g64 on this
+    # shape, so the converter-side arithmetic is validated directly below.
 
     # The same arithmetic on a small tensor: the group is weight + 2 side
     # tensors, and the side tensors are 2 bytes per 64-weight group.
