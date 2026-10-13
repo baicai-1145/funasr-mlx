@@ -112,6 +112,26 @@ def token_edit_distance(tokens_a: list[int], tokens_b: list[int]) -> tuple[int, 
     return distance, distance / denominator
 
 
+def character_error_rate(hypothesis: str, reference: str) -> float:
+    """CER: character-level Levenshtein distance / len(reference).
+
+    The token criterion punishes a single substituted token on a 40-token
+    utterance with 2.5% (a fail at the 2% line) even when the substitution is a
+    spelling variant a listener cannot hear (Korean case endings, katakana
+    choices, Thai segmentation).  CER is the industry metric for exactly this:
+    it measures what the transcript is actually made of.
+    """
+    hyp = normalize(hypothesis, language="")
+    ref = normalize(reference, language="")
+    # normalize() with language="" keeps punctuation-as-space (the generic
+    # branch); strip any remaining whitespace so CJK runs compare per glyph.
+    hyp = "".join(hyp.split())
+    ref = "".join(ref.split())
+    if not ref:
+        return 0.0 if not hyp else 1.0
+    return edit_distance(list(hyp), list(ref)) / len(ref)
+
+
 def guide_span_ok(transcript: str, prompt_language: str) -> bool:
     """Whether the ``language X`` guide span is present verbatim.
 
@@ -294,6 +314,9 @@ def main() -> int:
         base, quant = outputs["bf16"], outputs["quant"]
         distance, rate = token_edit_distance(quant["answer_span"], base["answer_span"])
         full_distance, full_rate = token_edit_distance(quant["tokens"], base["tokens"])
+        cer_vs_baseline = character_error_rate(quant["transcript"], base["transcript"])
+        cer_vs_expected = character_error_rate(quant["transcript"], sample["text"])
+        cer_baseline_vs_expected = character_error_rate(base["transcript"], sample["text"])
         row = {
             "language": language,
             "prompt_language": prompt_language,
@@ -307,6 +330,9 @@ def main() -> int:
             "span_token_edit_rate": rate,
             "full_token_edit_distance": full_distance,
             "full_token_edit_rate": full_rate,
+            "cer_vs_baseline": cer_vs_baseline,
+            "cer_vs_expected": cer_vs_expected,
+            "cer_baseline_vs_expected": cer_baseline_vs_expected,
             "span_identical": quant["answer_span"] == base["answer_span"],
             "semantic_equal": normalize(quant["transcript"], language)
             == normalize(base["transcript"], language),
@@ -341,6 +367,12 @@ def main() -> int:
             "mean_span_token_edit_rate": sum(row["span_token_edit_rate"] for row in rows)
             / len(rows),
             "span_identical": sum(row["span_identical"] for row in rows),
+            "mean_cer_vs_baseline": sum(row["cer_vs_baseline"] for row in rows) / len(rows),
+            "mean_cer_vs_expected": sum(row["cer_vs_expected"] for row in rows) / len(rows),
+            "mean_cer_baseline_vs_expected": sum(
+                row["cer_baseline_vs_expected"] for row in rows
+            )
+            / len(rows),
         }
     summary = {
         "family": args.family,
@@ -350,6 +382,7 @@ def main() -> int:
             "semantic_equal": "punctuation/whitespace-insensitive transcript match vs bf16",
             "max_span_token_edit_rate": args.max_token_edit_rate,
             "guide_span": "the 'language X' prefix preserved verbatim",
+            "cer": "character error rate reported alongside; not gating",
         },
         "totals": {
             "samples": len(results),
@@ -361,6 +394,8 @@ def main() -> int:
             / len(results),
             "max_span_token_edit_rate": max(row["span_token_edit_rate"] for row in results),
             "baseline_matches_expected": sum(row["expected_matches_baseline"] for row in results),
+            "mean_cer_vs_baseline": sum(row["cer_vs_baseline"] for row in results) / len(results),
+            "mean_cer_vs_expected": sum(row["cer_vs_expected"] for row in results) / len(results),
         },
         "per_language": per_language,
         "results": results,
