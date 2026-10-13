@@ -132,6 +132,15 @@ def character_error_rate(hypothesis: str, reference: str) -> float:
     return edit_distance(list(hyp), list(ref)) / len(ref)
 
 
+#: The qwen3-asr prompt language name per tag (the manifest carries it per
+#: sample; extended manifests that omit it fall back to this table).
+PROMPT_LANGUAGE = {
+    "zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean",
+    "es": "Spanish", "fr": "French", "de": "German", "ru": "Russian",
+    "th": "Thai", "vi": "Vietnamese",
+}
+
+
 def guide_span_ok(transcript: str, prompt_language: str) -> bool:
     """Whether the ``language X`` guide span is present verbatim.
 
@@ -298,7 +307,7 @@ def main() -> int:
 
     for index, sample in enumerate(samples):
         language = sample["lang"]
-        prompt_language = sample["prompt_language"]
+        prompt_language = sample.get("prompt_language") or PROMPT_LANGUAGE[language]
         order = (bf16_decode, quant_decode) if index % 2 == 0 else (quant_decode, bf16_decode)
         outputs = {}
         for position, decode in enumerate(order):
