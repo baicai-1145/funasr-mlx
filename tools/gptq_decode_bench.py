@@ -99,6 +99,45 @@ def build_decode(family: str, model, config, tokenizer_dir: Path, *, steps: int)
 
     from transformers import AutoTokenizer
 
+    if family == "qwen3-asr":
+        tok = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=False)
+        prefix_ids = tok(
+            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>",
+            add_special_tokens=False,
+        )["input_ids"]
+        tail_ids = tok(
+            "<|audio_end|><|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False
+        )["input_ids"]
+        pad_id = config.audio_pad_token_id
+        n_layers = config.text.num_hidden_layers
+        # The mel feeds the audio TOWER; follow the tower's dtype, not the
+        # decoder embedding's (for a quantized embedding that is the packed-code uint32).
+        dtype = _audio_dtype(model._tower_dtype(), what="the mel (qwen3-asr)")
+
+        def prepare(sample):
+            raw, _ = sf.read(sample["audio_path"], dtype="float32")
+            mel = log_mel_spectrogram(mx.array(raw[None, :]), n_mels=128)
+            mel = mx.transpose(mel[0], (1, 0)).astype(dtype)
+            mx.eval(mel)
+            embeds = model.encode_audio(mel)
+            mx.eval(embeds)
+            span = int(embeds.shape[1])
+            ids = mx.array([prefix_ids + [pad_id] * span + tail_ids], dtype=mx.int32)
+            caches = [KVCache() for _ in range(n_layers)]
+            logits = model.forward_with_audio(ids, embeds, span, caches)
+            mx.eval(logits)
+            return caches, int(mx.argmax(logits[0, -1]).item())
+
+        def decode(prepared, count):
+            caches, token = prepared
+            for _ in range(count):
+                logits = model.thinker(inputs=mx.array([[token]], dtype=mx.int32), cache=caches)
+                mx.eval(logits)
+                token = int(mx.argmax(logits[0, -1]).item())
+            return token
+
+        return prepare, decode, steps
+
     if family == "glm-asr-nano":
         # Same prompt structure the acceptance driver uses for this family
         # (t9-validated ids; no tokenizer needed for a paired timing bench).
