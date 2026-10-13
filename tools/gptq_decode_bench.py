@@ -134,6 +134,76 @@ def build_decode(family: str, model, config, tokenizer_dir: Path, *, steps: int)
 
         return prepare, decode, steps
 
+    if family == "moss-transcribe-diarize":
+        # Same protocol as the acceptance driver (t9-validated): the jinja
+        # template rendered once around an <|audio_pad|> hole, the chunked
+        # whisper tower in prepare (EXCLUDED from timing), greedy decode only.
+        from transformers import AutoTokenizer
+        import numpy as np
+
+        tok = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=False)
+        template = (tokenizer_dir / "chat_template.jinja").read_text()
+        prompt = (
+            "请将音频转写为文本，每一段需以起始时间戳和说话人编号"
+            "（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，"
+            "并在段末标注结束时间戳，以清晰标明该段语音范围。"
+        )
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": None},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+        rendered = tok.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False, chat_template=template
+        )
+        marker = "<|audio_pad|>"
+        pre, rest = rendered.split(marker, 1)
+        pre_ids = tok.encode(pre)
+        tail_ids = tok.encode(rest)
+        audio_token_id = tok.convert_tokens_to_ids(marker)
+        n_layers = config["text_config"]["num_hidden_layers"]
+        tower_weight = model.whisper_encoder.conv1.weight
+        mel_dtype = getattr(tower_weight, "dtype", __import__("mlx").core.bfloat16)
+
+        def prepare(sample):
+            raw, _ = sf.read(sample["audio_path"], dtype="float32")
+            n_samples, hop, stride, merge = 480000, 160, 2, 4
+            parts = []
+            for start in range(0, len(raw), n_samples):
+                chunk = raw[start : start + n_samples]
+                tok_len = (len(chunk) - 1) // (hop * stride * merge) + 1
+                pad = np.zeros(n_samples, dtype=np.float32)
+                pad[: len(chunk)] = chunk
+                mel_c = log_mel_spectrogram(mx.array(pad)[None], n_mels=80)[0]
+                h = model.whisper_encoder(mx.transpose(mel_c, (1, 0)).astype(mel_dtype))
+                parts.append(h[0, : tok_len * 4 * stride, :])
+            feat = mx.concatenate(parts, axis=0)[None]
+            mx.eval(feat)
+            embeds = model.encode_audio_from_hidden(feat)
+            mx.eval(embeds)
+            n = int(embeds.shape[1])
+            ids = mx.array([pre_ids + [audio_token_id] * n + tail_ids], dtype=mx.int32)
+            caches = [KVCache() for _ in range(n_layers)]
+            logits = model.forward_with_audio(ids, embeds, n, caches)
+            mx.eval(logits)
+            return caches, int(mx.argmax(logits[0, -1]).item())
+
+        def decode(prepared, count):
+            caches, token = prepared
+            for _ in range(count):
+                logits = model.language_model(
+                    mx.array([[token]], dtype=mx.int32), cache=caches
+                )
+                mx.eval(logits)
+                token = int(mx.argmax(logits[0, -1]).item())
+            return token
+
+        return prepare, decode, steps
+
     raise ValueError(f"No decode bench driver for {family}")
 
     tok = AutoTokenizer.from_pretrained(str(tokenizer_dir), use_fast=False)
