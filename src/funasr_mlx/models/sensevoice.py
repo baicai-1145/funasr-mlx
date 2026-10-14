@@ -44,6 +44,7 @@ from typing import Any, Mapping, Sequence
 import mlx.core as mx
 from mlx import nn as mxnn
 
+from ._strict_load import _filter
 from .sanm import (
     EncoderLayerSANM,
     Float32LayerNorm,
@@ -118,10 +119,6 @@ EVENT_EMO_IDS = (EVENT_ID, EMO_ID)
 #: language + event + emotion + textnorm
 NUM_PREFIX_FRAMES = 4
 
-
-def _filter(cls: type, data: Mapping[str, Any] | None) -> dict[str, Any]:
-    known = {f.name for f in fields(cls)}
-    return {k: v for k, v in (data or {}).items() if k in known}
 
 
 # --------------------------------------------------------------------------- #

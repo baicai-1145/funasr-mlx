@@ -44,6 +44,7 @@ from typing import Any, Mapping, Sequence
 import mlx.core as mx
 from mlx import nn as mxnn
 
+from ._strict_load import _filter
 from .sanm import (
     Conv2dSubsampling,
     Conv2dSubsampling2,
@@ -84,10 +85,6 @@ __all__ = [
     "ts_prediction_lfr6_standard",
 ]
 
-
-def _filter(cls: type, data: Mapping[str, Any] | None) -> dict[str, Any]:
-    known = {f.name for f in fields(cls)}
-    return {k: v for k, v in (data or {}).items() if k in known}
 
 
 _POS_ENC_CLASSES = {

@@ -39,6 +39,7 @@ import mlx.core as mx
 from mlx import nn as mxnn
 
 from ._layout_state import layout_rule as _layout_rule
+from ._strict_load import _filter
 
 __all__ = [
     "BasicResBlock",
@@ -974,10 +975,6 @@ class DenseLayer(mxnn.Module):
 # --------------------------------------------------------------------------- #
 # configuration
 # --------------------------------------------------------------------------- #
-def _filter(cls: type, data: Mapping[str, Any] | None) -> dict[str, Any]:
-    known = {f.name for f in fields(cls)}
-    return {k: v for k, v in (data or {}).items() if k in known}
-
 
 @dataclass
 class CAMPlusConfig:

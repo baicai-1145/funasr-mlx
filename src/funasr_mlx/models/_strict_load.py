@@ -23,6 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 __all__ = [
+    "_filter",
     "_require",
     "_as_float",
     "_as_int",
@@ -52,6 +53,11 @@ def _as_float(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number, got {value!r}")
     return float(value)
+
+
+def _filter(cls: type, data: Mapping[str, Any] | None) -> dict[str, Any]:
+    known = {f.name for f in dataclass_fields(cls)}
+    return {k: v for k, v in (data or {}).items() if k in known}
 
 
 def _known_fields(cls: type, mapping: Mapping[str, Any], context: str) -> dict[str, Any]:

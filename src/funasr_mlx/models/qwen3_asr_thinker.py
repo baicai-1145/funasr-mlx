@@ -24,6 +24,7 @@ import mlx.core as mx
 import mlx.nn as mxnn
 
 from .llm import KVCache, Qwen3ForCausalLM, Qwen3ModelArgs
+from .llm.splice import splice_and_forward
 from .qwen3_asr import (
     Qwen3ASRAudioConfig,
     Qwen3ASRAudioEncoder,
@@ -103,32 +104,16 @@ class Qwen3ASR(mxnn.Module):
         pad_span: int,
         caches: list[KVCache] | None = None,
     ) -> mx.array:
-        """Replace the ``pad_span``-wide ``<|audio_pad|>*`` run with the tower
-        output and run one decoder pass.
-
-        The prefill pass (fresh caches, L > 1) needs the causal mask -- the
-        generic model call only builds one when ``cache is None`` as a whole,
-        so pass an explicit mask here for the prefill step.
-        """
+        """Replace the ``pad_span`` audio run with tower output (shared splice)."""
+        th = self.thinker
         cfg = self.config
-        match = token_ids == cfg.audio_pad_token_id
-        first = int(mx.argmax(match).item())
-        h = self.thinker.model.embed_tokens(token_ids)
-        # Follow the decoder's own weight dtype, exactly as whisper's
-        # TextDecoder does.  The tower emits float32 embeds (float32 mel in),
-        # so splicing them unchanged locked all 28 decoder layers into fp32
-        # activations against fp16 weights: a mixed-dtype promotion at every
-        # Linear, every step (measured on M4: 109.6 vs 20.7 ms/step).  A
-        # float32 checkpoint is unaffected -- the cast is a no-op there.
-        audio_embeds = audio_embeds.astype(self._decoder_dtype())
-        h = mx.concatenate(
-            [h[:, :first, :], audio_embeds, h[:, first + pad_span :, :]], axis=1
+        return splice_and_forward(
+            token_ids, audio_embeds, pad_span, caches,
+            audio_token_id=cfg.audio_token_id,
+            embed_tokens=th.model.embed_tokens,
+            decoder=th.model,
+            embeds_as_linear=th.model.embed_tokens.as_linear,
+            lm_head=th.lm_head,
+            tied=cfg.text.tie_word_embeddings,
+            decoder_dtype=self._decoder_dtype(),
         )
-        prefill = caches is None or all(
-            c is None or c.offset == 0 for c in caches
-        )
-        mask = "causal" if prefill and h.shape[1] > 1 else None
-        out = self.thinker.model(input_embeddings=h, cache=caches, mask=mask)
-        if cfg.text.tie_word_embeddings:
-            return self.thinker.model.embed_tokens.as_linear(out)
-        return self.thinker.lm_head(out)

@@ -20,6 +20,7 @@ import mlx.core as mx
 import mlx.nn as mxnn
 
 from .glm_asr import GlmAsrAudioEncoder, GlmAsrAudioConfig, glmasr_audio_config_from_dict
+from .llm.splice import splice_and_forward
 from .llm.kv_cache import KVCache
 from .llm.llama import LlamaForCausalLM
 
@@ -93,33 +94,15 @@ class GlmAsrThinker(mxnn.Module):
         pad_span: int,
         caches: list[KVCache] | None = None,
     ) -> mx.array:
-        """Replace the pad run with tower output; one decoder pass.
-
-        The prefill pass needs the causal mask even when KVCache objects
-        already exist (see Qwen3-ASR thinker: the generic model call only
-        builds a mask when cache is None as a whole).
-        """
-        cfg = self.config
-        match = token_ids == cfg.audio_token_id
-        first = int(mx.argmax(match).item())
-        h = self.language_model.model.embed_tokens(token_ids)
-        # Follow the decoder's own weight dtype, exactly as whisper's
-        # TextDecoder does.  The tower emits float32 embeds (float32 mel in),
-        # so splicing them unchanged locked the whole Llama stack into fp32
-        # activations against bf16/fp16 weights: a mixed-dtype promotion at
-        # every Linear, every step.  A float32 checkpoint is unaffected -- the
-        # cast is a no-op there.
-        audio_embeds = audio_embeds.astype(self._decoder_dtype())
-        h = mx.concatenate(
-            [h[:, :first, :], audio_embeds, h[:, first + pad_span :, :]], axis=1
+        """Replace the pad run with tower output; one decoder pass (shared splice)."""
+        lm = self.language_model
+        return splice_and_forward(
+            token_ids, audio_embeds, pad_span, caches,
+            audio_token_id=self.config.audio_token_id,
+            embed_tokens=lm.model.embed_tokens,
+            decoder=lm.model,
+            embeds_as_linear=lm.model.embed_tokens.as_linear,
+            lm_head=getattr(lm, "lm_head", None),
+            tied=False if hasattr(lm, "lm_head") else True,
+            decoder_dtype=self._decoder_dtype(),
         )
-        prefill = caches is None or all(
-            c is None or c.offset == 0 for c in caches
-        )
-        mask = "causal" if prefill and h.shape[1] > 1 else None
-        out = self.language_model.model(
-            input_embeddings=h, cache=caches, mask=mask
-        )
-        if hasattr(self.language_model, "lm_head"):
-            return self.language_model.lm_head(out)
-        return self.language_model.model.embed_tokens.as_linear(out)

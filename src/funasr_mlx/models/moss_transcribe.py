@@ -18,6 +18,7 @@ import mlx.core as mx
 import mlx.nn as mxnn
 
 from .llm.kv_cache import KVCache
+from .llm.splice import splice_and_forward
 from .llm.qwen3 import Qwen3ForCausalLM
 
 
@@ -174,32 +175,15 @@ class MossTranscribeDiarize(mxnn.Module):
         pad_span: int,
         caches: list[KVCache] | None = None,
     ) -> mx.array:
-        """Replace the audio-token run with adaptor output; one decoder pass.
-
-        Prefill needs the causal mask even with pre-created KVCache objects
-        (same pattern as the Qwen3-ASR / GLM thinkers).
-        """
-        match = token_ids == self.audio_token_id
-        first = int(mx.argmax(match).item())
-        h = self.language_model.model.embed_tokens(token_ids)
-        # Follow the decoder's own weight dtype, exactly as the Qwen3-ASR and
-        # GLM thinkers do (57bf9cb) and as whisper's TextDecoder does.  The
-        # whisper tower + VQAdaptor emit float32 (float32 mel in), so splicing
-        # them unchanged locked all 28 Qwen3 decoder layers into float32
-        # activations against bf16 weights: a mixed-dtype promotion at every
-        # Linear, every step (measured on M4: 80.5 vs 13.8 ms/step, 5.8x).
-        # Both in-repo callers previously cast in the CALLER, which masked this
-        # -- the shipping model path was still promoted.  A float32 checkpoint
-        # is unaffected: the cast is a no-op there.
-        audio_embeds = audio_embeds.astype(self._decoder_dtype())
-        h = mx.concatenate(
-            [h[:, :first, :], audio_embeds, h[:, first + pad_span :, :]], axis=1
+        """Replace the audio-token run with adaptor output (shared splice)."""
+        lm = self.language_model
+        return splice_and_forward(
+            token_ids, audio_embeds, pad_span, caches,
+            audio_token_id=self.audio_token_id,
+            embed_tokens=lm.model.embed_tokens,
+            decoder=lm.model,
+            embeds_as_linear=lm.model.embed_tokens.as_linear,
+            lm_head=getattr(lm, "lm_head", None),
+            tied=lm.args.tie_word_embeddings,
+            decoder_dtype=self._decoder_dtype(),
         )
-        prefill = caches is None or all(
-            c is None or c.offset == 0 for c in caches
-        )
-        mask = "causal" if prefill and h.shape[1] > 1 else None
-        out = self.language_model.model(input_embeddings=h, cache=caches, mask=mask)
-        if self.language_model.args.tie_word_embeddings:
-            return self.language_model.model.embed_tokens.as_linear(out)
-        return self.language_model.lm_head(out)
