@@ -53,9 +53,7 @@ TORCH_ONLY_BUFFERS = ("num_batches_tracked",)
 CAMPPLUS_FRONTEND_DEFAULTS = {"window": "povey", "upsacle_samples": False}
 
 
-# --------------------------------------------------------------------------- #
 # containers that reproduce PyTorch parameter names
-# --------------------------------------------------------------------------- #
 class ModuleStack(mxnn.Module):
     # see docs/port-notes/functions.md :: ModuleStack
 
@@ -160,9 +158,7 @@ class NamedLayerList(mxnn.Module):
         return x
 
 
-# --------------------------------------------------------------------------- #
 # checkpoint plumbing
-# --------------------------------------------------------------------------- #
 #: Layout rule names produced by :func:`flatten_state_dict`.
 IDENTITY_LAYOUT = "identity"
 CONV1D_LAYOUT = "conv1d_torch_out_ink_to_mlx_out_ki"
@@ -188,7 +184,6 @@ def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_L
     if rule != IDENTITY_LAYOUT:
         raise ValueError(f"unknown layout rule {rule!r} for parameter {name!r}")
     return array
-
 
 
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
@@ -343,9 +338,7 @@ def _assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
     setattr(node, parts[-1], array)
 
 
-# --------------------------------------------------------------------------- #
 # initialisation (matches the reference's post-build kaiming pass)
-# --------------------------------------------------------------------------- #
 def kaiming_normal_(weight: mx.array) -> mx.array:
     # see docs/port-notes/functions.md :: kaiming_normal_
     fan_in = 1
@@ -369,9 +362,7 @@ def _reset_conv_linear(module: mxnn.Module) -> None:
                     _reset_conv_linear(item)
 
 
-# --------------------------------------------------------------------------- #
 # normalisation
-# --------------------------------------------------------------------------- #
 class BatchNorm(mxnn.Module):
     """``torch.nn.BatchNorm{1,2}d`` for channels-last MLX activations.
 
@@ -453,9 +444,7 @@ def get_nonlinear(config_str: str, channels: int) -> NamedModuleDict:
     return blocks
 
 
-# --------------------------------------------------------------------------- #
 # statistics pooling
-# --------------------------------------------------------------------------- #
 def statistics_pooling(
     x: mx.array,
     *,
@@ -482,9 +471,7 @@ class StatsPool(mxnn.Module):
         return statistics_pooling(x)
 
 
-# --------------------------------------------------------------------------- #
 # FCM front-end
-# --------------------------------------------------------------------------- #
 class BasicResBlock(mxnn.Module):
     # see docs/port-notes/functions.md :: BasicResBlock
 
@@ -583,9 +570,7 @@ class FCM(mxnn.Module):
         return out
 
 
-# --------------------------------------------------------------------------- #
 # TDNN building blocks (all channels-last NLC, matching MLX Conv1d)
-# --------------------------------------------------------------------------- #
 class TDNNLayer(mxnn.Module):
     # see docs/port-notes/functions.md :: TDNNLayer
 
@@ -794,9 +779,7 @@ class DenseLayer(mxnn.Module):
         return self.nonlinear(x)
 
 
-# --------------------------------------------------------------------------- #
 # configuration
-# --------------------------------------------------------------------------- #
 
 @dataclass
 class CAMPlusConfig:
@@ -843,9 +826,7 @@ def campplus_config_from_dict(
     return CAMPlusConfig.from_dict(data)
 
 
-# --------------------------------------------------------------------------- #
 # model
-# --------------------------------------------------------------------------- #
 class CAMPPlus(mxnn.Module):
     # see docs/port-notes/functions.md :: CAMPPlus
 
@@ -931,7 +912,6 @@ class CAMPPlus(mxnn.Module):
 
         _reset_conv_linear(self)
 
-    # -- checkpoint helpers ------------------------------------------------- #
     def state_dict(self) -> LayoutReport:
         # see docs/port-notes/functions.md :: state_dict
         return flatten_state_dict(self)
@@ -940,7 +920,6 @@ class CAMPPlus(mxnn.Module):
         # see docs/port-notes/functions.md :: load_checkpoint
         return load_strict(self, tensors, **kwargs)
 
-    # -- forward ------------------------------------------------------------ #
     def frame_features(self, x: mx.array) -> mx.array:
         # see docs/port-notes/functions.md :: frame_features
         x = mx.transpose(x, (0, 2, 1))  # (B, T, F) -> (B, F, T)

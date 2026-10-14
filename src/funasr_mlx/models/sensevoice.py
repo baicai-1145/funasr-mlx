@@ -43,9 +43,7 @@ __all__ = [
 ]
 
 
-# --------------------------------------------------------------------------- #
 # metadata dictionaries (verbatim from sense_voice/model.py)
-# --------------------------------------------------------------------------- #
 LID_DICT: dict[str, int] = {
     "auto": 0,
     "zh": 3,
@@ -87,10 +85,7 @@ EVENT_EMO_IDS = (EVENT_ID, EMO_ID)
 NUM_PREFIX_FRAMES = 4
 
 
-
-# --------------------------------------------------------------------------- #
 # configuration
-# --------------------------------------------------------------------------- #
 @dataclass
 class SenseVoiceEncoderSmallConfig:
     # see docs/port-notes/functions.md :: SenseVoiceEncoderSmallConfig
@@ -190,9 +185,7 @@ def sensevoice_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs:
     return SenseVoiceSmallConfig.from_dict(data)
 
 
-# --------------------------------------------------------------------------- #
 # modules
-# --------------------------------------------------------------------------- #
 class CTC(mxnn.Module):
     # see docs/port-notes/functions.md :: CTC
 
@@ -355,7 +348,6 @@ class SenseVoiceSmall(mxnn.Module):
         self.ignore_id = cfg.ignore_id
         self.encoder_output_size = self.encoder.output_size()
 
-    # -- checkpoint helpers ------------------------------------------------- #
     def state_dict(self) -> dict[str, mx.array]:
         # see docs/port-notes/functions.md :: state_dict
         return checkpoint_state_dict(self)
@@ -364,7 +356,6 @@ class SenseVoiceSmall(mxnn.Module):
         # see docs/port-notes/functions.md :: load_checkpoint
         return load_strict(self, tensors, **kwargs)
 
-    # -- forward ------------------------------------------------------------ #
     def _metadata_prefix(
         self,
         batch_size: int,

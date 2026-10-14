@@ -52,9 +52,7 @@ __all__ = [
 INFERENCE_ONLY_PREFIXES: tuple[str, ...] = ("modality_encoders.AUDIO.decoder.",)
 
 
-# --------------------------------------------------------------------------- #
 # small helpers
-# --------------------------------------------------------------------------- #
 
 def _as_int(value: Any, name: str, *, minimum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -93,9 +91,7 @@ def get_alibi(max_positions: int, attention_heads: int) -> mx.array:
     return slopes.reshape(-1, 1, 1) * pos_bias[None, :, :]
 
 
-# --------------------------------------------------------------------------- #
 # containers that preserve PyTorch Sequential / ModuleList key indices
-# --------------------------------------------------------------------------- #
 class OrderedModules(nn.Module):
     # see docs/port-notes/functions.md :: OrderedModules
 
@@ -167,9 +163,7 @@ class Identity(nn.Module):
         return x
 
 
-# --------------------------------------------------------------------------- #
 # norms and activations
-# --------------------------------------------------------------------------- #
 class Fp32LayerNorm(nn.LayerNorm):
     # see docs/port-notes/functions.md :: Fp32LayerNorm
 
@@ -198,9 +192,7 @@ class Mlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
-# --------------------------------------------------------------------------- #
 # ConvFeatureExtractionModel (fairseq v0.12.2 wav2vec2.py:819-895)
-# --------------------------------------------------------------------------- #
 def parse_feature_encoder_spec(spec: str) -> list[tuple[int, int, int]]:
     # see docs/port-notes/functions.md :: parse_feature_encoder_spec
     if not isinstance(spec, str) or not spec.strip():
@@ -334,9 +326,7 @@ class ConvFeatureExtraction(nn.Module):
         return y
 
 
-# --------------------------------------------------------------------------- #
 # relative positional encoder (audio.py:83-106)
-# --------------------------------------------------------------------------- #
 class SamePad(OrderedModules):
     """``fairseq.modules.SamePad`` (non-causal), ``same_pad.py:18-22``.
 
@@ -410,9 +400,7 @@ class PositionalEncoder(OrderedModules):
         return super().__call__(x)
 
 
-# --------------------------------------------------------------------------- #
 # AltBlock / AltAttention (modules.py)
-# --------------------------------------------------------------------------- #
 class AltAttention(nn.Module):
     # see docs/port-notes/functions.md :: AltAttention
 
@@ -515,9 +503,7 @@ class BlockEncoder(nn.Module):
         return x
 
 
-# --------------------------------------------------------------------------- #
 # config
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Emotion2VecConfig:
     # see docs/port-notes/functions.md :: Emotion2VecConfig
@@ -663,9 +649,7 @@ class Emotion2VecConfig:
         return frames
 
 
-# --------------------------------------------------------------------------- #
 # modality encoder
-# --------------------------------------------------------------------------- #
 class AudioEncoder(nn.Module):
 
     def __init__(self, config: Emotion2VecConfig) -> None:
@@ -723,7 +707,6 @@ class AudioEncoder(nn.Module):
         else:
             self.alibi_scale = None
 
-    # -- pieces, kept separate so the tests can drive them individually ----- #
     def _weight_dtype(self) -> mx.Dtype:
         # see docs/port-notes/functions.md :: _weight_dtype
         return self.local_encoder.conv_layers["0"]["0"].weight.dtype
@@ -786,9 +769,7 @@ class AudioEncoder(nn.Module):
         return self.contextualized_features(samples)
 
 
-# --------------------------------------------------------------------------- #
 # top level model
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class EmotionResult:
     # see docs/port-notes/functions.md :: EmotionResult
@@ -846,7 +827,6 @@ class Emotion2VecModel(nn.Module):
             nn.Linear(config.embed_dim, config.vocab_size) if config.vocab_size > 0 else None
         )
 
-    # -- forward paths ------------------------------------------------------ #
     def extract_features(self, samples: mx.array, *, remove_extra_tokens: bool = True) -> mx.array:
         # see docs/port-notes/functions.md :: extract_features
         if samples.ndim != 2:
@@ -912,9 +892,7 @@ class Emotion2VecModel(nn.Module):
         )
 
 
-# --------------------------------------------------------------------------- #
 # checkpoint loading
-# --------------------------------------------------------------------------- #
 def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
     """``{dotted.name: array}`` for every parameter leaf.
 

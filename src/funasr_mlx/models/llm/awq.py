@@ -170,7 +170,6 @@ class AwqBlockQuantizer:
         self.config = config or AwqConfig()
         self._nn = nn
 
-    # -- activation capture -------------------------------------------------- #
     def _submodule(self, key: str):
         module = self.block
         for part in key.split("."):
@@ -219,7 +218,6 @@ class AwqBlockQuantizer:
             self.block.update_modules(orig)
         mx.eval(self.block.parameters())
 
-    # -- scale search --------------------------------------------------------- #
     def _run_block(self, block, x, mask=None):
         # see docs/port-notes/functions.md :: _run_block
         import mlx.core as mx
@@ -278,7 +276,6 @@ class AwqBlockQuantizer:
             mx.eval(best_scales)
             return best_scales
 
-    # -- clip search ---------------------------------------------------------- #
     def search_clip(self, name: str, module, quantize_func) -> Any:
         import mlx.core as mx
 
@@ -323,7 +320,6 @@ class AwqBlockQuantizer:
         mx.eval(clipped)
         return clipped
 
-    # -- folding --------------------------------------------------------------- #
     def apply_scale(self, site: ScaleSite, scales) -> None:
         # see docs/port-notes/functions.md :: apply_scale
         prev = self._submodule(site.prev)
@@ -348,7 +344,6 @@ class AwqBlockQuantizer:
             if hasattr(layer, "input_feat"):
                 layer.input_feat = onp.asarray(layer.input_feat) / scales_np
 
-    # -- orchestration ---------------------------------------------------------- #
     def optimize(self, quantize_func, *, do_clip: bool = True) -> dict:
         import mlx.core as mx
         from mlx.utils import tree_flatten

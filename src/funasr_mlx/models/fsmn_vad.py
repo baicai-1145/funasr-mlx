@@ -82,9 +82,7 @@ def load_state_dict_strict(model, state, *, ignore_prefixes=()):
 DECIBEL_EPSILON = 0.000001
 
 
-# --------------------------------------------------------------------------- #
 # enums (values mirror funasr/models/fsmn_vad_streaming/model.py)
-# --------------------------------------------------------------------------- #
 class FrameState(enum.Enum):
     INVALID = -1
     SIL = 0
@@ -111,14 +109,10 @@ class VadDetectMode(enum.Enum):
     MULTIPLE_UTTERANCE = 1
 
 
-# --------------------------------------------------------------------------- #
 # validation helpers
-# --------------------------------------------------------------------------- #
 
 
-# --------------------------------------------------------------------------- #
 # config
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class FsmnEncoderConfig:
     # see docs/port-notes/functions.md :: FsmnEncoderConfig
@@ -270,9 +264,7 @@ class VadOptions:
         return cls(**_known_fields(cls, config, "model_conf"))
 
 
-# --------------------------------------------------------------------------- #
 # modules
-# --------------------------------------------------------------------------- #
 class ModuleLayerList(nn.Module):
     # see docs/port-notes/functions.md :: ModuleLayerList
 
@@ -454,9 +446,7 @@ class FSMN(nn.Module):
         return scores, caches
 
 
-# --------------------------------------------------------------------------- #
 # decision logic (pure Python; mirrors funasr/models/fsmn_vad_streaming/model.py)
-# --------------------------------------------------------------------------- #
 class WindowDetector:
 
     def __init__(
@@ -596,9 +586,7 @@ class VadStats:
     data_buf_all_init: bool = False
 
 
-# --------------------------------------------------------------------------- #
 # model + driver
-# --------------------------------------------------------------------------- #
 def _require_cache(cache: dict | None) -> dict:
     if not isinstance(cache, dict) or "stats" not in cache:
         raise ValueError("cache must be initialised with FsmnVadModel.init_cache()")
@@ -1211,6 +1199,4 @@ class FsmnVadModel(nn.Module):
         return batches[0]
 
 
-# --------------------------------------------------------------------------- #
 # strict checkpoint loading
-# --------------------------------------------------------------------------- #

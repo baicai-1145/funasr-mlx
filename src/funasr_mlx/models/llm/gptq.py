@@ -29,9 +29,7 @@ _MLX_SCALE_EPS = 1e-7
 _STORAGE_DTYPES = ("bfloat16", "float16", "float32")
 
 
-# --------------------------------------------------------------------------- #
 # the quantizer
-# --------------------------------------------------------------------------- #
 def _round_half_away(values: np.ndarray) -> np.ndarray:
     # see docs/port-notes/functions.md :: _round_half_away
     return np.floor(np.abs(values) + 0.5) * np.sign(values)
@@ -62,7 +60,6 @@ class AffineQuantizer:
             return np.dtype(np.float16)
         return np.dtype(np.float32)
 
-    # -- side tensors ------------------------------------------------------- #
     def cast(self, values: np.ndarray) -> np.ndarray:
         # see docs/port-notes/functions.md :: cast
         values = np.asarray(values, dtype=np.float32)
@@ -142,7 +139,6 @@ class AffineQuantizer:
             return codes[:, 0], reconstruction[:, 0]
         return codes, reconstruction
 
-    # -- packing ------------------------------------------------------------ #
     def pack(self, codes: np.ndarray) -> np.ndarray:
         codes = np.asarray(codes)
         if codes.ndim != 2:
@@ -178,9 +174,7 @@ def unpack_codes(words: np.ndarray, columns: int, *, bits: int = 4) -> np.ndarra
     return AffineQuantizer(bits=bits).unpack(words, columns)
 
 
-# --------------------------------------------------------------------------- #
 # configuration
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class GptqConfig:
     # see docs/port-notes/functions.md :: GptqConfig
@@ -280,9 +274,7 @@ class GptqOutcome:
         }
 
 
-# --------------------------------------------------------------------------- #
 # GPTQ core
-# --------------------------------------------------------------------------- #
 def output_error(weight: np.ndarray, reconstructed: np.ndarray, hessian: np.ndarray) -> float:
     """Total squared layer-output error of a reconstruction, from ``H`` alone.
 
@@ -616,9 +608,7 @@ def _pack_triple(
     return quantizer.pack(codes), scales.astype(dtype), biases.astype(dtype)
 
 
-# --------------------------------------------------------------------------- #
 # Hessian collection
-# --------------------------------------------------------------------------- #
 @dataclass
 class HessianAccumulator:
     """``H = 2 X^T X`` in float32, with a per-language balance guard.

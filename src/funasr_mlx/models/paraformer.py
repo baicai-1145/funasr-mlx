@@ -53,16 +53,13 @@ __all__ = [
 ]
 
 
-
 _POS_ENC_CLASSES = {
     "SinusoidalPositionEncoder": SinusoidalPositionEncoder,
     "PositionalEncoding": PositionalEncoding,
 }
 
 
-# --------------------------------------------------------------------------- #
 # configuration
-# --------------------------------------------------------------------------- #
 @dataclass
 class SANMEncoderConfig:
     # see docs/port-notes/functions.md :: SANMEncoderConfig
@@ -231,9 +228,7 @@ def paraformer_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs:
     return ParaformerConfig.from_dict(data)
 
 
-# --------------------------------------------------------------------------- #
 # CTC head (shared shape with the SenseVoice port, kept local for independence)
-# --------------------------------------------------------------------------- #
 class CTC(mxnn.Module):
     # see docs/port-notes/functions.md :: CTC
 
@@ -260,9 +255,7 @@ class CTC(mxnn.Module):
         return mx.argmax(self(hs_pad), axis=-1)
 
 
-# --------------------------------------------------------------------------- #
 # encoder
-# --------------------------------------------------------------------------- #
 class SANMEncoder(mxnn.Module):
     # see docs/port-notes/functions.md :: SANMEncoder
 
@@ -401,9 +394,7 @@ class SANMEncoder(mxnn.Module):
         return xs_pad, olens
 
 
-# --------------------------------------------------------------------------- #
 # CIF predictor
-# --------------------------------------------------------------------------- #
 CIF_DEVICE = mx.cpu
 """Device the CIF predictor evaluates on.
 
@@ -646,9 +637,7 @@ class CifPredictorV2(mxnn.Module):
         return acoustic_embeds, token_num, alphas, cif_peak
 
 
-# --------------------------------------------------------------------------- #
 # decoder
-# --------------------------------------------------------------------------- #
 class ParaformerSANMDecoder(mxnn.Module):
     # see docs/port-notes/functions.md :: ParaformerSANMDecoder
 
@@ -775,9 +764,7 @@ class ParaformerSANMDecoder(mxnn.Module):
         return hidden, olens
 
 
-# --------------------------------------------------------------------------- #
 # model
-# --------------------------------------------------------------------------- #
 @dataclass
 class ParaformerOutputs:
 
@@ -826,7 +813,6 @@ class Paraformer(mxnn.Module):
         self.predictor = CifPredictorV2(**vars(cfg.predictor_conf))
         self.predictor_bias = cfg.predictor_bias
 
-    # -- checkpoint helpers ------------------------------------------------- #
     def state_dict(self) -> dict[str, mx.array]:
         # see docs/port-notes/functions.md :: state_dict
         return checkpoint_state_dict(self)
@@ -835,7 +821,6 @@ class Paraformer(mxnn.Module):
         # see docs/port-notes/functions.md :: load_checkpoint
         return load_strict(self, tensors, **kwargs)
 
-    # -- forward ------------------------------------------------------------ #
     def encode(self, speech: mx.array, speech_lengths: mx.array) -> tuple[mx.array, mx.array]:
         if speech.ndim == 2:
             speech = mx.expand_dims(speech, 0)

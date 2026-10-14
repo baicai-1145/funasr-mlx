@@ -65,9 +65,7 @@ IDENTITY_LAYOUT = "identity"
 CONV1D_LAYOUT = "conv1d_torch_out_ink_to_mlx_out_ki"
 
 
-# --------------------------------------------------------------------------- #
 # containers / checkpoint plumbing (self-contained by design)
-# --------------------------------------------------------------------------- #
 class ModuleStack(mxnn.Module):
     # see docs/port-notes/functions.md :: ModuleStack
 
@@ -274,9 +272,7 @@ def _assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
     setattr(node, parts[-1], array)
 
 
-# --------------------------------------------------------------------------- #
 # building blocks
-# --------------------------------------------------------------------------- #
 class Linear(mxnn.Linear):
     """``torch.nn.Linear`` alias.
 
@@ -481,9 +477,7 @@ class ResidualAttentionBlock(mxnn.Module):
         return x
 
 
-# --------------------------------------------------------------------------- #
 # dimensions / configuration
-# --------------------------------------------------------------------------- #
 @dataclass
 class ModelDimensions:
     # see docs/port-notes/functions.md :: ModelDimensions
@@ -568,9 +562,7 @@ def whisper_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs: An
     return WhisperConfig(dims=ModelDimensions.from_dict(dims), **kwargs_)
 
 
-# --------------------------------------------------------------------------- #
 # encoder / decoder / model
-# --------------------------------------------------------------------------- #
 class AudioEncoder(mxnn.Module):
     # see docs/port-notes/functions.md :: AudioEncoder
 
@@ -764,7 +756,6 @@ class Whisper(mxnn.Module):
     def __call__(self, mel: mx.array, tokens: mx.array) -> mx.array:
         return self.forward(mel, tokens)
 
-    # -- checkpoint helpers ------------------------------------------------- #
     def state_dict(self) -> LayoutReport:
         return flatten_state_dict(self)
 
@@ -772,9 +763,7 @@ class Whisper(mxnn.Module):
         return load_strict(self, tensors, **kwargs)
 
 
-# --------------------------------------------------------------------------- #
 # front-end helpers (raw mel only -- no tokenizer, no downloads)
-# --------------------------------------------------------------------------- #
 def reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
     # see docs/port-notes/functions.md :: reflect_pad_1d
     if pad <= 0:
@@ -923,9 +912,7 @@ def log_mel_spectrogram(
     return (log_spec + 4.0) / 4.0
 
 
-# --------------------------------------------------------------------------- #
 # raw decoding helpers (token ids only -- no text, no tokenizer)
-# --------------------------------------------------------------------------- #
 @dataclass
 class GreedyDecodeConfig:
     # see docs/port-notes/functions.md :: GreedyDecodeConfig

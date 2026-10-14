@@ -219,9 +219,7 @@ def _dec_layer_forward_chunk(
     return x, memory, fsmn_cache, opt_cache
 
 
-# --------------------------------------------------------------------------- #
 # model
-# --------------------------------------------------------------------------- #
 @dataclass
 class ParaformerStreamingConfig(ParaformerConfig):
 
@@ -249,7 +247,6 @@ class ParaformerStreaming(mxnn.Module):
         self._encoder_look_back = int(cfg.encoder_chunk_look_back)
         self._decoder_look_back = int(cfg.decoder_chunk_look_back)
 
-    # -- streaming protocol ------------------------------------------------ #
     def init_cache(self, enc_output_size: int = 512, feats_dims: int = 560) -> dict:
         # see docs/port-notes/functions.md :: init_cache
         chunk_size = self._chunk_size

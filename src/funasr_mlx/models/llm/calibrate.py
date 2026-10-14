@@ -82,7 +82,6 @@ class HeadActivationCollector:
     def __post_init__(self) -> None:
         self.accumulator = HessianAccumulator(columns=self.target.hidden_size)
 
-    # -- hook management ---------------------------------------------------- #
     def install(self) -> None:
         if self._original is not None:
             raise RuntimeError("The collector is already installed")
@@ -137,7 +136,6 @@ class HeadActivationCollector:
     def __exit__(self, *exc_info) -> None:
         self.uninstall()
 
-    # -- capture ------------------------------------------------------------ #
     def _capture(self, x: Any) -> None:
         import mlx.core as mx
 
@@ -175,7 +173,6 @@ class HeadActivationCollector:
             run()
         return self.flush(language)
 
-    # -- results ------------------------------------------------------------ #
     def hessian(self, *, balance: bool = True, cap_fraction: float | None = None) -> np.ndarray:
         return self.accumulator.hessian(balance=balance, cap_fraction=cap_fraction)
 

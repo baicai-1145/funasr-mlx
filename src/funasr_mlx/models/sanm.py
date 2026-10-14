@@ -52,9 +52,7 @@ __all__ = [
 ]
 
 
-# --------------------------------------------------------------------------- #
 # masking / padding helpers
-# --------------------------------------------------------------------------- #
 def sequence_mask(lengths: Any, maxlen: int | None = None, dtype: Any = mx.float32) -> mx.array:
     # see docs/port-notes/functions.md :: sequence_mask
     lens = mx.asarray(lengths)
@@ -93,9 +91,7 @@ def decimate_mask(x_mask: mx.array, stride: int = 2, end_offset: int = 2) -> mx.
     return mx.take(x_mask, mx.array(indices, dtype=mx.int32), axis=-1)
 
 
-# --------------------------------------------------------------------------- #
 # checkpoint plumbing
-# --------------------------------------------------------------------------- #
 IDENTITY_LAYOUT = "identity"
 CONV1D_LAYOUT = "conv1d_torch_out_ink"
 CONV2D_LAYOUT = "conv2d_torch_out_ink"
@@ -124,7 +120,6 @@ class CheckpointKeyError(KeyError):
     The message always lists the offending keys so a failed load is never
     silently downgraded to a partial load.
     """
-
 
 
 def _module_layout_rule(module: mxnn.Module) -> str:
@@ -269,9 +264,7 @@ def load_strict(
     return loaded
 
 
-# --------------------------------------------------------------------------- #
 # containers
-# --------------------------------------------------------------------------- #
 class ModuleStack(mxnn.Module):
     """A stack of sibling modules with PyTorch-compatible parameter names.
 
@@ -316,9 +309,7 @@ def repeat(num_blocks: int, factory: Callable[[int], mxnn.Module]) -> ModuleStac
     return ModuleStack([factory(index) for index in range(num_blocks)])
 
 
-# --------------------------------------------------------------------------- #
 # normalisation
-# --------------------------------------------------------------------------- #
 class LayerNorm(mxnn.LayerNorm):
     # see docs/port-notes/functions.md :: LayerNorm
 
@@ -339,9 +330,7 @@ class Float32LayerNorm(mxnn.LayerNorm):
         return super().__call__(x.astype(mx.float32)).astype(out_dtype)
 
 
-# --------------------------------------------------------------------------- #
 # positional encodings
-# --------------------------------------------------------------------------- #
 class PositionalEncoding(mxnn.Module):
     """``funasr.models.transformer.embedding.PositionalEncoding``.
 
@@ -411,9 +400,7 @@ class SinusoidalPositionEncoder(mxnn.Module):
         return x + position_encoding
 
 
-# --------------------------------------------------------------------------- #
 # feed forward
-# --------------------------------------------------------------------------- #
 class PositionwiseFeedForward(mxnn.Module):
     # see docs/port-notes/functions.md :: PositionwiseFeedForward
 
@@ -445,9 +432,7 @@ class PositionwiseFeedForwardDecoderSANM(mxnn.Module):
         return self.w_2(self.norm(mx.maximum(self.w_1(x), 0.0)))
 
 
-# --------------------------------------------------------------------------- #
 # attention
-# --------------------------------------------------------------------------- #
 class MultiHeadedAttentionSANM(mxnn.Module):
     # see docs/port-notes/functions.md :: MultiHeadedAttentionSANM
 
@@ -649,9 +634,7 @@ class MultiHeadedAttentionCrossAtt(mxnn.Module):
         return self.forward_attention(v_h, scores, memory_mask, ret_attn)
 
 
-# --------------------------------------------------------------------------- #
 # encoder / decoder layers
-# --------------------------------------------------------------------------- #
 class EncoderLayerSANM(mxnn.Module):
     # see docs/port-notes/functions.md :: EncoderLayerSANM
 
@@ -751,9 +734,7 @@ class DecoderLayerSANM(mxnn.Module):
         return x, tgt_mask, memory, memory_mask
 
 
-# --------------------------------------------------------------------------- #
 # subsampling front-ends
-# --------------------------------------------------------------------------- #
 class TooShortUttError(Exception):
     # see docs/port-notes/functions.md :: TooShortUttError
 

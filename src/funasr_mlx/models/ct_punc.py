@@ -87,14 +87,10 @@ FUNASR_LAYER_NORM_EPS = 1e-12
 CJK_RANGE = ("\u4e00", "\u9fa5")
 
 
-# --------------------------------------------------------------------------- #
 # validation helpers
-# --------------------------------------------------------------------------- #
 
 
-# --------------------------------------------------------------------------- #
 # config
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class SanmEncoderConfig:
     # see docs/port-notes/functions.md :: SanmEncoderConfig
@@ -284,9 +280,7 @@ class CtPuncConfig:
         return cls(encoder=SanmEncoderConfig.from_dict(encoder_conf), **payload)
 
 
-# --------------------------------------------------------------------------- #
 # vocabulary
-# --------------------------------------------------------------------------- #
 class CharVocab:
     # see docs/port-notes/functions.md :: CharVocab
 
@@ -337,9 +331,7 @@ class CharVocab:
         return [self.token2id.get(token, unk) for token in tokens]
 
 
-# --------------------------------------------------------------------------- #
 # tensor helpers
-# --------------------------------------------------------------------------- #
 def is_first_byte_ascii(token: str) -> bool:
     # see docs/port-notes/functions.md :: is_first_byte_ascii
     if not token:
@@ -377,9 +369,7 @@ def sinusoidal_position_encoding(x: mx.array) -> mx.array:
     return x + encoding.astype(x.dtype)
 
 
-# --------------------------------------------------------------------------- #
 # modules
-# --------------------------------------------------------------------------- #
 class ModuleLayerList(nn.Module):
     # see docs/port-notes/functions.md :: ModuleLayerList
 
@@ -622,16 +612,10 @@ class CtPuncModel(nn.Module):
         return [ids[i * t : (i + 1) * t] for i in range(b)]
 
 
-# --------------------------------------------------------------------------- #
 # strict checkpoint loading
-# --------------------------------------------------------------------------- #
 
 
-
-
-# --------------------------------------------------------------------------- #
 # text post-processing (pure Python, mirrors funasr/models/ct_transformer)
-# --------------------------------------------------------------------------- #
 def split_words(text: str) -> list[str]:
     # see docs/port-notes/functions.md :: split_words
     words: list[str] = []
