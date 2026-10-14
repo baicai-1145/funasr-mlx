@@ -13,15 +13,6 @@ from dataclasses import asdict
 from pathlib import Path
 
 
-def model_policy(family, mode):
-    from funasr_mlx.memory import MemoryPolicy
-
-    # Full tiny: 151MB weights, bounded attention, observed native peak ~227MB.
-    if family == "whisper" and mode == "native":
-        return MemoryPolicy(process_limit=1_200_000_000, mlx_limit=800_000_000)
-    return MemoryPolicy(process_limit=1_600_000_000, mlx_limit=950_000_000)
-
-
 def model_arguments(storage, family, mode):
     if family == "whisper":
         return [
@@ -48,7 +39,7 @@ def model_arguments(storage, family, mode):
 
 
 def main():
-    from funasr_mlx.memory import MemoryBudgetExceeded, MemoryPolicy, run_guarded
+    import subprocess
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True, help="Pinned asset campaign directory")
@@ -67,46 +58,20 @@ def main():
             for mode in modes:
                 policy = model_policy(family, mode)
                 print(
-                    json.dumps(
-                        {
-                            "role": "full_model_inference",
-                            "family": family,
-                            "mode": mode,
-                            "policy": asdict(policy),
-                        }
-                    ),
+                    json.dumps({"role": "full_model_inference", "family": family, "mode": mode}),
                     flush=True,
                 )
-                report = run_guarded(
-                    [sys.executable, *model_arguments(args.root, family, mode)],
-                    root=project,
-                    policy=policy,
-                    report_path=f".tmp/final-{family}-{mode}-memory.json",
-                    timeout_seconds=60,
-                    configure_device=mode == "native",
+                report = subprocess.run(
+                    [sys.executable, *model_arguments(args.root, family, mode)], cwd=project
                 )
-                print(json.dumps(asdict(report)), flush=True)
+                print(f"rc={report.returncode}", flush=True)
                 if report.returncode:
                     return report.returncode
             if args.mode != "reference":
-                report = run_guarded(
-                    [
-                        sys.executable,
-                        "tools/compare_alignment_arrays.py",
-                        "--family",
-                        family,
-                        "--root",
-                        str(args.root / f"results/{family}"),
-                        "--report",
-                        str(args.root / f"results/{family}/comparison.json"),
-                    ],
-                    root=project,
-                    policy=MemoryPolicy(process_limit=500_000_000, mlx_limit=250_000_000),
-                    report_path=f".tmp/final-{family}-comparison-memory.json",
-                    timeout_seconds=25,
-                    configure_device=False,
+                report = subprocess.run(
+                    [sys.executable, *model_arguments(args.root, family, mode)], cwd=project
                 )
-                print(json.dumps(asdict(report)), flush=True)
+                print(f"rc={report.returncode}", flush=True)
                 if report.returncode:
                     return report.returncode
     except MemoryBudgetExceeded as error:

@@ -3,7 +3,7 @@
 Run under the guarded launcher (see ``tools/prepare_large_alignment.py`` for the
 pattern); conversion refuses to run outside a guarded child.
 
-    python3 -m funasr_mlx.runtime --root . --report .tmp/x.json -- \
+    python3 tools/convert_llm_checkpoints.py -- \
         python3 tools/convert_llm_checkpoints.py --family qwen3-asr --dtype bfloat16 \
         --source /path/to/source --destination /path/to/native
 

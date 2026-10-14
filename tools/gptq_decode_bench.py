@@ -297,10 +297,7 @@ def main() -> int:
     parser.add_argument("--languages", default="zh,en,ja,ko,es,fr,de,ru,th,vi")
     args = parser.parse_args()
 
-    from funasr_mlx.memory import guarded_child_active
 
-    if not guarded_child_active():
-        raise RuntimeError("The decode benchmark must run under the memory guard")
 
     family = MODEL_FAMILY[args.family]
     languages = [part for part in args.languages.split(",") if part]

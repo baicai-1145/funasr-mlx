@@ -19,7 +19,7 @@ the conversion is what has to be repeatable):
 
 Both phases must run under the guarded launcher.
 
-    python3 -m funasr_mlx.runtime --root . --report .tmp/x.json --timeout 3600 \
+    python3 tools/gptq_calibrate.py \
         -- python3 tools/gptq_calibrate.py --family qwen3-asr-0.6b --phase calibrate
 
 The per-family prefill builders mirror the ones task-9 used for its paired A/B
@@ -360,12 +360,9 @@ def parse_language_weights(spec: str | None) -> dict[str, float]:
 
 
 def calibrate(args) -> int:
-    from funasr_mlx.memory import guarded_child_active
     from funasr_mlx.models.llm.calibrate import HeadActivationCollector, HeadTarget
     from funasr_mlx.pipeline import load_model
 
-    if not guarded_child_active():
-        raise RuntimeError("Calibration must run under the memory guard")
 
     native_dir, family, head_path, key = FAMILIES[args.family]
     source = args.native_root / native_dir
@@ -435,12 +432,9 @@ def np_all_finite(array) -> bool:
 
 def convert(args) -> int:
     from funasr_mlx.checkpoints import GptqWeight, convert_checkpoint
-    from funasr_mlx.memory import guarded_child_active
     from funasr_mlx.models.llm.gptq import HessianAccumulator, GptqConfig
     from funasr_mlx.models.llm.quant import QuantizationSpec
 
-    if not guarded_child_active():
-        raise RuntimeError("Conversion must run under the memory guard")
 
     native_dir, family, head_path, _key = FAMILIES[args.family]
     source = args.source_dir if args.source_dir is not None else args.native_root / native_dir

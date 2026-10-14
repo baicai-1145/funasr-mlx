@@ -8,7 +8,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .memory import MemoryBudgetExceeded
 
 def download_model(repo, *, variant=None, dest=".", owner=None):
     # see docs/port-notes/functions.md :: download_model

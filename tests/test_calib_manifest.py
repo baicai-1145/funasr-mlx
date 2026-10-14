@@ -354,9 +354,6 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
     monkeypatch.setattr(
         "funasr_mlx.models.llm.gptq.HessianAccumulator.load", FakeAccumulator.load
     )
-    # The tool imports it inside the function, so patch it on the module the
-    # tool imports FROM (funasr_mlx.memory), which is what the local import sees.
-    monkeypatch.setattr("funasr_mlx.memory.guarded_child_active", lambda: True)
 
     class Args:
         family = "qwen3-asr-0.6b"

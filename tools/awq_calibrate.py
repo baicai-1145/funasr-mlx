@@ -20,7 +20,7 @@ weights are kept.
 
 Usage (inside the guard)::
 
-    python3 -m funasr_mlx.runtime --root . --report .tmp/x.json --timeout 3600 \\
+    python3 tools/awq_calibrate.py \\
       -- python3 tools/awq_calibrate.py --family qwen3-asr-0.6b
 """
 
@@ -45,12 +45,9 @@ from tools.gptq_calibrate import (  # noqa: E402
 
 def calibrate(args) -> int:
     import mlx.core as mx
-    from funasr_mlx.memory import guarded_child_active
     from funasr_mlx.models.llm.awq import AwqBlockQuantizer, AwqConfig
     from funasr_mlx.pipeline import load_model
 
-    if not guarded_child_active():
-        raise RuntimeError("AWQ calibration must run under the memory guard")
 
     native_dir, family, head_path, key = FAMILIES[args.family]
     source = args.native_root / native_dir

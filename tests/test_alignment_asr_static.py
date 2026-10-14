@@ -157,7 +157,7 @@ def test_native_run_uses_the_shipping_pipeline_loader():
     assert "load_model" in src
     # A missing guard, a missing artefact and a float16 checkpoint are all
     # refused loudly rather than silently producing numbers to compare.
-    for token in ("guarded_child_active", "native_checkpoint", "float32"):
+    for token in ("native_checkpoint", "float32"):
         assert token in src, token
     sample = _source("_run_native_sample")
     # The CIF embeddings are the decoder INPUT and are never promoted to being

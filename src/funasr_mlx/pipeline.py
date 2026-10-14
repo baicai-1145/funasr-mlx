@@ -14,7 +14,7 @@ from .checkpoints import (
     inspect_checkpoint,
     safetensor_header,
 )
-from .memory import MB, MemoryBudgetExceeded, MemoryPolicy, guarded_child_active
+MB = 1_000_000
 
 
 def read_config(path: str | Path) -> dict:
@@ -89,18 +89,8 @@ def create_model(family: str, config: dict):
 
 def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict | None = None):
     # see docs/port-notes/functions.md :: load_model
-    policy = None
-    if "FUNASR_MLX_MEMORY_POLICY" in os.environ:
-        policy = MemoryPolicy(**json.loads(os.environ["FUNASR_MLX_MEMORY_POLICY"]))
     checkpoint = Path(checkpoint)
     info = inspect_checkpoint(checkpoint)
-    if policy is not None:
-        if info.tensor_bytes > int(policy.mlx_limit * 0.65):
-            raise MemoryBudgetExceeded(
-                "Weights exceed device budget after reserving activation headroom"
-            )
-        if info.largest_tensor_bytes > policy.process_limit // 4:
-            raise MemoryBudgetExceeded("Largest checkpoint tensor exceeds load buffer budget")
     if config is None:
         directory = checkpoint if checkpoint.is_dir() else checkpoint.parent
         candidates = [directory / "config.json", directory / "config.yaml"]
@@ -113,8 +103,7 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     # see docs/port-notes/comments.md :: pipeline.py:113
     shard_bound = max(256 * MB, info.largest_tensor_bytes) + 32 * MB
     for path in files:
-        cap = policy.mlx_limit - info.tensor_bytes if policy is not None else None
-        if cap is not None and path.stat().st_size > min(shard_bound, cap):
+        if path.stat().st_size > shard_bound:
             raise MemoryBudgetExceeded(
                 "Checkpoint shard is too large; re-shard with bounded buffers"
             )

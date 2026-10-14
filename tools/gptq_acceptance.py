@@ -390,10 +390,7 @@ def main() -> int:
     parser.add_argument("--per-language", type=int, default=8)
     args = parser.parse_args()
 
-    from funasr_mlx.memory import guarded_child_active
 
-    if not guarded_child_active():
-        raise RuntimeError("Acceptance must run under the memory guard")
 
     languages = [part for part in args.languages.split(",") if part]
     model_family = MODEL_FAMILY[args.family]

@@ -13,10 +13,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
-    from funasr_mlx.memory import guarded_child_active
 
-    if not guarded_child_active():
-        raise RuntimeError("Weight inspection requires the guarded launcher")
     import torch
 
     catalog = json.loads((args.root / "catalog.json").read_text())

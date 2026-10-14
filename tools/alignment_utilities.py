@@ -116,20 +116,6 @@ FAMILIES = ("fsmn-vad", "ct-punc", "campplus", "emotion2vec")
 # --------------------------------------------------------------------------- #
 # private output helpers
 # --------------------------------------------------------------------------- #
-def guarded_alignment(function):
-    """Require authenticated supervision before importing numerical backends."""
-
-    @wraps(function)
-    def run(*args, **kwargs):
-        from funasr_mlx.memory import guarded_child_active
-
-        if not guarded_child_active():
-            raise RuntimeError("Alignment execution requires the guarded launcher")
-        return function(*args, **kwargs)
-
-    return run
-
-
 def _write_npz(out_dir: Path, key: str, mode: str, arrays: Mapping[str, Any]) -> Path:
     import numpy as np
 
@@ -241,7 +227,6 @@ def _check_audio(entry: Mapping[str, Any], samples: Any) -> None:
 # --------------------------------------------------------------------------- #
 # fsmn-vad
 # --------------------------------------------------------------------------- #
-@guarded_alignment
 def run_fsmn_vad_reference(
     entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
 ) -> None:
@@ -375,7 +360,6 @@ def _required_attr(obj: Any, name: str) -> Any:
     return getattr(obj, name)
 
 
-@guarded_alignment
 def run_fsmn_vad_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path) -> None:
     """Native ``funasr_mlx.models.fsmn_vad.FsmnVadModel`` forward.
 
@@ -472,7 +456,6 @@ def _vad_input_dim(config: Any) -> int:
 # --------------------------------------------------------------------------- #
 # ct-punc
 # --------------------------------------------------------------------------- #
-@guarded_alignment
 def run_ct_punc_reference(
     entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
 ) -> None:
@@ -537,7 +520,6 @@ def run_ct_punc_reference(
     )
 
 
-@guarded_alignment
 def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path) -> None:
     """Native ``funasr_mlx.models.ct_punc.CtPuncModel.punc_forward``."""
     import mlx.core as mx
@@ -591,7 +573,6 @@ def run_ct_punc_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out_
 # --------------------------------------------------------------------------- #
 # campplus
 # --------------------------------------------------------------------------- #
-@guarded_alignment
 def run_campplus_reference(
     entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
 ) -> None:
@@ -679,7 +660,6 @@ def _cosine(first: Any, second: Any) -> float:
     return float((a * b).sum() / denominator)
 
 
-@guarded_alignment
 def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path) -> None:
     """Native ``CAMPPlus.embed`` with the reference's mean-subtracted features."""
     import mlx.core as mx
@@ -734,7 +714,6 @@ def run_campplus_native(entry: Mapping[str, Any], assets: Mapping[str, Any], out
 # --------------------------------------------------------------------------- #
 # emotion2vec
 # --------------------------------------------------------------------------- #
-@guarded_alignment
 def run_emotion2vec_reference(
     entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
 ) -> None:
@@ -1057,7 +1036,6 @@ def _emotion_consistency_checks(raw: Mapping[str, Any], report: dict[str, Any]) 
     report["consistency"] = checks
 
 
-@guarded_alignment
 def run_emotion2vec_native(
     entry: Mapping[str, Any], assets: Mapping[str, Any], out_dir: Path
 ) -> None:

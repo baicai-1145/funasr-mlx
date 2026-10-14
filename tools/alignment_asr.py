@@ -1726,15 +1726,8 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
     from funasr_mlx import pipeline
     from funasr_mlx.checkpoints import checkpoint_files, safetensor_header
     from funasr_mlx.frontend import FbankConfig, WavFrontend
-    from funasr_mlx.memory import guarded_child_active
     from funasr_mlx.models.sanm import flatten_state_dict
 
-    if not guarded_child_active():
-        raise AlignmentError(
-            "the native backend must run inside the memory guard: "
-            "python -m funasr_mlx.runtime -- <repo>/tools/alignment_asr.py run "
-            "--backend native --spec <spec.json> --output-root <dir>"
-        )
 
     variant = spec["variant"]
     native_checkpoint = variant.get("native_checkpoint")

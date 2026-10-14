@@ -175,22 +175,6 @@ for chunk in mic:                 # numpy float32 @16k, any sizes
 final = stream.close()            # == offline transcription
 ```
 
-## Memory guard (optional, dev-machine tool)
-
-`funasr_mlx.memory.run_guarded` is a host-protection wrapper developed on a
-16GB MacBook Air: it bounds per-process RSS and wired-memory headroom while
-big checkpoints load. It is NOT a project requirement:
-
-* Library callers (`funasr_mlx.api`, `pipeline.load_model`) load and run
-  in-process by default, with no guard and no policy environment.
-* `funasr-mlx` CLI wraps execution in the guard by default
-  (`--memory-gb`); pass `--no-guard` (or set `FUNASR_MLX_NO_GUARD=1`)
-  to run in-process with library semantics.
-* The 12GB `HARD_CEILING` is a host default, not a law: override with
-  `MemoryPolicy(hard_ceiling=...)` on bigger machines.
-* Budget checks (weights-vs-limit, shard caps) apply only when a policy is
-  present in the environment.
-
 
 ## Development
 

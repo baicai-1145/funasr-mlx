@@ -10,18 +10,11 @@ from pathlib import Path
 import sys
 
 from .checkpoints import SUPPORTED_MODELS, info_json, inspect_checkpoint
-from .memory import GB, MB, MemoryPolicy, guarded_child_active, run_guarded
 
 
 def _parser():
     parser = argparse.ArgumentParser(prog="funasr-mlx")
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--memory-gb", type=int, choices=[1, 2, 3, 4], default=2)
-    parser.add_argument(
-        "--no-guard",
-        action="store_true",
-        help="Run in-process without the memory guard wrapper (library semantics)",
-    )
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser("inspect", help="Inspect safetensors without loading weights")
     inspect.add_argument("checkpoint", type=Path)
@@ -259,24 +252,8 @@ def main(argv=None):
     if args.command == "inspect":
         print(info_json(inspect_checkpoint(args.checkpoint)))
         return 0
-    if "FUNASR_MLX_MEMORY_POLICY" in os.environ:
-        if not guarded_child_active():
-            raise RuntimeError("Memory-policy environment is not an authenticated guarded child")
-        _execute(args)
-        return 0
-    if args.no_guard or os.environ.get("FUNASR_MLX_NO_GUARD") == "1":
-        _execute(args)
-        return 0
-    policy = MemoryPolicy(process_limit=args.memory_gb * GB, mlx_limit=args.memory_gb * 625 * MB)
-    report = run_guarded(
-        [sys.executable, "-m", "funasr_mlx.cli", *arguments],
-        root=args.root,
-        policy=policy,
-        report_path=".tmp/last-job-memory.json",
-        configure_device=args.command != "convert",
-    )
-    print(json.dumps({"memory": asdict(report)}), file=sys.stderr)
-    return report.returncode
+    _execute(args)
+    return 0
 
 
 if __name__ == "__main__":

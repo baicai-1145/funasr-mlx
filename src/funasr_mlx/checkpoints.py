@@ -397,8 +397,6 @@ def convert_checkpoint(
 
     Full notes: docs/port-notes/functions.md :: convert_checkpoint
     """
-    from .memory import MemoryPolicy
-
     if model not in SUPPORTED_MODELS or dtype not in SUPPORTED_DTYPES:
         raise ValueError("Unsupported model or output precision")
     if dtype == "bfloat16" and model not in BFLOAT16_FAMILIES:
@@ -427,11 +425,6 @@ def convert_checkpoint(
 
     import os
 
-    policy = (
-        MemoryPolicy(**json.loads(os.environ["FUNASR_MLX_MEMORY_POLICY"]))
-        if "FUNASR_MLX_MEMORY_POLICY" in os.environ
-        else None
-    )
     if is_safetensors:
         return _convert_safetensors_source(
             source,
@@ -452,7 +445,6 @@ def convert_checkpoint(
     if not is_zip:
         if not allow_legacy:
             raise ValueError("Legacy checkpoint requires explicit allow_legacy admission")
-        if policy is not None and source.stat().st_size + 500_000_000 > policy.process_limit:
             raise ValueError("Legacy checkpoint plus reader headroom exceeds job budget")
     state = torch.load(source, map_location="cpu", weights_only=True, mmap=is_zip)
     if isinstance(state, dict) and "model_state_dict" in state:

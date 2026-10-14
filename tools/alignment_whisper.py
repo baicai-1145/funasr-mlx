@@ -87,10 +87,7 @@ def save_case(destination, entry, mode, arrays, metadata):
 
 
 def run_reference(root, entries, destination):
-    from funasr_mlx.memory import guarded_child_active
 
-    if not guarded_child_active():
-        raise RuntimeError("Whisper reference execution requires the guarded launcher")
     import numpy as np
     import torch
     import whisper

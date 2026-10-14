@@ -301,10 +301,7 @@ def main():
     parser.add_argument("--from-catalog", type=Path)
     parser.add_argument("--group", choices=["all", "models", "datasets"], default="all")
     args = parser.parse_args()
-    from funasr_mlx.memory import guarded_child_active
 
-    if not guarded_child_active():
-        raise RuntimeError("Asset acquisition requires the guarded launcher")
     args.root.mkdir(parents=True, exist_ok=True)
     catalog_path = args.root / "catalog.json"
     previous = json.loads(catalog_path.read_text()) if catalog_path.is_file() else None

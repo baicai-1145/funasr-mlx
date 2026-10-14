@@ -41,14 +41,6 @@ def test_module_imports_no_ml_or_torch():
     subprocess.run([sys.executable, "-I", "-c", program], check=True, timeout=10)
 
 
-@pytest.mark.parametrize("family", ["fsmn-vad", "ct-punc", "campplus", "emotion2vec"])
-def test_reference_rejects_execution_without_guard_before_backend_import(family, monkeypatch):
-    from funasr_mlx import memory
-
-    monkeypatch.setattr(memory, "guarded_child_active", lambda: False)
-    with pytest.raises(RuntimeError, match="guarded launcher"):
-        au._DISPATCH[(family, "reference")]({}, {}, Path("unused"))
-
 
 def test_every_family_has_both_sides():
     assert set(au.FAMILIES) == {"fsmn-vad", "ct-punc", "campplus", "emotion2vec"}
