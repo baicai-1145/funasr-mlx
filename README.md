@@ -100,6 +100,23 @@ Per-family scope, checkpoint sizes, measured speedups and peak-memory drops are
 in `.tmp/t9/RESULTS.md`; the scheme and its failure modes are in
 `.tmp/t9/LEDGER.md`.
 
+## Downloading published checkpoints
+
+No hub dependencies (stdlib HTTPS only; HF and MS mirrors with per-file
+fallback; ~5-6 MB/s ceiling is the hosts' per-IP throttle, not client):
+
+```sh
+funasr-mlx download qwen3-asr-0.6b-mlx --variant w4a16 --dest ./models
+# classic models omit --variant:
+funasr-mlx download sensevoice-mlx-fp16 --dest ./models
+```
+
+Then transcribe directly from the download:
+
+```sh
+funasr-mlx transcribe ./models/qwen3-asr-0.6b-mlx/w4a16 --audio recording.wav
+```
+
 ## LLM-ASR transcription
 
 Three interfaces share one resident-worker protocol (KV cache reset-reuse

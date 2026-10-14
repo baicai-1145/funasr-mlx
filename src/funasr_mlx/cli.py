@@ -63,6 +63,15 @@ def _parser():
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--max-tokens", type=int, default=96)
+    download_cmd = commands.add_parser(
+        "download",
+        help="Download a published native checkpoint from HF/MS (stdlib only, no hub deps)",
+    )
+    download_cmd.add_argument("repo", help="Repository name, e.g. qwen3-asr-0.6b-mlx")
+    download_cmd.add_argument("--variant", default=None,
+                              help="For LLM repos: fp16 or w4a16 (default: both)")
+    download_cmd.add_argument("--dest", type=Path, default=Path("."))
+    download_cmd.add_argument("--force", action="store_true", help="Re-download existing files")
     return parser
 
 
@@ -169,6 +178,11 @@ def _infer(args):
 
 
 def _execute(args):
+    if args.command == "download":
+        from .download import download
+
+        download(args.repo, variant=args.variant, dest=args.dest, skip_existing=not args.force)
+        return
     if args.command == "transcribe":
         from .llm_asr import LlmAsrTranscriber, resolve_family
 
