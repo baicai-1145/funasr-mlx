@@ -70,6 +70,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from ._strict_load import _require
 from mlx.utils import tree_flatten, tree_unflatten
 
 __all__ = [
@@ -110,10 +112,6 @@ INFERENCE_ONLY_PREFIXES: tuple[str, ...] = ("modality_encoders.AUDIO.decoder.",)
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
-def _require(condition: bool, message: str) -> None:
-    if not condition:
-        raise ValueError(message)
-
 
 def _as_int(value: Any, name: str, *, minimum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
