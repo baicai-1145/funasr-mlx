@@ -17,13 +17,7 @@ __all__ = ["HeadActivationCollector", "HeadTarget"]
 
 @dataclass
 class HeadTarget:
-    """Which module in a live model is the LM head, and how it is called.
-
-    ``kind`` is ``"tied"`` when the head is the token embedding used through
-    ``as_linear`` (qwen3 / moss) and ``"linear"`` when the checkpoint has a
-    separate ``lm_head`` (glm).  ``hidden_size`` is the head's *input*
-    dimension -- the size of the Hessian.
-    """
+    # see docs/port-notes/functions.md :: HeadTarget
 
     module: Any
     kind: str
@@ -38,11 +32,7 @@ class HeadTarget:
 
     @classmethod
     def resolve(cls, model: Any, *, head_path: str) -> "HeadTarget":
-        """Locate the head on ``model`` and describe how it is called.
-
-        ``head_path`` is a dotted path to the head module (e.g.
-        ``thinker.model.embed_tokens`` or ``language_model.lm_head``).
-        """
+        # see docs/port-notes/functions.md :: resolve
         import mlx.nn as nn
 
         module: Any = model

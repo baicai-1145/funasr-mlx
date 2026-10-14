@@ -14,12 +14,7 @@ import numpy as np
 
 @dataclass
 class StreamEvent:
-    """One pseudo-stream block result.
-
-    ``text`` is the full current best-effort transcription (stable prefix +
-    rolling tail). ``is_final`` marks the closing event, whose text equals
-    offline transcription exactly.
-    """
+    # see docs/port-notes/functions.md :: StreamEvent
 
     text: str
     audio_seconds: float
@@ -81,13 +76,7 @@ class PseudoStream:
 
 
 def classic_transcriber(model, config: dict, *, family: str, tokens=None, cmvn=None):
-    """Build a ``samples -> text`` callable for classic (non-LLM) families.
-
-    Covers sensevoice / paraformer (greedy CTC/CIF). ``cmvn`` is REQUIRED
-    for sensevoice-family checkpoints (``am.mvn``; found next to the source
-    configuration) -- without it the fbank distribution is shifted and the
-    encoder collapses to all-blanks (verified: argmax == 0 everywhere).
-    """
+    # see docs/port-notes/functions.md :: classic_transcriber
     import mlx.core as mx
 
     from .frontend import FbankConfig, WavFrontend
@@ -113,5 +102,5 @@ def classic_transcriber(model, config: dict, *, family: str, tokens=None, cmvn=N
 
 
 def llm_transcriber(transcriber):
-    """Adapt an ``LlmAsrTranscriber`` into a ``samples -> text`` callable."""
+    # see docs/port-notes/functions.md :: llm_transcriber
     return transcriber.transcribe_samples

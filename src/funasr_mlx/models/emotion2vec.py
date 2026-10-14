@@ -86,11 +86,7 @@ def get_slopes(n: int) -> list[float]:
 
 
 def get_alibi(max_positions: int, attention_heads: int) -> mx.array:
-    """``get_alibi(max_positions, attention_heads, dims=1)``.
-
-    1-D manhattan ALiBi: ``slopes[h] * -|i - j|`` with shape
-    ``(heads, max_positions, max_positions)``.
-    """
+    # see docs/port-notes/functions.md :: get_alibi
     slopes = mx.array(get_slopes(attention_heads), dtype=mx.float32)
     pos = mx.arange(max_positions, dtype=mx.float32)
     pos_bias = -mx.abs(pos[:, None] - pos[None, :])  # (T, T)
@@ -101,13 +97,7 @@ def get_alibi(max_positions: int, attention_heads: int) -> mx.array:
 # containers that preserve PyTorch Sequential / ModuleList key indices
 # --------------------------------------------------------------------------- #
 class OrderedModules(nn.Module):
-    """An ``nn.Sequential`` whose children keep their integer index in the key.
-
-    ``nn.Module`` is a dict subclass and ``tree_flatten`` walks ``.items()``, so
-    registering a child under the *string* ``"2"`` reproduces PyTorch's
-    ``...2.1.weight`` naming exactly.  A plain list would also be captured by
-    ``Module.__setattr__`` and would pollute the key space, hence the tuple.
-    """
+    # see docs/port-notes/functions.md :: OrderedModules
 
     def __init__(self, modules: Mapping[str, nn.Module]) -> None:
         super().__init__()
@@ -124,12 +114,7 @@ class OrderedModules(nn.Module):
         return len(self._order)
 
     def __getitem__(self, index: int | str) -> nn.Module:
-        """Fetch by Sequential position (``self[0]``) **or** by raw key (``self["0"]``).
-
-        Both spellings are used: ``__call__`` walks ``_order`` positionally while
-        :class:`PositionalBlock` needs named access so it can reorder the
-        transposes around the channel-last conv.
-        """
+        # see docs/port-notes/functions.md :: __getitem__
         if isinstance(index, str):
             return getattr(self, index)
         return getattr(self, self._order[index])
@@ -140,7 +125,7 @@ class SequentialStack(OrderedModules):
 
 
 class ModuleListStack(nn.Module):
-    """``nn.ModuleList``; children registered under their decimal index."""
+    # see docs/port-notes/functions.md :: ModuleListStack
 
     def __init__(self, modules: Sequence[nn.Module]) -> None:
         super().__init__()
@@ -156,12 +141,7 @@ class ModuleListStack(nn.Module):
             yield getattr(self, str(index))
 
     def __getitem__(self, index: int | str) -> nn.Module:
-        """Fetch by position (``self[0]``) or by the mapping key (``self["0"]``).
-
-        ``nn.Module.update`` / ``tree_unflatten`` hand back the *string* keys that
-        were registered here, so a positional-only ``index < 0`` comparison raises
-        ``TypeError: '<' not supported between instances of 'str' and 'int'``.
-        """
+        # see docs/port-notes/functions.md :: __getitem__
         if isinstance(index, str):
             if not index.lstrip("-").isdigit():
                 raise KeyError(index)
@@ -176,7 +156,7 @@ class ModuleListStack(nn.Module):
 
 
 class TransposeLast(nn.Module):
-    """``fairseq.modules.TransposeLast``: swap the last two axes."""
+    # see docs/port-notes/functions.md :: TransposeLast
 
     def __call__(self, x: mx.array) -> mx.array:
         return mx.swapaxes(x, -2, -1)
@@ -191,11 +171,7 @@ class Identity(nn.Module):
 # norms and activations
 # --------------------------------------------------------------------------- #
 class Fp32LayerNorm(nn.LayerNorm):
-    """``fairseq.layers.fp32_group_norm.Fp32LayerNorm``.
-
-    A ``nn.LayerNorm`` that upcasts to float32, normalises and casts back, so
-    the reduction never happens in half precision.
-    """
+    # see docs/port-notes/functions.md :: Fp32LayerNorm
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
@@ -203,14 +179,14 @@ class Fp32LayerNorm(nn.LayerNorm):
 
 
 class Gelu(nn.Module):
-    """``nn.GELU()`` with the default (exact, erf-based) approximation."""
+    # see docs/port-notes/functions.md :: Gelu
 
     def __call__(self, x: mx.array) -> mx.array:
         return nn.gelu(x)
 
 
 class Mlp(nn.Module):
-    """``fairseq`` ``Mlp``: ``fc1 -> act -> fc2`` with dropout around."""
+    # see docs/port-notes/functions.md :: Mlp
 
     def __init__(self, in_features: int, hidden_features: int, act_layer: Callable) -> None:
         super().__init__()
@@ -226,12 +202,7 @@ class Mlp(nn.Module):
 # ConvFeatureExtractionModel (fairseq v0.12.2 wav2vec2.py:819-895)
 # --------------------------------------------------------------------------- #
 def parse_feature_encoder_spec(spec: str) -> list[tuple[int, int, int]]:
-    """Parse ``feature_encoder_spec`` with ``ast`` -- ``eval`` is never used.
-
-    Accepts only literal arithmetic over tuples of ints, i.e. ``+``, ``*`` and
-    ``[a, b, c]``.  Anything else (names, calls, attributes, comprehensions)
-    raises.
-    """
+    # see docs/port-notes/functions.md :: parse_feature_encoder_spec
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError("feature_encoder_spec must be a non-empty string")
     try:
@@ -288,13 +259,7 @@ def conv_feature_output_length(samples: int, layers: Sequence[tuple[int, int, in
 
 
 class ConvFeatureBlock(OrderedModules):
-    """``wav2vec2.py:839-860`` ``block(...)`` for ``is_layer_norm=True``.
-
-    ``Conv1d -> Dropout -> Sequential(TransposeLast, Fp32LayerNorm(affine=True),
-    TransposeLast) -> GELU``.  The double transpose turns the ``NCT`` conv
-    output into ``NTC`` so the LayerNorm normalises the **512 channels**, and the
-    norm is **affine**, i.e. its ``weight``/``bias`` are real checkpoint tensors.
-    """
+    # see docs/port-notes/functions.md :: ConvFeatureBlock
 
     def __init__(
         self,
@@ -345,7 +310,7 @@ class ConvFeatureBlock(OrderedModules):
 
 
 class ConvFeatureExtraction(nn.Module):
-    """``ConvFeatureExtractionModel`` with ``mode="layer_norm"``."""
+    # see docs/port-notes/functions.md :: ConvFeatureExtraction
 
     def __init__(
         self, layers: Sequence[tuple[int, int, int]], *, eps: float, conv_bias: bool
@@ -428,17 +393,7 @@ class PositionalBlock(OrderedModules):
 
 
 class PositionalEncoder(OrderedModules):
-    """``Sequential(TransposeLast, 5 x PositionalBlock, TransposeLast)``.
-
-    With ``conv_pos_pre_ln=false`` (the large config) the conv's
-    ``padding = k // 2 = 9`` preserves ``T`` and ``SamePad(19)`` is the identity
-    on top of it, so the output length is always exactly ``T``.
-
-    Time axis contract: the encoder takes ``NTC`` and returns ``NTC``; each
-    :class:`PositionalBlock` takes ``NTC`` and returns ``NCT``, so the encoder
-    restores ``NTC`` for the final output.  Each :class:`PositionalBlock` is
-    ``NCT`` in and ``NCT`` out, so nothing is transposed *between* blocks.
-    """
+    # see docs/port-notes/functions.md :: PositionalEncoder
 
     def __init__(self, dim: int, depth: int, kernel_size: int, groups: int, eps: float) -> None:
         modules: dict[str, nn.Module] = {"0": TransposeLast()}
@@ -451,11 +406,7 @@ class PositionalEncoder(OrderedModules):
         self.groups = int(groups)
 
     def __call__(self, x: mx.array) -> mx.array:
-        """``NTC`` in, ``NTC`` out -- the untouched source chain.
-
-        The leading ``TransposeLast`` converts ``NTC -> NCT`` for the blocks (each
-        ``NCT -> NCT``) and the trailing one restores ``NTC``.
-        """
+        # see docs/port-notes/functions.md :: __call__
         return super().__call__(x)
 
 
@@ -463,7 +414,7 @@ class PositionalEncoder(OrderedModules):
 # AltBlock / AltAttention (modules.py)
 # --------------------------------------------------------------------------- #
 class AltAttention(nn.Module):
-    """``modules.py:255-300`` ``AltAttention`` (cosine attention is not used)."""
+    # see docs/port-notes/functions.md :: AltAttention
 
     def __init__(self, dim: int, num_heads: int) -> None:
         super().__init__()
@@ -499,17 +450,7 @@ class AltAttention(nn.Module):
 
 
 class AltBlock(nn.Module):
-    """``modules.py:180-245`` ``AltBlock`` with ``layer_norm_first=false``.
-
-    Post-norm ordering::
-
-        x = x + attn(norm1(x))
-        x = x + mlp(norm2(x))
-
-    and the second return value is the post-norm ``x`` when ``ffn_targets`` else
-    the pre-norm mlp output.  That value is training-only (it supervises the
-    teacher), so the port returns it for API parity but never consumes it.
-    """
+    # see docs/port-notes/functions.md :: AltBlock
 
     def __init__(
         self,
@@ -531,13 +472,7 @@ class AltBlock(nn.Module):
         self.mlp = Mlp(dim, hidden, Gelu)
 
     def __call__(self, x: mx.array, alibi_bias: mx.array | None) -> tuple[mx.array, mx.array]:
-        """``modules.py:227-244`` with every dropout/drop-path removed.
-
-        Note the post-norm branch feeds the **raw** ``x`` to the attention and
-        only then applies ``norm1``; ``t`` is the pre-``norm2`` mlp output when
-        ``ffn_targets`` and the final ``x`` otherwise.  ``t`` is training-only
-        (it supervises the teacher) and is returned for API parity only.
-        """
+        # see docs/port-notes/functions.md :: __call__
         if self.layer_norm_first:
             x = x + self.attn(self.norm1(x), alibi_bias)
             r = x = self.mlp(self.norm2(x))
@@ -585,7 +520,7 @@ class BlockEncoder(nn.Module):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Emotion2VecConfig:
-    """Validated mirror of the audio modality config plus the model fields."""
+    # see docs/port-notes/functions.md :: Emotion2VecConfig
 
     # model
     embed_dim: int = 1024
@@ -705,12 +640,12 @@ class Emotion2VecConfig:
 
     @property
     def pos_kernel_size(self) -> int:
-        """``k = max(3, conv_pos_width // conv_pos_depth)`` (``audio.py:87``)."""
+        # see docs/port-notes/functions.md :: pos_kernel_size
         return max(3, self.conv_pos_width // self.conv_pos_depth)
 
     @property
     def ffn_targets(self) -> bool:
-        """``ffn_targets = not end_of_block_targets`` (``emotion2vec.py``)."""
+        # see docs/port-notes/functions.md :: ffn_targets
         return not self.end_of_block_targets
 
     def frames_for(self, samples: int) -> int:
@@ -790,37 +725,24 @@ class AudioEncoder(nn.Module):
 
     # -- pieces, kept separate so the tests can drive them individually ----- #
     def _weight_dtype(self) -> mx.Dtype:
-        """Dtype of this encoder's checkpoint weights (first conv always exists)."""
+        # see docs/port-notes/functions.md :: _weight_dtype
         return self.local_encoder.conv_layers["0"]["0"].weight.dtype
 
     def local_features(self, samples: mx.array) -> mx.array:
-        """Waveform ``(B, samples)`` -> projected features ``(B, T, embed_dim)``.
-
-        The conv stack returns ``NCT`` and ``project_features`` is the source's
-        ``Sequential(TransposeLast, LayerNorm(512), Linear)``.  Its leading
-        ``TransposeLast`` is a **real** transpose, so the ``NCT`` tensor is fed
-        straight in and the norm correctly reduces the **512 channels**.
-        """
+        # see docs/port-notes/functions.md :: local_features
         x = self.local_encoder(samples)  # (B, C, frames) == NCT
         x = self.project_features(x)  # -> NTC -> LayerNorm(512) -> NTC -> Linear
         return x
 
     def alibi_bias(self, batch_size: int, time_steps: int) -> mx.array:
-        """``get_alibi_bias`` -> ``(B, heads, T, T)``."""
+        # see docs/port-notes/functions.md :: alibi_bias
         base = get_alibi(time_steps, self.config.num_alibi_heads)  # (H, T, T)
         return mx.broadcast_to(base[None], (batch_size, *base.shape))
 
     def contextualized_features(
         self, samples: mx.array
     ) -> tuple[mx.array, mx.array, mx.array | None]:
-        """``contextualized_features(..., mask=False, remove_masked=False)``.
-
-        Returns ``(x, alibi_bias, alibi_scale_for_model_blocks)``.  When the
-        learned scale has a single row it is folded into ``alibi_bias`` here and
-        the third element is ``None``; with one row **per layer** the rows stay
-        live and the tail (``alibi_scale[prenet_depth:]``) is handed back so the
-        shared blocks pick their own row, exactly like the reference.
-        """
+        # see docs/port-notes/functions.md :: contextualized_features
         if samples.ndim != 2:
             raise ValueError(f"expected (B, samples), got shape {samples.shape}")
         # Bound the O(T^2) attention here too, not only via Emotion2VecModel.
@@ -869,7 +791,7 @@ class AudioEncoder(nn.Module):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class EmotionResult:
-    """Mirrors the keys FunASR's ``Emotion2vec.inference`` returns."""
+    # see docs/port-notes/functions.md :: EmotionResult
 
     key: str
     labels: tuple[str, ...]
@@ -878,11 +800,7 @@ class EmotionResult:
 
 
 def preprocess_waveform(waveform: mx.array, normalize: bool = True, eps: float = 1e-5) -> mx.array:
-    """``source = F.layer_norm(source, source.shape)`` then ``view(1, -1)``.
-
-    The reference normalises over the *entire* 1-D waveform (one global
-    normalisation), not per frame.
-    """
+    # see docs/port-notes/functions.md :: preprocess_waveform
     x = waveform
     if x.ndim == 1:
         x = x[None, :]
@@ -898,14 +816,7 @@ def preprocess_waveform(waveform: mx.array, normalize: bool = True, eps: float =
 
 
 class Emotion2VecModel(nn.Module):
-    """``Emotion2vec`` (FunASR wrapper) as native MLX modules.
-
-    The checkpoint is a plain ``state_dict`` of the ``Emotion2vec`` module, so the
-    parameter prefixes are ``modality_encoders.AUDIO.*``, ``blocks.N.*`` and
-    ``proj.*``.  ``self.modality_encoders`` is a plain dict so the keys come out
-    as ``modality_encoders.AUDIO.<...>`` exactly like the reference
-    ``nn.ModuleDict``.
-    """
+    # see docs/port-notes/functions.md :: Emotion2VecModel
 
     def __init__(self, config: Emotion2VecConfig) -> None:
         super().__init__()
@@ -937,12 +848,7 @@ class Emotion2VecModel(nn.Module):
 
     # -- forward paths ------------------------------------------------------ #
     def extract_features(self, samples: mx.array, *, remove_extra_tokens: bool = True) -> mx.array:
-        """Waveform ``(B, samples)`` -> frame features ``(B, T', embed_dim)``.
-
-        ``remove_extra_tokens=True`` strips the ``num_extra_tokens`` cls tokens,
-        which is what FunASR does before the utterance-level pooling.  The encoder
-        is evaluated exactly **once**.
-        """
+        # see docs/port-notes/functions.md :: extract_features
         if samples.ndim != 2:
             raise ValueError(f"expected (B, samples), got shape {samples.shape}")
         # Attention is O(T^2) * num_heads, so the bound is enforced here rather
@@ -965,14 +871,7 @@ class Emotion2VecModel(nn.Module):
         return x
 
     def classify(self, samples: mx.array) -> tuple[mx.array, mx.array, mx.array]:
-        """Return ``(features (B, embed_dim), logits (B, vocab_size), frames)``.
-
-        The head is ``nn.Linear(embed_dim, vocab_size)`` applied to the mean over
-        time **after** the extra tokens have been removed
-        (``Emotion2vec.inference``: ``x = x.mean(dim=1); x = self.proj(x)``).  The
-        frame features are returned so a caller that also wants them does not have
-        to run the whole encoder a second time.
-        """
+        # see docs/port-notes/functions.md :: classify
         if self.proj is None:
             raise RuntimeError(
                 "no classifier head: construct with vocab_size > 0. The reference "
@@ -983,12 +882,7 @@ class Emotion2VecModel(nn.Module):
         return pooled, self.proj(pooled), frames
 
     def emotion_scores(self, samples: mx.array) -> EmotionResult:
-        """Full FunASR-equivalent result: labels + softmax scores + features.
-
-        Runs the encoder exactly once; ``feats`` is the utterance-level pooled
-        embedding the classifier consumed, which is the same
-        ``x.mean(dim=1)`` the reference uses, so no second pass is needed.
-        """
+        # see docs/port-notes/functions.md :: emotion_scores
         if self.proj is None:
             raise RuntimeError("emotion_scores requires a classifier head (vocab_size > 0)")
         if samples.ndim != 2:
@@ -1044,18 +938,14 @@ CONV_WEIGHT_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def is_conv_weight(name: str) -> bool:
-    """True for the depthwise ``Conv1d`` weights listed in :data:`CONV_WEIGHT_PATTERNS`."""
+    # see docs/port-notes/functions.md :: is_conv_weight
     return any(pattern.match(name) for pattern in CONV_WEIGHT_PATTERNS)
 
 
 def convert_checkpoint_tensors(
     state: Mapping[str, mx.array | Any],
 ) -> tuple[dict[str, mx.array], tuple[str, ...]]:
-    """Convert a published ``state_dict`` and report what was discarded.
-
-    Only ``Conv1d`` weights change layout: ``(out, in//g, K) -> (out, K, in//g)``.
-    Linears, LayerNorms, ``extra_tokens`` and ``alibi_scale`` already match MLX.
-    """
+    # see docs/port-notes/functions.md :: convert_checkpoint_tensors
     converted: dict[str, mx.array] = {}
     discarded: list[str] = []
     for name, value in state.items():
@@ -1096,11 +986,7 @@ def load_state_dict_strict(
     *,
     allow_training_only: bool = True,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Load ``state`` into ``module``; return ``(discarded, unexpected)``.
-
-    Never silently skips a key: anything outside
-    :data:`INFERENCE_ONLY_PREFIXES` must match a parameter by name *and* shape.
-    """
+    # see docs/port-notes/functions.md :: load_state_dict_strict
     converted, discarded = convert_checkpoint_tensors(state)
     if not allow_training_only and discarded:
         raise CheckpointKeyError(f"training-only keys present but not allowed: {list(discarded)}")

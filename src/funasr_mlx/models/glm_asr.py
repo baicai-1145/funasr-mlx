@@ -1,14 +1,4 @@
-"""GLM-ASR-Nano audio encoder + projector, ported from the checkpoint's code.
-
-Structure verified from ``model.safetensors`` (zai-org/GLM-ASR-Nano-2512,
-MIT): ``conv1`` (1280, 128, 3) stride 1 + ``conv2`` (1280, 1280, 3) stride 2
-=> a single 2x downsample; 32 pre-norm blocks with Llama-style names
-(``input_layernorm``/``post_attention_layernorm``), attention q/k/v/o where
-q, v, o carry biases and k does not, ``partial_rotary_factor`` 0.5; final
-``norm``; projector ``linear_1`` 1280->4096 + gelu + ``linear_2`` 4096->2048.
-
-Text side is a Llama-shaped decoder (see :mod:`.llm.llama`).
-"""
+"""Port notes: docs/port-notes/glm_asr.py.md"""
 
 from __future__ import annotations
 
@@ -135,7 +125,7 @@ class _Mlp(mxnn.Module):
 
 
 class GlmAsrAudioEncoder(mxnn.Module):
-    """``glmasr_encoder`` (inference): mel (F, T) -> (1, T', output_size)."""
+    # see docs/port-notes/functions.md :: GlmAsrAudioEncoder
 
     def __init__(self, cfg: GlmAsrAudioConfig) -> None:
         super().__init__()
@@ -148,13 +138,7 @@ class GlmAsrAudioEncoder(mxnn.Module):
         self.linear_2 = mxnn.Linear(cfg.projector_dim, cfg.output_size)
 
     def __call__(self, mel: mx.array) -> mx.array:
-        """mel: ``(F, T)``; returns ``(1, T'', output_size)`` embeddings.
-
-        The official projector consumes the encoder output RE-GROUPED into
-        ``intermediate_size``-wide rows: every 4 frames of 1280 become one
-        5120-wide row (a 4-frame merge), then linear_1 5120->4096 + gelu +
-        linear_2 4096->2048.
-        """
+        # see docs/port-notes/functions.md :: __call__
         x = mxnn.GELU()(
             self.conv1(mx.transpose(mel[None], (0, 2, 1)))
         )  # (1, T, d) stride 1

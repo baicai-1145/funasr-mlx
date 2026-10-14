@@ -71,7 +71,7 @@ CONV2D_RULES = {suffix: _depthwise_conv2d for suffix in CONV2D_WEIGHT_SUFFIXES}
 
 
 def convert_checkpoint_tensors(state):
-    """Depthwise 4-D kernels transposed; strict elsewhere (see _strict_load)."""
+    # see docs/port-notes/functions.md :: convert_checkpoint_tensors
     return _strict_convert(state, CONV2D_RULES)
 
 
@@ -121,7 +121,7 @@ class VadDetectMode(enum.Enum):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class FsmnEncoderConfig:
-    """Validated mirror of ``encoder_conf`` for FunASR's ``FSMN`` network."""
+    # see docs/port-notes/functions.md :: FsmnEncoderConfig
 
     input_dim: int = 400
     input_affine_dim: int = 140
@@ -159,7 +159,7 @@ class FsmnEncoderConfig:
 
     @property
     def cache_frames(self) -> int:
-        """Left-context cache length ``(lorder - 1) * lstride``."""
+        # see docs/port-notes/functions.md :: cache_frames
         return (self.lorder - 1) * self.lstride
 
     @classmethod
@@ -171,11 +171,7 @@ class FsmnEncoderConfig:
 
 @dataclass
 class VadOptions:
-    """Mutable mirror of FunASR's ``VADXOptions``.
-
-    Mutable because ``ComputeScores`` overwrites ``nn_eval_block_size`` with the
-    number of frames in the current block, exactly like the reference.
-    """
+    # see docs/port-notes/functions.md :: VadOptions
 
     sample_rate: int = 16000
     detect_mode: int = VadDetectMode.MULTIPLE_UTTERANCE.value
@@ -264,7 +260,7 @@ class VadOptions:
 
     @property
     def max_end_sil_frame_cnt_thresh(self) -> int:
-        """``Stats.max_end_sil_frame_cnt_thresh`` at cache-initialisation time."""
+        # see docs/port-notes/functions.md :: max_end_sil_frame_cnt_thresh
         return self.max_end_silence_time - self.speech_to_sil_time_thres
 
     @classmethod
@@ -278,14 +274,7 @@ class VadOptions:
 # modules
 # --------------------------------------------------------------------------- #
 class ModuleLayerList(nn.Module):
-    """``nn.ModuleList`` keyed by *string* index (see ``ct_punc.py`` for why).
-
-    MLX's own ``ModuleList`` nests children under ``layers`` and would shift every
-    checkpoint key; FunASR's ``FsmnStack`` (an ``nn.Sequential``) indexes blocks
-    as ``fsmn.0.…``, ``fsmn.1.…``, so children must sit directly under ``"0"``,
-    ``"1"``, …  ``nn.Module.update()`` can only overwrite existing keys, so
-    children are inserted as dict items.
-    """
+    # see docs/port-notes/functions.md :: ModuleLayerList
 
     def __init__(self, modules: Sequence[nn.Module]) -> None:
         super().__init__()
@@ -304,11 +293,7 @@ class ModuleLayerList(nn.Module):
 
 
 class LinearTransform(nn.Module):
-    """Bias-free wrapper retaining the reference's named ``linear`` child.
-
-    ``BasicBlock.linear`` owns this wrapper, so its child adds the second
-    ``linear`` in ``fsmn.<i>.linear.linear.weight``.
-    """
+    # see docs/port-notes/functions.md :: LinearTransform
 
     def __init__(self, input_dim: int, output_dim: int) -> None:
         super().__init__()
@@ -321,11 +306,7 @@ class LinearTransform(nn.Module):
 
 
 class AffineTransform(nn.Module):
-    """``AffineTransform``: ``self.linear = nn.Linear(input_dim, output_dim)``.
-
-    Like :class:`LinearTransform`, this retains the named ``linear`` submodule;
-    unlike it, the affine transform also has a bias.
-    """
+    # see docs/port-notes/functions.md :: AffineTransform
 
     def __init__(self, input_dim: int, output_dim: int) -> None:
         super().__init__()
@@ -338,14 +319,7 @@ class AffineTransform(nn.Module):
 
 
 class FSMNBlock(nn.Module):
-    """``FSMNBlock``: left/right dilated depthwise memory block.
-
-    The reference applies ``nn.Conv2d`` to a ``(B, D, T, 1)`` view; here the time
-    axis is the sequence axis of ``mx.conv1d`` and the trailing singleton axis is
-    dropped (it carries no data).
-
-    Cache shapes: ``cache`` is ``(B, D, (lorder - 1) * lstride)`` or ``None``.
-    """
+    # see docs/port-notes/functions.md :: FSMNBlock
 
     def __init__(
         self, dim: int, lorder: int, rorder: int, lstride: int, rstride: int
@@ -372,16 +346,7 @@ class FSMNBlock(nn.Module):
         )
 
     def __call__(self, x: mx.array, cache: mx.array | None = None):
-        """Return ``(output, new_cache)`` with ``output`` shaped ``(B, T, D)``.
-
-        Layout: ``mx.nn.Conv1d`` is channels-last ``(batch, length, channels)``.
-        The reference works in ``(B, D, T)``; the time axis is moved to the middle
-        so the ``(lorder - 1) * lstride`` left padding (or cache concatenation) is
-        expressed on the same axis FunASR pads, then moved back for the conv.
-
-        ``mx.core.conv1d`` reads ``in[t * stride + k * dilation]``; with
-        ``y[i] = x[i - keep]`` kernel tap ``k`` therefore reads ``x[t - keep + k]``.
-        """
+        # see docs/port-notes/functions.md :: __call__
         if x.ndim != 3:
             raise ValueError(f"expected (B, T, D) input, got shape {x.shape}")
         x_per = mx.transpose(x, (0, 2, 1))  # (B, T, D) -> (B, D, T)
@@ -420,7 +385,7 @@ class FSMNBlock(nn.Module):
 
 
 class BasicBlock(nn.Module):
-    """``BasicBlock``: linear -> FSMN -> affine -> relu, with a per-layer cache."""
+    # see docs/port-notes/functions.md :: BasicBlock
 
     def __init__(
         self, linear_dim: int, proj_dim: int, lorder: int, rorder: int,
@@ -450,12 +415,7 @@ class BasicBlock(nn.Module):
 
 
 class FSMN(nn.Module):
-    """``FSMN`` encoder (``funasr/models/fsmn_vad_streaming/encoder.py``).
-
-    ``cache=None`` runs the non-streaming path (zero left padding); passing a dict
-    runs the streaming path and updates ``cache["cache_layer_<i>"]`` in place,
-    exactly like the reference.
-    """
+    # see docs/port-notes/functions.md :: FSMN
 
     def __init__(self, config: FsmnEncoderConfig) -> None:
         super().__init__()
@@ -486,7 +446,7 @@ class FSMN(nn.Module):
         return nn.softmax(h, axis=-1) if self.use_softmax else h
 
     def forward_with_caches(self, x: mx.array, cache: dict[str, mx.array]):
-        """ONNX-export style: return ``(scores, [cache_layer_0, …])``."""
+        # see docs/port-notes/functions.md :: forward_with_caches
         scores = self.__call__(x, cache)
         caches = [
             cache[layer.cache_key] for layer in self.fsmn if layer.cache_key in cache
@@ -646,12 +606,7 @@ def _require_cache(cache: dict | None) -> dict:
 
 
 class FsmnVadModel(nn.Module):
-    """FSMN-VAD: streaming/offline speech endpointing.
-
-    ``__call__(feats, waveform, cache, is_final=…, is_streaming_input=…)`` mirrors
-    ``FsmnVADStreaming.forward`` and returns ``[[[start_ms, end_ms], …], …]``
-    (batch x segment; batch size 1 is the only supported case, as in FunASR).
-    """
+    # see docs/port-notes/functions.md :: FsmnVadModel
 
     def __init__(
         self,
@@ -676,7 +631,7 @@ class FsmnVadModel(nn.Module):
         *,
         max_chunk_frames: int = 6000,
     ) -> "FsmnVadModel":
-        """Build from a FunASR ``config.yaml`` mapping."""
+        # see docs/port-notes/functions.md :: from_dict
         if not isinstance(config, Mapping):
             raise TypeError(f"config must be a mapping, got {type(config).__name__}")
         model_conf = dict(config.get("model_conf") or {})
@@ -698,7 +653,7 @@ class FsmnVadModel(nn.Module):
         max_end_silence_time: int | None = None,
         speech_noise_thres: float | None = None,
     ) -> dict:
-        """``init_cache``: fresh encoder caches, window detector and stats."""
+        # see docs/port-notes/functions.md :: init_cache
         cache = {} if cache is None else cache
         if max_end_silence_time is not None:
             self.vad_opts.max_end_silence_time = _as_int(
@@ -727,11 +682,11 @@ class FsmnVadModel(nn.Module):
         return cache
 
     def reset(self, cache: dict | None = None, **kwargs: Any) -> dict:
-        """Full reset between utterances (``init_cache``)."""
+        # see docs/port-notes/functions.md :: reset
         return self.init_cache(cache, **kwargs)
 
     def drop_cached_frames(self, drop_frames: int, cache: dict) -> None:
-        """``DropCachedFrames``: release decibel/score history before a frame."""
+        # see docs/port-notes/functions.md :: drop_cached_frames
         stats = cache["stats"]
         if drop_frames > stats.frm_cnt:
             raise RuntimeError(
@@ -1177,12 +1132,7 @@ class FsmnVadModel(nn.Module):
         is_final: bool = False,
         is_streaming_input: bool = True,
     ) -> list[list[list[int]]]:
-        """``FsmnVADStreaming.forward``.
-
-        ``feats`` is ``(1, T, input_dim)`` fbank (the frontend is owned by the
-        shared runtime); ``waveform`` is the exact ``(1, N)`` (or ``(N,)``)
-        sample span those ``T`` frames cover.
-        """
+        # see docs/port-notes/functions.md :: __call__
         if not isinstance(cache, dict) or "stats" not in cache:
             raise ValueError("cache must be initialised with FsmnVadModel.init_cache()")
         if feats.size == 0:
@@ -1249,7 +1199,7 @@ class FsmnVadModel(nn.Module):
         is_streaming_input: bool = False,
         **init_kwargs: Any,
     ) -> list[list[int]]:
-        """Convenience wrapper for the offline case (auto-initialised cache)."""
+        # see docs/port-notes/functions.md :: detect
         if cache is None:
             cache = self.init_cache(**init_kwargs)
         batches = self.__call__(

@@ -1,19 +1,4 @@
-"""Qwen3-ASR audio encoder + thinker, ported from the qwen-asr package.
-
-Source: qwen-asr 0.0.6 ``qwen_asr/core/transformers_backend/
-modeling_qwen3_asr.py`` (Apache 2.0, Qwen team), inference subset.
-
-Architecture (``thinker_config.audio_config`` of Qwen3-ASR-0.6B):
-``conv2d1/2/3`` (stride 2 + GELU, 8x total downsample) -> ``conv_out``
--> sinusoidal positions -> 18 pre-norm encoder layers (LayerNorm, GELU
-FFN, windowed varlen attention) -> ``ln_post`` -> ``proj1``/GELU/
-``proj2`` (d_model 896 -> output_dim 1024, the Qwen3-0.6B hidden size).
-
-The reference runs attention as flash-varlen over per-chunk windows of
-``n_window * 2`` mel frames; here the same windowing is expressed as a
-block-diagonal mask over one batched attention, which is numerically
-identical (each window only ever attends within itself).
-"""
+"""Port notes: docs/port-notes/qwen3_asr.py.md"""
 
 from __future__ import annotations
 
@@ -63,7 +48,7 @@ def _get_feat_extract_output_lengths(n: int) -> int:
 
 
 class _Conv2dStride2(mxnn.Module):
-    """``nn.Conv2d(h, h, 3, stride=2, padding=1)`` in MLX (NHWC)."""
+    # see docs/port-notes/functions.md :: _Conv2dStride2
 
     def __init__(self, cin: int, cout: int) -> None:
         super().__init__()
@@ -138,12 +123,7 @@ class _Sinusoids(mxnn.Module):
 
 
 class Qwen3ASRAudioEncoder(mxnn.Module):
-    """``Qwen3ASRAudioEncoder`` (inference), single-utterance path.
-
-    Input mel: ``(F, T)`` (n_mels first, like the reference). Output:
-    ``(1, T', output_dim)`` -- one embedding row per audio token slot,
-    which the thinker splices between ``audio_start`` and ``audio_end``.
-    """
+    # see docs/port-notes/functions.md :: Qwen3ASRAudioEncoder
 
     def __init__(self, cfg: Qwen3ASRAudioConfig) -> None:
         super().__init__()

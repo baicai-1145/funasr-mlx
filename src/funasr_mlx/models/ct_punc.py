@@ -97,12 +97,7 @@ CJK_RANGE = ("\u4e00", "\u9fa5")
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class SanmEncoderConfig:
-    """Validated mirror of ``encoder_conf`` for FunASR's ``SANMEncoder``.
-
-    Only the ``ct-punc`` configuration is supported: ``input_layer="pe"`` (a
-    parameter-free sinusoidal position encoder) and
-    ``selfattention_layer_type="sanm"``.
-    """
+    # see docs/port-notes/functions.md :: SanmEncoderConfig
 
     input_size: int = 256
     output_size: int = 256
@@ -175,7 +170,7 @@ class SanmEncoderConfig:
 
     @classmethod
     def from_dict(cls, config: Mapping[str, Any]) -> "SanmEncoderConfig":
-        """Build from a FunASR ``encoder_conf`` mapping."""
+        # see docs/port-notes/functions.md :: from_dict
         if not isinstance(config, Mapping):
             raise TypeError(f"encoder_conf must be a mapping, got {type(config).__name__}")
         # The official config passes pos_enc_class (a class object the SANM
@@ -188,7 +183,7 @@ class SanmEncoderConfig:
 
 @dataclass(frozen=True)
 class CtPuncConfig:
-    """Validated mirror of ``model_conf`` for FunASR's ``CTTransformer``."""
+    # see docs/port-notes/functions.md :: CtPuncConfig
 
     vocab_size: int = 471067
     embed_unit: int = 256
@@ -266,12 +261,7 @@ class CtPuncConfig:
 
     @classmethod
     def from_dict(cls, config: Mapping[str, Any]) -> "CtPuncConfig":
-        """Build from a full FunASR ``config.yaml`` mapping or from a flat one.
-
-        Accepts ``{"model_conf": {...}, "encoder_conf": {...},
-        "tokenizer_conf": {...}}`` (the on-disk layout) as well as a single flat
-        ``model_conf`` mapping.
-        """
+        # see docs/port-notes/functions.md :: from_dict
         if not isinstance(config, Mapping):
             raise TypeError(f"config must be a mapping, got {type(config).__name__}")
         if "model_conf" in config:
@@ -298,13 +288,7 @@ class CtPuncConfig:
 # vocabulary
 # --------------------------------------------------------------------------- #
 class CharVocab:
-    """Character vocabulary equivalent to FunASR's ``CharTokenizer``.
-
-    ``BaseTokenizer.encode`` simply maps every token through ``token2id`` with an
-    ``<unk>`` fallback, so this class exposes exactly that behaviour and nothing
-    more (no segmentation: the caller already produced tokens via
-    :func:`split_words`).
-    """
+    # see docs/port-notes/functions.md :: CharVocab
 
     def __init__(self, token_list: Iterable[str], unk_symbol: str = "<unk>") -> None:
         self.token_list: list[str] = list(token_list)
@@ -323,14 +307,14 @@ class CharVocab:
 
     @classmethod
     def from_file(cls, path: str | Path, unk_symbol: str = "<unk>") -> "CharVocab":
-        """Load a newline-separated vocabulary (``token_list.txt``)."""
+        # see docs/port-notes/functions.md :: from_file
         with Path(path).open("r", encoding="utf-8") as handle:
             tokens = [line.rstrip() for line in handle]
         return cls(tokens, unk_symbol=unk_symbol)
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any], path: str | Path | None = None) -> "CharVocab":
-        """Build from a FunASR ``tokenizer_conf`` mapping (or an explicit path)."""
+        # see docs/port-notes/functions.md :: from_config
         source = config or {}
         if "tokenizer_conf" in source:
             tokenizer_conf = dict(source["tokenizer_conf"] or {})
@@ -357,7 +341,7 @@ class CharVocab:
 # tensor helpers
 # --------------------------------------------------------------------------- #
 def is_first_byte_ascii(token: str) -> bool:
-    """FunASR's ``len(token[0].encode()) == 1`` test (first character is ASCII)."""
+    # see docs/port-notes/functions.md :: is_first_byte_ascii
     if not token:
         return False
     return len(token[0].encode("utf-8")) == 1
@@ -366,7 +350,7 @@ def is_first_byte_ascii(token: str) -> bool:
 def make_valid_mask(
     lengths: Sequence[int] | mx.array, maxlen: int, dtype: Any = mx.float32
 ) -> mx.array:
-    """``(~make_pad_mask(lengths)[:, None, :])`` -> ``(B, 1, maxlen)`` of 1/0 floats."""
+    # see docs/port-notes/functions.md :: make_valid_mask
     if isinstance(lengths, mx.array):
         lens = lengths.reshape(-1).astype(mx.int32)
     else:
@@ -377,11 +361,7 @@ def make_valid_mask(
 
 
 def sinusoidal_position_encoding(x: mx.array) -> mx.array:
-    """FunASR ``SinusoidalPositionEncoder`` (``input_layer="pe"``), parameter-free.
-
-    ``log_timescale_increment = log(10000) / (depth/2 - 1)``; the sin block is
-    concatenated *before* the cos block; positions start at 1.
-    """
+    # see docs/port-notes/functions.md :: sinusoidal_position_encoding
     if x.ndim != 3:
         raise ValueError(f"expected a (B, T, D) array, got shape {x.shape}")
     depth = x.shape[-1]
@@ -401,17 +381,7 @@ def sinusoidal_position_encoding(x: mx.array) -> mx.array:
 # modules
 # --------------------------------------------------------------------------- #
 class ModuleLayerList(nn.Module):
-    """``nn.ModuleList`` variant keyed by *string* index.
-
-    MLX's own ``ModuleList`` nests children under ``layers``, which would shift
-    every checkpoint key (``encoders.0.…`` -> ``encoders.layers.0.…``).  Storing
-    the children directly under ``"0"``, ``"1"``, … keeps FunASR's
-    ``nn.ModuleList`` parameter paths byte-identical.
-
-    Note ``nn.Module.update()`` can only overwrite *existing* keys, so children
-    are inserted as dict items (which is what ``Module.__setattr__`` does for
-    ``dict``/``list`` values too).
-    """
+    # see docs/port-notes/functions.md :: ModuleLayerList
 
     def __init__(self, modules: Sequence[nn.Module]) -> None:
         super().__init__()
@@ -430,11 +400,7 @@ class ModuleLayerList(nn.Module):
 
 
 class PositionwiseFeedForward(nn.Module):
-    """``PositionwiseFeedForward`` with the ``w_1``/``w_2`` names preserved.
-
-    Dropout is omitted: FunASR's ``nn.Dropout`` is an identity at inference and
-    this port is inference-only.
-    """
+    # see docs/port-notes/functions.md :: PositionwiseFeedForward
 
     def __init__(self, idim: int, hidden_units: int) -> None:
         super().__init__()
@@ -446,12 +412,7 @@ class PositionwiseFeedForward(nn.Module):
 
 
 class SanmAttention(nn.Module):
-    """``MultiHeadedAttentionSANM`` (funasr/models/sanm/attention.py).
-
-    Weight layout conversion: ``self.fsmn_block.weight`` is ``(C, 1, K)`` in
-    PyTorch (depthwise ``nn.Conv1d``) and must be transposed to MLX's
-    ``(C, K, 1)``.  ``linear_q_k_v`` and ``linear_out`` already use MLX's layout.
-    """
+    # see docs/port-notes/functions.md :: SanmAttention
 
     def __init__(
         self,
@@ -579,11 +540,7 @@ class SanmEncoderLayer(nn.Module):
 
 
 class SanmEncoder(nn.Module):
-    """``SANMEncoder`` restricted to ``input_layer="pe"``.
-
-    Parameter paths are ``encoders0.0.…`` for the first block and ``encoders.i.…``
-    for the remaining ``num_blocks - 1``, matching FunASR exactly.
-    """
+    # see docs/port-notes/functions.md :: SanmEncoder
 
     def __init__(self, config: SanmEncoderConfig) -> None:
         super().__init__()
@@ -628,7 +585,7 @@ class SanmEncoder(nn.Module):
 
 
 class CtPuncModel(nn.Module):
-    """``CTTransformer``: embedding -> SANMEncoder -> linear punc classifier."""
+    # see docs/port-notes/functions.md :: CtPuncModel
 
     def __init__(self, config: CtPuncConfig) -> None:
         super().__init__()
@@ -656,7 +613,7 @@ class CtPuncModel(nn.Module):
         return self.punc_forward(text, text_lengths)
 
     def argmax_punc_ids(self, logits: mx.array) -> list[list[int]]:
-        """FunASR's ``y.view(-1, C).topk(1, dim=1)`` followed by ``squeeze(1)``."""
+        # see docs/port-notes/functions.md :: argmax_punc_ids
         if logits.ndim != 3:
             raise ValueError(f"expected (B, T, C) logits, got shape {logits.shape}")
         b, t, c = logits.shape
@@ -676,11 +633,7 @@ class CtPuncModel(nn.Module):
 # text post-processing (pure Python, mirrors funasr/models/ct_transformer)
 # --------------------------------------------------------------------------- #
 def split_words(text: str) -> list[str]:
-    """FunASR ``split_words`` without a jieba user dictionary.
-
-    Splits on whitespace, then keeps maximal ASCII runs as one token and emits
-    every non-ASCII character as its own token.
-    """
+    # see docs/port-notes/functions.md :: split_words
     words: list[str] = []
     for segment in text.split():
         current = ""
@@ -698,7 +651,7 @@ def split_words(text: str) -> list[str]:
 
 
 def split_to_mini_sentence(words: Sequence[Any], word_limit: int = 20) -> list[list[Any]]:
-    """FunASR ``split_to_mini_sentence``: fixed-size chunks plus one remainder."""
+    # see docs/port-notes/functions.md :: split_to_mini_sentence
     if word_limit <= 1:
         raise ValueError(f"word_limit must be > 1, got {word_limit}")
     if len(words) <= word_limit:
@@ -718,17 +671,7 @@ def expand_word_level_punc(
     tokens: Sequence[str],
     no_punc_id: int = 1,
 ) -> list[int]:
-    """FunASR's jieba word-level ``punc_array`` expansion.
-
-    Mirrors the reverse walk in ``CTTransformer.inference`` for CJK word tokens
-    longer than one character: insert ``len(token) - 1`` entries of ``no_punc_id``
-    so the array lines up with the character-level token stream.
-
-    The reference hard-codes the inserted value as the literal ``1``; that is kept
-    as the default so behaviour is bit-identical, but note that ``1`` only means
-    "no punctuation" when ``punc_list[1] == "_"``.  Pass ``no_punc_id=0`` (or
-    whatever the target config uses) when the label table is ordered differently.
-    """
+    # see docs/port-notes/functions.md :: expand_word_level_punc
     values = list(punc_array)
     total = len(tokens)
     for i, token in enumerate(reversed(list(tokens))):
@@ -749,15 +692,7 @@ class PuncResult:
 
 
 class CtPuncPunctuator:
-    """End-to-end ``ct-punc``: tokens -> model -> punctuated text + ``punc_array``.
-
-    The mini-sentence chunking / look-back cache behaviour of
-    ``CTTransformer.inference`` is reproduced exactly, including the case where a
-    chunk contains no sentence terminator: nothing is emitted for that chunk, the
-    whole chunk is carried into the next one, and once it exceeds
-    ``cache_pop_trigger_limit`` tokens the last comma is promoted to a sentence
-    end.
-    """
+    # see docs/port-notes/functions.md :: CtPuncPunctuator
 
     def __init__(
         self,
@@ -776,11 +711,7 @@ class CtPuncPunctuator:
 
     # -- state ---------------------------------------------------------------
     def reset(self) -> None:
-        """No-op: ``ct-punc`` carries no state between calls.
-
-        Provided for API symmetry with the streaming VAD; the mini-sentence cache
-        is local to :meth:`punctuate`.
-        """
+        # see docs/port-notes/functions.md :: reset
         return None
 
     # -- prediction ----------------------------------------------------------

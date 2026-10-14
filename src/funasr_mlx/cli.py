@@ -1,4 +1,4 @@
-"""Offline CLI. Model and device imports happen only in a guarded worker."""
+"""Port notes: docs/port-notes/cli.py.md"""
 
 from __future__ import annotations
 

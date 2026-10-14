@@ -1,4 +1,4 @@
-"""Offline checkpoint inspection and bounded, sharded weight conversion."""
+"""Port notes: docs/port-notes/checkpoints.py.md"""
 
 from __future__ import annotations
 
@@ -35,17 +35,7 @@ SUPPORTED_DTYPES = ("float16", "float32", "bfloat16")
 
 @dataclass(frozen=True)
 class SourceRule:
-    """How one LLM family's source keys map onto the native parameter names.
-
-    ``prefixes`` maps a source key prefix to the native prefix, longest first.
-    ``renames`` are literal substring rewrites applied afterwards (used for the
-    Qwen3-ASR ``conv2d`` -> ``conv`` submodule move and for MOSS's
-    ``language_model`` -> ``model`` decoder nesting). ``drop`` lists source keys
-    that the native model does not carry, because the port *derives* them (the
-    Qwen3-ASR sinusoidal position table). A rule is strict: a key that matches
-    no prefix and is not in ``drop`` raises rather than being passed through, so
-    a renamed upstream checkpoint cannot silently produce a wrong key set.
-    """
+    # see docs/port-notes/functions.md :: SourceRule
 
     prefixes: tuple[tuple[str, str], ...]
     renames: tuple[tuple[str, str], ...] = ()
@@ -222,17 +212,7 @@ def quantize_bf16_weight(
 
 @dataclass(frozen=True)
 class GptqWeight:
-    """Per-tensor GPTQ calibration state, keyed by native tensor name.
-
-    ``hessians`` maps a native ``<module>.weight`` name to that matrix's
-    ``H = 2 X^T X`` (float32).  ``configs`` maps the same name to the
-    :class:`~funasr_mlx.models.llm.gptq.GptqConfig` to use, so different
-    matrices can carry different hyper-parameters.  A name with a Hessian but no
-    explicit config uses ``default_config``.
-
-    Kept as a plain data holder (no MLX import at module scope) so the converter
-    can accept it without pulling the runtime in.
-    """
+    # see docs/port-notes/functions.md :: GptqWeight
 
     hessians: Mapping[str, np.ndarray]
     configs: Mapping[str, Any] = field(default_factory=dict)
@@ -263,7 +243,7 @@ class GptqWeight:
     def quantize_tensor(
         self, name: str, weight, *, bits: int, group_size: int
     ) -> tuple:
-        """Quantize one tensor and return MLX tensors in the usual layout."""
+        # see docs/port-notes/functions.md :: quantize_tensor
         import mlx.core as mx
 
         from .models.llm.gptq import gptq_quantize, rtn_quantize
@@ -687,26 +667,14 @@ _CARRIER_DTYPES = {
 
 
 def _carry(tensor, code: str) -> np.ndarray:
-    """Copy one source tensor into a small owned array in its carrier dtype.
-
-    The copy is the point: the source buffer belongs to a lazily-read shard
-    handle, and converted arrays that still referenced it would pin the whole
-    shard in memory. Every layout transpose therefore happens *after* this
-    copy, on the owned array. bfloat16 is viewed as ``uint16`` first because
-    ``torch.Tensor.numpy`` refuses the bfloat16 scalar type outright.
-    """
+    # see docs/port-notes/functions.md :: _carry
     if code == "BF16":
         tensor = tensor.view(__import__("torch").uint16)
     return np.ascontiguousarray(tensor.numpy())
 
 
 def _bf16_carrier_to(array: np.ndarray, dtype: str) -> np.ndarray:
-    """Round a ``uint16``-carried bfloat16 tensor to the requested precision.
-
-    bfloat16 -> float32 is exact (a 16-bit left shift; the shift must be done
-    in 32-bit lanes or the high half is discarded). The further round to
-    float16 happens on the host, exactly as an on-device ``astype`` would.
-    """
+    # see docs/port-notes/functions.md :: _bf16_carrier_to
     as_float32 = np.left_shift(array.astype(np.uint32), 16).view(np.float32)
     if dtype == "float32":
         return as_float32

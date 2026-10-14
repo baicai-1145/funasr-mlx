@@ -93,7 +93,7 @@ NUM_PREFIX_FRAMES = 4
 # --------------------------------------------------------------------------- #
 @dataclass
 class SenseVoiceEncoderSmallConfig:
-    """Mirror of FunASR's ``encoder_conf`` for ``SenseVoiceEncoderSmall``."""
+    # see docs/port-notes/functions.md :: SenseVoiceEncoderSmallConfig
 
     output_size: int = 512
     attention_heads: int = 4
@@ -123,7 +123,7 @@ class SenseVoiceEncoderSmallConfig:
 
 @dataclass
 class CTCConfig:
-    """Mirror of FunASR's ``ctc_conf`` (only the inference-relevant fields)."""
+    # see docs/port-notes/functions.md :: CTCConfig
 
     dropout_rate: float = 0.0
     ctc_type: str = "builtin"
@@ -140,11 +140,7 @@ class CTCConfig:
 
 @dataclass
 class SenseVoiceSmallConfig:
-    """Mirror of FunASR's ``model_conf`` for ``SenseVoiceSmall``.
-
-    The defaults are the published ``SenseVoiceSmall`` values
-    (``input_size=560``, 50 SANM blocks + 20 tail blocks, ``vocab_size=55465``).
-    """
+    # see docs/port-notes/functions.md :: SenseVoiceSmallConfig
 
     input_size: int = 560
     vocab_size: int = 55465
@@ -183,11 +179,7 @@ class SenseVoiceSmallConfig:
 
 
 def sensevoice_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs: Any):
-    """Build a :class:`SenseVoiceSmallConfig` from a FunASR ``model.yaml`` mapping.
-
-    Accepts either the flat ``model_conf`` block or the whole document with
-    ``model_conf``/``encoder_conf``/``ctc_conf`` sections.
-    """
+    # see docs/port-notes/functions.md :: sensevoice_config_from_dict
     data = dict(data or {})
     if "model_conf" in data and isinstance(data["model_conf"], Mapping):
         merged = dict(data["model_conf"])
@@ -202,11 +194,7 @@ def sensevoice_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs:
 # modules
 # --------------------------------------------------------------------------- #
 class CTC(mxnn.Module):
-    """``funasr.models.ctc.ctc.CTC`` restricted to its inference path.
-
-    The only parameter is ``ctc_lo`` (``Linear(encoder_output_size, odim)``);
-    the loss/argmax helpers of the reference are re-implemented on top of it.
-    """
+    # see docs/port-notes/functions.md :: CTC
 
     def __init__(
         self,
@@ -292,16 +280,7 @@ class SenseVoiceEncoderSmall(mxnn.Module):
         self.tp_norm = Float32LayerNorm(cfg.output_size)
 
     def _weight_dtype(self) -> mx.Dtype:
-        """Dtype of this encoder's checkpoint weights (``encoders0`` always exists).
-
-        Read through :func:`~funasr_mlx.models.llm.quant.activation_dtype` rather
-        than ``weight.dtype`` directly: the SANM stack is a documented
-        quantization target (``audio_encoder.`` is in fun-asr-nano's scope), and
-        a quantized Linear's ``weight`` holds packed ``uint32`` codes.  Casting
-        the fbank input to ``uint32`` would destroy it exactly as the decoder
-        embedding cast did.  The helper returns the side tensor's dtype for a
-        quantized module, so this stays correct either way.
-        """
+        # see docs/port-notes/functions.md :: _weight_dtype
         from .llm.quant import activation_dtype
 
         return activation_dtype(self.encoders0[0].self_attn.linear_q_k_v)
@@ -351,7 +330,7 @@ class SenseVoiceEncoderSmall(mxnn.Module):
 
 
 class SenseVoiceSmall(mxnn.Module):
-    """``funasr.models.sense_voice.model.SenseVoiceSmall`` (inference only)."""
+    # see docs/port-notes/functions.md :: SenseVoiceSmall
 
     def __init__(
         self,
@@ -378,11 +357,11 @@ class SenseVoiceSmall(mxnn.Module):
 
     # -- checkpoint helpers ------------------------------------------------- #
     def state_dict(self) -> dict[str, mx.array]:
-        """``{pytorch_name: mlx_array}`` in MLX layout (no key rewriting)."""
+        # see docs/port-notes/functions.md :: state_dict
         return checkpoint_state_dict(self)
 
     def load_checkpoint(self, tensors: Mapping[str, Any], **kwargs: Any) -> list[str]:
-        """Strict load; see :func:`funasr_mlx.models.sanm.load_strict`."""
+        # see docs/port-notes/functions.md :: load_checkpoint
         return load_strict(self, tensors, **kwargs)
 
     # -- forward ------------------------------------------------------------ #
@@ -469,7 +448,7 @@ class SenseVoiceSmall(mxnn.Module):
         text_norm: str | None = None,
         ban_emo_unk: bool = False,
     ) -> list[list[int]]:
-        """Greedy CTC token ids per utterance (mirrors ``SenseVoiceSmall.inference``)."""
+        # see docs/port-notes/functions.md :: greedy_decode
         logits = self.forward_logits(
             speech, speech_lengths, language, use_itn, text_norm, ban_emo_unk
         )
@@ -484,11 +463,7 @@ def ctc_greedy_decode(
     lengths: mx.array | Sequence[int] | None = None,
     blank_id: int = 0,
 ) -> list[list[int]]:
-    """``argmax`` -> ``unique_consecutive`` -> drop ``blank_id``.
-
-    Faithful to ``SenseVoiceSmall.inference``: consecutive duplicates collapse
-    *before* blanks are removed, so ``[a, blank, a]`` decodes to ``[a, a]``.
-    """
+    # see docs/port-notes/functions.md :: ctc_greedy_decode
     ids = mx.argmax(log_probs, axis=-1)
     if lengths is None:
         lengths_arr = mx.full((ids.shape[0],), ids.shape[1], dtype=mx.int32)

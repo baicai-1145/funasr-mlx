@@ -56,11 +56,7 @@ __all__ = [
 # masking / padding helpers
 # --------------------------------------------------------------------------- #
 def sequence_mask(lengths: Any, maxlen: int | None = None, dtype: Any = mx.float32) -> mx.array:
-    """Port of ``funasr.models.scama.utils.sequence_mask``.
-
-    Returns a ``(batch, maxlen)`` array holding ``1.0`` on valid positions and
-    ``0.0`` on padded ones.  ``lengths`` may be ``(B,)`` or ``(B, 1)``.
-    """
+    # see docs/port-notes/functions.md :: sequence_mask
     lens = mx.asarray(lengths)
     if lens.ndim > 1:
         lens = lens.reshape(-1)
@@ -72,25 +68,14 @@ def sequence_mask(lengths: Any, maxlen: int | None = None, dtype: Any = mx.float
 
 
 def make_pad_mask(lengths: Any, maxlen: int | None = None) -> mx.array:
-    """Port of ``funasr.models.transformer.utils.nets_utils.make_pad_mask``.
-
-    Returns a boolean ``(batch, maxlen)`` array that is ``True`` on padded
-    positions (i.e. the logical inverse of :func:`sequence_mask`).
-    """
+    # see docs/port-notes/functions.md :: make_pad_mask
     return ~sequence_mask(lengths, maxlen, dtype=mx.bool_)
 
 
 def constant_pad_1d(
     x: mx.array, left: int, right: int, *, axis: int = -1, value: float = 0.0
 ) -> mx.array:
-    """``torch.nn.ConstantPad1d`` port.
-
-    MLX convolutions are **channels-last**: ``mx.conv1d`` consumes ``NLC`` and
-    ``mx.conv2d`` consumes ``NHWC``.  The reference SANM modules therefore pad
-    the *time* axis of an ``NLC`` tensor, which is ``axis=1`` -- not the last
-    axis as it is for PyTorch's ``NCL`` tensors.  ``axis`` is explicit so the
-    intent is visible at every call site.
-    """
+    # see docs/port-notes/functions.md :: constant_pad_1d
     if left == 0 and right == 0:
         return x
     axis = axis % x.ndim
@@ -100,14 +85,7 @@ def constant_pad_1d(
 
 
 def decimate_mask(x_mask: mx.array, stride: int = 2, end_offset: int = 2) -> mx.array:
-    """Port of the ``x_mask[:, :, :-2:2][:, :, :-2:2]`` subsampling masks.
-
-    ``torch`` slices with an explicit stop index (``[:-2]`` stops at
-    ``length - 2``); MLX negative-stop semantics are easy to get subtly wrong,
-    so the equivalent index vector is built explicitly and applied with
-    :func:`mx.take`.  ``stride=2`` models ``[:-2:2]`` and ``stride=1`` models
-    ``[:-2:1]``; both stop at ``length - end_offset``.
-    """
+    # see docs/port-notes/functions.md :: decimate_mask
     length = x_mask.shape[-1]
     indices = [i for i in range(0, length - end_offset, stride)]
     if not indices:
@@ -154,7 +132,7 @@ def _module_layout_rule(module: mxnn.Module) -> str:
 
 
 def convert_checkpoint_tensor(name: str, array: mx.array, rule: str | None = None) -> mx.array:
-    """Convert one PyTorch checkpoint tensor into the MLX layout (shared kernel)."""
+    # see docs/port-notes/functions.md :: convert_checkpoint_tensor
     if rule is None:
         rule = _rule_for_name(name)
     out = _convert_tensor(name, array, rule, (CONV1D_LAYOUT, CONV2D_LAYOUT))
@@ -171,20 +149,14 @@ def _rule_for_name(name: str) -> str:
 
 
 def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> dict[str, mx.array]:
-    """Flatten a module tree into FunASR/PyTorch-compatible parameter names.
-
-    Names are built from the Module's **mapping storage** (see
-    :func:`_flatten_into`), which is the only place MLX can hold a tensor.  The
-    result matches what ``torch.nn.Module.state_dict()`` produces for the
-    corresponding PyTorch modules.
-    """
+    # see docs/port-notes/functions.md :: flatten_state_dict
     return _flatten(module, prefix)[0]
 
 
 def flatten_state_dict_with_rules(
     module: mxnn.Module, prefix: str = ""
 ) -> tuple[dict[str, mx.array], dict[str, str]]:
-    """Like :func:`flatten_state_dict`, but also returns the per-key layout rule."""
+    # see docs/port-notes/functions.md :: flatten_state_dict_with_rules
     return _flatten(module, prefix)
 
 
@@ -233,11 +205,7 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
 
 
 def checkpoint_state_dict(module: mxnn.Module) -> dict[str, mx.array]:
-    """Return the module's parameters as ``{pytorch_name: mlx_array}``.
-
-    The names are byte-compatible with the FunASR ``.pt`` checkpoints; the
-    arrays are already in MLX layout.
-    """
+    # see docs/port-notes/functions.md :: checkpoint_state_dict
     return flatten_state_dict(module)
 
 
@@ -332,14 +300,7 @@ class ModuleStack(mxnn.Module):
         return dict.__getitem__(self, key)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Chain blocks with canonical ``nn.Sequential`` semantics.
-
-        The leading argument is threaded through the chain while the remaining
-        positional arguments and the keywords stay fixed.  Feeding a block's
-        *return value* back as ``*args`` instead would unpack an ``mx.array``
-        along axis 0 and hand the next block ``B`` separate arguments, which
-        only works at batch size 1 or when the arities happen to line up.
-        """
+        # see docs/port-notes/functions.md :: __call__
         if not args:
             raise TypeError(f"{type(self).__name__}.__call__() requires at least one argument")
         head, *rest = args
@@ -349,7 +310,7 @@ class ModuleStack(mxnn.Module):
 
 
 def repeat(num_blocks: int, factory: Callable[[int], mxnn.Module]) -> ModuleStack:
-    """Port of ``funasr.models.transformer.utils.repeat.repeat``."""
+    # see docs/port-notes/functions.md :: repeat
     if num_blocks < 0:
         raise ValueError(f"num_blocks must be >= 0, got {num_blocks}")
     return ModuleStack([factory(index) for index in range(num_blocks)])
@@ -359,12 +320,7 @@ def repeat(num_blocks: int, factory: Callable[[int], mxnn.Module]) -> ModuleStac
 # normalisation
 # --------------------------------------------------------------------------- #
 class LayerNorm(mxnn.LayerNorm):
-    """``funasr.models.transformer.layer_norm.LayerNorm`` (eps ``1e-12``).
-
-    Parameter names are ``weight``/``bias`` and the normalisation axis is the
-    last one, exactly like the PyTorch original.  MLX performs the reduction in
-    float32 internally, which matches ``torch.nn.LayerNorm`` for float32 inputs.
-    """
+    # see docs/port-notes/functions.md :: LayerNorm
 
     def __init__(self, num_features: int, dim: int = -1, eps: float = 1e-12) -> None:
         super().__init__(num_features, eps=eps)
@@ -372,13 +328,7 @@ class LayerNorm(mxnn.LayerNorm):
 
 
 class Float32LayerNorm(mxnn.LayerNorm):
-    """``funasr.models.sense_voice.model.LayerNorm`` (eps ``1e-5``, fp32 math).
-
-    SenseVoice keeps its own ``LayerNorm`` that inherits the ``torch`` default
-    ``eps=1e-5`` and forces the reduction to float32 before casting the result
-    back to the input dtype.  Reproducing the explicit cast keeps the fp16 path
-    numerically identical to the reference.
-    """
+    # see docs/port-notes/functions.md :: Float32LayerNorm
 
     def __init__(self, num_features: int, dim: int = -1, eps: float = 1e-5) -> None:
         super().__init__(num_features, eps=eps)
@@ -437,12 +387,7 @@ class PositionalEncoding(mxnn.Module):
 
 
 class SinusoidalPositionEncoder(mxnn.Module):
-    """``funasr.models.transformer.embedding.SinusoidalPositionEncoder``.
-
-    Note the reference divides ``log(10000)`` by ``depth / 2 - 1`` (not by
-    ``depth / 2``), i.e. positions start at ``1`` and the wavelength exponent
-    denominator is ``depth / 2 - 1``.  Both quirks are preserved.
-    """
+    # see docs/port-notes/functions.md :: SinusoidalPositionEncoder
 
     def __init__(self, d_model: int = 80, dropout_rate: float = 0.1) -> None:
         super().__init__()
@@ -470,7 +415,7 @@ class SinusoidalPositionEncoder(mxnn.Module):
 # feed forward
 # --------------------------------------------------------------------------- #
 class PositionwiseFeedForward(mxnn.Module):
-    """``funasr.models.transformer.positionwise_feed_forward.PositionwiseFeedForward``."""
+    # see docs/port-notes/functions.md :: PositionwiseFeedForward
 
     def __init__(self, idim: int, hidden_units: int, dropout_rate: float = 0.1) -> None:
         super().__init__()
@@ -482,11 +427,7 @@ class PositionwiseFeedForward(mxnn.Module):
 
 
 class PositionwiseFeedForwardDecoderSANM(mxnn.Module):
-    """``funasr.models.sanm.positionwise_feed_forward.PositionwiseFeedForwardDecoderSANM``.
-
-    Two details matter for checkpoint compatibility: ``w_2`` has **no bias** and
-    the ``norm`` sits *between* the two linears and uses ``eps=1e-12``.
-    """
+    # see docs/port-notes/functions.md :: PositionwiseFeedForwardDecoderSANM
 
     def __init__(
         self,
@@ -508,13 +449,7 @@ class PositionwiseFeedForwardDecoderSANM(mxnn.Module):
 # attention
 # --------------------------------------------------------------------------- #
 class MultiHeadedAttentionSANM(mxnn.Module):
-    """``funasr.models.sanm.attention.MultiHeadedAttentionSANM``.
-
-    Fused QKV projection (``linear_q_k_v``) plus a depth-wise FSMN memory block
-    whose output is added to the attention output.  The reference applies
-    ``d_k ** -0.5`` to the queries *after* splitting heads (equivalent to
-    scaling the scores by ``1/sqrt(d_k)``).
-    """
+    # see docs/port-notes/functions.md :: MultiHeadedAttentionSANM
 
     def __init__(
         self,
@@ -544,7 +479,7 @@ class MultiHeadedAttentionSANM(mxnn.Module):
         self._kernel_size = int(kernel_size)
 
     def _split_heads(self, x: mx.array) -> mx.array:
-        """``(B, T, n_feat)`` -> ``(B, head, T, d_k)``."""
+        # see docs/port-notes/functions.md :: _split_heads
         b, t, _ = x.shape
         return mx.transpose(mx.reshape(x, (b, t, self._h, self._d_k)), (0, 2, 1, 3))
 
@@ -601,16 +536,7 @@ class MultiHeadedAttentionSANM(mxnn.Module):
 
 
 class MultiHeadedAttentionSANMDecoder(mxnn.Module):
-    """``funasr.models.sanm.attention.MultiHeadedAttentionSANMDecoder``.
-
-    Pure FSMN memory block over the decoder input.  ``cache`` mirrors the
-    reference streaming state; offline inference passes ``None``.
-
-    Deviation: the cache is kept channels-last ``(b, L, d)`` whereas the
-    reference keeps ``(b, d, L)``.  See the module docstring's "Known
-    deviations" section -- this matters only for the streaming/export contract,
-    not for offline inference.
-    """
+    # see docs/port-notes/functions.md :: MultiHeadedAttentionSANMDecoder
 
     def __init__(
         self, n_feat: int, dropout_rate: float = 0.0, kernel_size: int = 11, sanm_shfit: int = 0
@@ -632,7 +558,7 @@ class MultiHeadedAttentionSANMDecoder(mxnn.Module):
         mask: mx.array | None = None,
         cache: mx.array | None = None,
     ) -> tuple[mx.array, mx.array | None]:
-        """``inputs`` is ``(B, T, D)`` (MLX NLC); ``cache`` mirrors the reference."""
+        # see docs/port-notes/functions.md :: __call__
         b = inputs.shape[0]
         t = inputs.shape[1]
         if mask is not None:
@@ -653,7 +579,7 @@ class MultiHeadedAttentionSANMDecoder(mxnn.Module):
 
 
 class MultiHeadedAttentionCrossAtt(mxnn.Module):
-    """``funasr.models.sanm.attention.MultiHeadedAttentionCrossAtt``."""
+    # see docs/port-notes/functions.md :: MultiHeadedAttentionCrossAtt
 
     def __init__(
         self,
@@ -727,11 +653,7 @@ class MultiHeadedAttentionCrossAtt(mxnn.Module):
 # encoder / decoder layers
 # --------------------------------------------------------------------------- #
 class EncoderLayerSANM(mxnn.Module):
-    """``funasr.models.sanm.encoder.EncoderLayerSANM`` (offline inference path).
-
-    The first layer (``encoders0``) has ``in_size != size``; in that case the
-    self-attention residual is dropped exactly like the reference does.
-    """
+    # see docs/port-notes/functions.md :: EncoderLayerSANM
 
     def __init__(
         self,
@@ -782,12 +704,7 @@ class EncoderLayerSANM(mxnn.Module):
 
 
 class DecoderLayerSANM(mxnn.Module):
-    """``funasr.models.paraformer.decoder.DecoderLayerSANM``.
-
-    Note the ordering: the feed-forward runs **first** and the self-attention
-    residual is taken against the block *input* (``residual``), not against the
-    feed-forward output.  ``src_attn`` may be ``None`` (the ``decoders2`` stack).
-    """
+    # see docs/port-notes/functions.md :: DecoderLayerSANM
 
     def __init__(
         self,
@@ -838,7 +755,7 @@ class DecoderLayerSANM(mxnn.Module):
 # subsampling front-ends
 # --------------------------------------------------------------------------- #
 class TooShortUttError(Exception):
-    """Port of ``funasr.models.transformer.utils.subsampling.TooShortUttError``."""
+    # see docs/port-notes/functions.md :: TooShortUttError
 
     def __init__(self, message: str, actual_size: int, limit: int) -> None:
         super().__init__(message)
@@ -847,7 +764,7 @@ class TooShortUttError(Exception):
 
 
 def check_short_utt(embed: mxnn.Module, size: int) -> tuple[bool, int]:
-    """Port of ``funasr.models.transformer.utils.subsampling.check_short_utt``."""
+    # see docs/port-notes/functions.md :: check_short_utt
     if isinstance(embed, Conv2dSubsampling2) and size < 3:
         return True, 3
     if isinstance(embed, Conv2dSubsampling) and size < 7:
@@ -856,16 +773,7 @@ def check_short_utt(embed: mxnn.Module, size: int) -> tuple[bool, int]:
 
 
 class Conv2dSubsampling(mxnn.Module):
-    """``funasr.models.transformer.utils.subsampling.Conv2dSubsampling`` (1/4).
-
-    Two strided 3x3 convolutions over the ``(B, T, F, 1)`` view followed by a
-    linear projection.  Parameter keys stay ``conv.<i>.weight`` and
-    ``out.0.weight`` thanks to :class:`ModuleStack`.
-
-    MLX convolutions are channels-last, so the channel axis comes **last**
-    (``(B, T, F, C)``).  The flatten before ``out.0`` is transposed back to
-    PyTorch's ``(C, F)`` row-major order, which is what ``out.0`` was trained on.
-    """
+    # see docs/port-notes/functions.md :: Conv2dSubsampling
 
     def __init__(self, idim: int, odim: int, dropout_rate: float = 0.1) -> None:
         super().__init__()
@@ -899,7 +807,7 @@ class Conv2dSubsampling(mxnn.Module):
 
 
 class Conv2dSubsampling2(mxnn.Module):
-    """``funasr.models.transformer.utils.subsampling.Conv2dSubsampling2`` (1/2)."""
+    # see docs/port-notes/functions.md :: Conv2dSubsampling2
 
     def __init__(self, idim: int, odim: int, dropout_rate: float = 0.1) -> None:
         super().__init__()

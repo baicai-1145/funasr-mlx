@@ -1,4 +1,4 @@
-"""Strict, local-only model construction and shard loading."""
+"""Port notes: docs/port-notes/pipeline.py.md"""
 
 from __future__ import annotations
 
@@ -93,11 +93,7 @@ def create_model(family: str, config: dict):
 
 
 def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict | None = None):
-    """Prevalidate every key/shape, then load one bounded shard at a time.
-
-    Only native-layout, explicitly tagged checkpoints are admitted. Running in
-    a guarded child is mandatory; importing this module does not load MLX.
-    """
+    # see docs/port-notes/functions.md :: load_model
     if not guarded_child_active():
         raise RuntimeError("Use the guarded CLI to load models")
     policy = MemoryPolicy(**json.loads(os.environ["FUNASR_MLX_MEMORY_POLICY"]))

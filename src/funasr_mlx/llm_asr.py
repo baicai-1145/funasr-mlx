@@ -1,15 +1,4 @@
-"""LLM-ASR transcription drivers for the CLI / API / server layers.
-
-One module, three consumers:
-* ``funasr-mlx transcribe`` (CLI) -- single-shot, guarded child.
-* ``funasr_mlx.transcribe()`` (Python API) -- resident worker with KV
-  reset-reuse across calls (validated bit-stable on M4; the RTF numbers in
-  the README come from this pattern).
-* ``funasr_mlx serve`` (HTTP) -- wraps the same driver.
-
-The per-family prompt/decode protocols are the acceptance-validated ones
-(tools/gptq_acceptance.py); token-level behavior is identical.
-"""
+"""Port notes: docs/port-notes/llm_asr.py.md"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -39,12 +28,7 @@ class TranscribeResult:
 
 
 class LlmAsrTranscriber:
-    """Resident transcriber: one model load, many calls.
-
-    Construct inside a guarded child (``memory.run_guarded``); the API layer
-    arranges that. KV caches are allocated once and reset (offset=0) between
-    utterances -- reuse validated bit-stable in .tmp/opt/LOG.md.
-    """
+    # see docs/port-notes/functions.md :: LlmAsrTranscriber
 
     def __init__(self, checkpoint: str | Path, *, family: str, max_tokens: int = 96):
         import mlx.core as mx

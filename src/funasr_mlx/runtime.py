@@ -1,4 +1,4 @@
-"""Guarded Python launcher; the package root remains dependency-lazy."""
+"""Port notes: docs/port-notes/runtime.py.md"""
 
 from __future__ import annotations
 

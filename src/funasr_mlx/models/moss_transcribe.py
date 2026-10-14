@@ -1,14 +1,4 @@
-"""MOSS-Transcribe-Diarize: Whisper-Medium encoder + VQAdaptor + Qwen3-0.6B.
-
-Reference: OpenMOSS-Team/MOSS-Transcribe-Diarize ``modeling_moss_transcribe_diarize.py``
-(ships with the checkpoint; MIT). The audio tower is the **HF transformers**
-``WhisperEncoder`` layout (NOT openai/whisper): conv1 stride 2 + conv2
-stride 1 (one 2x downsample total), a LEARNED ``embed_positions`` table
-(1500, 1024), 24 pre-norm blocks with ``self_attn_layer_norm`` /
-``final_layer_norm`` (LayerNorm with bias), MHA with q/k/v/out biases,
-fc1/fc2 GELU, no top-level norm. Text side reuses :mod:`.llm.qwen3`
-(q_norm/k_norm, tie_word_embeddings).
-"""
+"""Port notes: docs/port-notes/moss_transcribe.py.md"""
 
 from __future__ import annotations
 
@@ -42,16 +32,7 @@ class _HfWhisperBlock(mxnn.Module):
 
 
 class _HfWhisperAttn(mxnn.Module):
-    """HF ``WhisperAttention``: q/v/out carry biases, **k does not**.
-
-    ``k_proj`` is bias-free in the reference (``nn.Linear(embed_dim,
-    embed_dim, bias=False)`` in transformers' ``modeling_whisper.py``), and the
-    checkpoint agrees: ``...self_attn.k_proj.bias`` is absent from all 24
-    layers.  Building it with ``bias=True`` therefore left a random,
-    never-trained key bias in the audio tower -- measured on the previous
-    release: exists=True, absmax 0.0312, absmean 0.0158.  The old permissive
-    loaders never noticed, which is why MOSS tower parity sat at 1.3e-3.
-    """
+    # see docs/port-notes/functions.md :: _HfWhisperAttn
 
     def __init__(self, d: int, heads: int) -> None:
         super().__init__()
@@ -75,7 +56,7 @@ class _HfWhisperAttn(mxnn.Module):
 
 
 class HfWhisperEncoder(mxnn.Module):
-    """HF ``WhisperEncoder`` (inference): mel (F, T) -> (1, T/2, d)."""
+    # see docs/port-notes/functions.md :: HfWhisperEncoder
 
     def __init__(self, n_mels: int, d: int, layers: int, heads: int, ffn: int,
                  max_source_positions: int) -> None:
@@ -96,7 +77,7 @@ class HfWhisperEncoder(mxnn.Module):
 
 
 class VQAdaptor(mxnn.Module):
-    """Linear(input_dim->hidden) + SiLU + Linear(hidden->hidden) + LN(1e-6)."""
+    # see docs/port-notes/functions.md :: VQAdaptor
 
     def __init__(self, input_dim: int, hidden: int) -> None:
         super().__init__()
@@ -114,7 +95,7 @@ class VQAdaptor(mxnn.Module):
 
 
 class MossTranscribeDiarize(mxnn.Module):
-    """whisper_encoder + vq_adaptor + qwen3 (audio-token splice)."""
+    # see docs/port-notes/functions.md :: MossTranscribeDiarize
 
     def __init__(
         self,
@@ -139,15 +120,12 @@ class MossTranscribeDiarize(mxnn.Module):
         self.audio_token_id = audio_token_id
 
     def encode_audio(self, mel: mx.array) -> mx.array:
-        """mel (F, T) -> whisper (1, T/2, 1024) -> adaptor (1, T/8, hidden)."""
+        # see docs/port-notes/functions.md :: encode_audio
         whisper_hidden = self.whisper_encoder(mel)
         return self.encode_audio_from_hidden(whisper_hidden)
 
     def encode_audio_from_hidden(self, whisper_hidden: mx.array) -> mx.array:
-        """Merged/chunked whisper output (1, T, 1024) -> adaptor (1, T/4, hidden).
-
-        Trims to a multiple of the merge size first (official time_merge).
-        """
+        # see docs/port-notes/functions.md :: encode_audio_from_hidden
         m = self.audio_merge_size
         b, t, d = whisper_hidden.shape
         trim = (t // m) * m
@@ -156,12 +134,7 @@ class MossTranscribeDiarize(mxnn.Module):
         return self.vq_adaptor(x)
 
     def _decoder_dtype(self) -> mx.Dtype:
-        """Dtype the decoder activations must follow.
-
-        Read through :func:`activation_dtype`, not ``weight.dtype``: a quantized
-        embedding stores packed ``uint32`` codes in ``weight``, and casting the
-        spliced audio embeddings to ``uint32`` destroys them.
-        """
+        # see docs/port-notes/functions.md :: _decoder_dtype
         from .llm.quant import activation_dtype
 
         return activation_dtype(self.language_model.model.embed_tokens)
@@ -173,7 +146,7 @@ class MossTranscribeDiarize(mxnn.Module):
         pad_span: int,
         caches: list[KVCache] | None = None,
     ) -> mx.array:
-        """Replace the audio-token run with adaptor output (shared splice)."""
+        # see docs/port-notes/functions.md :: forward_with_audio
         lm = self.language_model
         return splice_and_forward(
             token_ids, audio_embeds, pad_span, caches,

@@ -1,4 +1,4 @@
-"""Bounded native MLX audio features; no PyTorch inference dependency."""
+"""Port notes: docs/port-notes/frontend.py.md"""
 
 from __future__ import annotations
 

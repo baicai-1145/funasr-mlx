@@ -69,12 +69,7 @@ CONV1D_LAYOUT = "conv1d_torch_out_ink_to_mlx_out_ki"
 # containers / checkpoint plumbing (self-contained by design)
 # --------------------------------------------------------------------------- #
 class ModuleStack(mxnn.Module):
-    """Ordered children registered under their numeric index.
-
-    ``torch.nn.Sequential`` yields ``<parent>.<i>.<leaf>`` parameter names; MLX's
-    ``nn.Sequential`` would insert a ``layers`` level, so children are registered
-    directly under ``"0"``, ``"1"``, ...
-    """
+    # see docs/port-notes/functions.md :: ModuleStack
 
     def __init__(self, blocks: Sequence[mxnn.Module]) -> None:
         super().__init__()
@@ -123,7 +118,7 @@ def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_L
 
 
 def _rule_for(module: mxnn.Module) -> str:
-    """Conv1d is the only module whose MLX layout differs from PyTorch's."""
+    # see docs/port-notes/functions.md :: _rule_for
     return CONV1D_LAYOUT if isinstance(module, mxnn.Conv1d) else IDENTITY_LAYOUT
 
 
@@ -164,13 +159,7 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
 
 @dataclass
 class LayoutReport(Mapping):
-    """Flat parameter tensors plus the layout rule that applies to each key.
-
-    Behaves like a read-only ``Mapping`` of ``{parameter_name: mlx_array}``, so it
-    can be iterated, indexed, ``len()``-ed and fed to ``dict(...)`` exactly like a
-    plain state dict, while also carrying the per-key rule used for the
-    torch -> MLX layout conversion.
-    """
+    # see docs/port-notes/functions.md :: LayoutReport
 
     tensors: dict[str, mx.array]
     rules: dict[str, str]
@@ -201,12 +190,7 @@ class LayoutReport(Mapping):
 
 
 def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> LayoutReport:
-    """Flatten a module tree into FunASR/PyTorch-compatible parameter names.
-
-    The layout rule is derived from the owning module type rather than from a
-    name pattern, so it cannot silently mis-convert a renamed submodule.
-    Attributes starting with ``_`` are configuration, never weights.
-    """
+    # see docs/port-notes/functions.md :: flatten_state_dict
     tensors: dict[str, mx.array] = {}
     rules: dict[str, str] = {}
     _flatten_into(module, prefix, tensors, rules)
@@ -216,16 +200,7 @@ def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> LayoutReport:
 def flatten_state_dict_with_rules(
     module: mxnn.Module, prefix: str = ""
 ) -> tuple[dict[str, mx.array], dict[str, str]]:
-    """Like :func:`flatten_state_dict`, but also returns the per-key layout rule.
-
-    Returns ``(tensors, rules)`` with the same two dictionaries that the
-    :class:`LayoutReport` carries -- nothing is dropped and the rule metadata is
-    not recomputed by a second walk.  This is the contract
-    :func:`funasr_mlx.models.sanm.flatten_state_dict_with_rules` and
-    :func:`funasr_mlx.models.campplus.flatten_state_dict_with_rules` expose, so
-    the three model modules agree on one name for the same operation; callers
-    that want the richer object should use :func:`flatten_state_dict` instead.
-    """
+    # see docs/port-notes/functions.md :: flatten_state_dict_with_rules
     report = flatten_state_dict(module, prefix)
     return report.tensors, report.rules
 
@@ -236,7 +211,7 @@ class CheckpointKeyError(KeyError):
 
 @dataclass
 class LoadReport:
-    """Outcome of a :func:`load_strict` call."""
+    # see docs/port-notes/functions.md :: LoadReport
 
     loaded: list[str]
 
@@ -252,12 +227,7 @@ def load_strict(
     convert: bool = False,
     dtype: Any | None = None,
 ) -> LoadReport:
-    """Load ``tensors`` into ``module``, refusing any key mismatch.
-
-    Arrays must already be in MLX layout unless ``convert=True`` (raw PyTorch
-    ``state_dict``).  Raises :class:`CheckpointKeyError` listing the offending
-    keys, and ``ValueError`` on any shape mismatch -- never a partial load.
-    """
+    # see docs/port-notes/functions.md :: load_strict
     report = flatten_state_dict(module)
     expected = {f"{prefix}{k}": v for k, v in report.tensors.items()}
     incoming = dict(tensors)
@@ -317,13 +287,7 @@ class Linear(mxnn.Linear):
 
 
 class LayerNorm(mxnn.LayerNorm):
-    """``whisper.model.LayerNorm`` -- fp32 reduction, torch's default ``eps=1e-5``.
-
-    The reference casts the input to ``float32`` before normalising and casts
-    the result back to the input dtype; MLX's ``LayerNorm`` already accumulates
-    in float32, so the explicit round-trip is kept for clarity and for the fp16
-    path.
-    """
+    # see docs/port-notes/functions.md :: LayerNorm
 
     def __init__(self, n_state: int, eps: float = 1e-5) -> None:
         super().__init__(n_state, eps=eps)
@@ -334,13 +298,7 @@ class LayerNorm(mxnn.LayerNorm):
 
 
 def sinusoids(length: int, channels: int, max_timescale: int = 10000) -> mx.array:
-    """Port of ``whisper.model.sinusoids``.
-
-    Note this is **0-based** and uses ``-log_increment * arange(channels // 2)``
-    -- different from FunASR's ``SinusoidalPositionEncoder`` (1-based, positive
-    increments), which the SANM blocks use.  Both quirks matter and both are
-    preserved exactly.
-    """
+    # see docs/port-notes/functions.md :: sinusoids
     if channels % 2 != 0:
         raise ValueError(f"sinusoids requires an even channel count, got {channels}")
     log_timescale_increment = math.log(max_timescale) / (channels // 2 - 1)
@@ -377,11 +335,11 @@ class MultiHeadAttention(mxnn.Module):
 
     @property
     def cache_prefix(self) -> str:
-        """Cache key prefix for this attention (e.g. ``"blocks.0.attn"``)."""
+        # see docs/port-notes/functions.md :: cache_prefix
         return self._prefix
 
     def _split(self, x: mx.array) -> mx.array:
-        """``(B, T, C)`` -> ``(B, H, T, d)``."""
+        # see docs/port-notes/functions.md :: _split
         b, t, _ = x.shape
         return mx.transpose(mx.reshape(x, (b, t, self._n_head, -1)), (0, 2, 1, 3))
 
@@ -392,17 +350,7 @@ class MultiHeadAttention(mxnn.Module):
         v: mx.array,
         mask: mx.array | None = None,
     ) -> tuple[mx.array, mx.array]:
-        """Port of ``MultiHeadAttention.qkv_attention`` (the non-SDPA path).
-
-        Layouts follow the reference exactly: ``q`` is ``(B, H, T, d)`` and
-        ``k`` is **transposed** to ``(B, H, d, T)``.  That ``.permute(0, 2, 3, 1)``
-        in the reference is what makes ``q @ k`` contract the head dimension and
-        produce the ``(B, H, T, T)`` score matrix; leaving ``k`` as
-        ``(B, H, T, d)`` would contract ``T`` with ``T`` instead.
-
-        Whisper applies ``(n_state // n_head) ** -0.25`` to *both* ``q`` and
-        ``k``, which is exactly a ``d_k ** -0.5`` factor on the scores.
-        """
+        # see docs/port-notes/functions.md :: qkv_attention
         n_ctx = q.shape[2]
         scale = (self._n_state // self._n_head) ** -0.25
         q = q * scale
@@ -538,7 +486,7 @@ class ResidualAttentionBlock(mxnn.Module):
 # --------------------------------------------------------------------------- #
 @dataclass
 class ModelDimensions:
-    """Mirror of ``whisper.model.ModelDimensions``."""
+    # see docs/port-notes/functions.md :: ModelDimensions
 
     n_mels: int = 80
     n_audio_ctx: int = 1500
@@ -569,7 +517,7 @@ class ModelDimensions:
 
 @dataclass
 class WhisperConfig:
-    """Mirror of ``funasr/models/whisper/model.py::Whisper``'s inference config."""
+    # see docs/port-notes/functions.md :: WhisperConfig
 
     dims: ModelDimensions = None  # type: ignore[assignment]
     device: str = "cpu"
@@ -602,11 +550,7 @@ class WhisperConfig:
 
 
 def whisper_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs: Any) -> WhisperConfig:
-    """Build a :class:`WhisperConfig` from a FunASR ``model.yaml``-like mapping.
-
-    ``WhisperParameters`` is also accepted as an alias for the ``parameters``
-    section of FunASR's document.
-    """
+    # see docs/port-notes/functions.md :: whisper_config_from_dict
     data = dict(data or {})
     for section in ("model_conf", "parameters", "WhisperParameters", "parameters_inferred"):
         if section in data and isinstance(data[section], Mapping):
@@ -628,14 +572,7 @@ def whisper_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs: An
 # encoder / decoder / model
 # --------------------------------------------------------------------------- #
 class AudioEncoder(mxnn.Module):
-    """``whisper.model.AudioEncoder``.
-
-    ``mel`` is channels-last ``(B, T', n_mels)``; the reference's
-    ``permute(0, 2, 1)`` after ``conv2`` is unnecessary under MLX's channels-last
-    Conv1d.  ``positional_embedding`` is materialised (the reference registers it
-    as a persistent buffer) so it round-trips through strict loading; the
-    regenerated value is identical to :func:`sinusoids`.
-    """
+    # see docs/port-notes/functions.md :: AudioEncoder
 
     def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int) -> None:
         super().__init__()
@@ -653,7 +590,7 @@ class AudioEncoder(mxnn.Module):
         self._n_ctx = n_ctx
 
     def _weight_dtype(self) -> mx.Dtype:
-        """Dtype of this module's checkpoint weights (``conv1`` always exists)."""
+        # see docs/port-notes/functions.md :: _weight_dtype
         return self.conv1.weight.dtype
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -697,12 +634,7 @@ class AudioEncoder(mxnn.Module):
 
 
 class TextDecoder(mxnn.Module):
-    """``whisper.model.TextDecoder`` with an explicit MLX KV cache.
-
-    The causal mask is **not** a parameter: the reference registers it with
-    ``persistent=False``, so it never appears in a ``state_dict`` and is
-    regenerated on demand here.
-    """
+    # see docs/port-notes/functions.md :: TextDecoder
 
     def __init__(self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int) -> None:
         super().__init__()
@@ -736,16 +668,11 @@ class TextDecoder(mxnn.Module):
         return self._mask
 
     def _weight_dtype(self) -> mx.Dtype:
-        """Dtype of this module's checkpoint weights (``ln`` always exists)."""
+        # see docs/port-notes/functions.md :: _weight_dtype
         return self.ln.weight.dtype
 
     def offset(self, kv_cache: Mapping[str, mx.array] | None) -> int:
-        """Absolute position of the next token, from the self-attention cache.
-
-        The reference reads ``next(iter(kv_cache.values())).shape[1]``, which
-        relies on ``dict`` insertion order.  Here it is read deterministically
-        from the first block's self-attention key.
-        """
+        # see docs/port-notes/functions.md :: offset
         if not kv_cache or self._offset_key is None:
             return 0
         entry = kv_cache.get(self._offset_key)
@@ -820,12 +747,7 @@ class Whisper(mxnn.Module):
         return True
 
     def embed_audio(self, mel: mx.array) -> mx.array:
-        """Encode ``(B, 2 * n_audio_ctx, n_mels)`` mel frames.
-
-        The encoder casts the mel to its own weight dtype (see
-        :meth:`AudioEncoder.__call__`), so an fp16 checkpoint produces fp16
-        audio features even though the front-end mel is float32.
-        """
+        # see docs/port-notes/functions.md :: embed_audio
         return self.encoder(mel)
 
     def logits(
@@ -854,13 +776,7 @@ class Whisper(mxnn.Module):
 # front-end helpers (raw mel only -- no tokenizer, no downloads)
 # --------------------------------------------------------------------------- #
 def reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
-    """``torch.nn.functional.pad(..., mode="reflect")`` along the last axis.
-
-    The edge value is **not** repeated.  With ``x = [1, 2, 3, 4]`` and ``pad=2``
-    on both sides the result is ``[3, 2, 1, 2, 3, 4, 3, 2]``: the left filler
-    reads left-to-right as ``x[pad] ... x[1]`` and the right filler as
-    ``x[n-2] ... x[n-1-pad]`` -- both *descending* index runs.
-    """
+    # see docs/port-notes/functions.md :: reflect_pad_1d
     if pad <= 0:
         return x
     length = x.shape[-1]
@@ -872,7 +788,7 @@ def reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
 
 
 def pad_or_trim(x: mx.array, length: int = DEFAULT_N_SAMPLES, axis: int = -1) -> mx.array:
-    """Port of ``whisper.audio.pad_or_trim`` (zero-pad or truncate)."""
+    # see docs/port-notes/functions.md :: pad_or_trim
     if x.shape[axis] > length:
         index = [slice(None)] * x.ndim
         index[axis] = slice(0, length)
@@ -883,7 +799,7 @@ def pad_or_trim(x: mx.array, length: int = DEFAULT_N_SAMPLES, axis: int = -1) ->
 
 
 def _hz_to_mel(frequencies: mx.array) -> mx.array:
-    """Slaney mel scale (librosa default, ``htk=False``)."""
+    # see docs/port-notes/functions.md :: _hz_to_mel
     f_sp = 200.0 / 3.0
     min_log_hz = 1000.0
     min_log_mel = min_log_hz / f_sp
@@ -924,12 +840,7 @@ module, which is the blanket-private-drop failure this exists to avoid.
 
 
 def _is_non_persistent_buffer(owner: Any, key: str) -> bool:
-    """Whether ``owner``'s parameter ``key`` is a derived, non-persistent buffer.
-
-    ``isinstance`` rather than an exact type match, so a subclass still matches.
-    The result is independent of any flatten prefix or of whether the owning
-    module is reached standalone or as part of a full ``Whisper``.
-    """
+    # see docs/port-notes/functions.md :: _is_non_persistent_buffer
     return any(
         isinstance(owner, owner_type) and key == name for owner_type, name in NON_PERSISTENT_BUFFERS
     )
@@ -942,14 +853,7 @@ def mel_filterbank(
     fmin: float = 0.0,
     fmax: float | None = None,
 ) -> mx.array:
-    """Slaney-normalised mel filterbank, shape ``(n_mels, n_fft // 2 + 1)``.
-
-    Re-implementation of ``librosa.filters.mel(sr=16000, n_fft=400, n_mels=80)``,
-    which is how the reference's ``mel_filters.npz`` asset was produced.  **Not
-    numerically verified against the official asset** -- if the official array is
-    available, load it and pass it to :func:`log_mel_spectrogram` directly instead
-    of relying on this function.
-    """
+    # see docs/port-notes/functions.md :: mel_filterbank
     if n_fft % 2 != 0:
         raise ValueError(f"this filterbank builder assumes an even n_fft, got {n_fft}")
     if fmax is None:
@@ -1024,12 +928,7 @@ def log_mel_spectrogram(
 # --------------------------------------------------------------------------- #
 @dataclass
 class GreedyDecodeConfig:
-    """Bounds and logit filters for :func:`greedy_decode`.
-
-    ``eot_token_id`` and ``space_token_id`` **must** be supplied by the caller
-    (they depend on the BPE vocabulary of the particular checkpoint) or left as
-    ``None`` to disable the corresponding filter.  No default is guessed.
-    """
+    # see docs/port-notes/functions.md :: GreedyDecodeConfig
 
     max_tokens: int = 224
     eot_token_id: int | None = None
@@ -1043,7 +942,7 @@ class GreedyDecodeConfig:
 
 @dataclass
 class GreedyDecodeResult:
-    """Token-level greedy output (ids only; decoding to text is not provided)."""
+    # see docs/port-notes/functions.md :: GreedyDecodeResult
 
     tokens: list[list[int]]
     tokens_including_prompt: list[list[int]]
@@ -1052,14 +951,7 @@ class GreedyDecodeResult:
 
 
 def _suppress(logits: mx.array, ids: Sequence[int]) -> mx.array:
-    """Set the given vocabulary columns to ``-inf`` (a port of the logit filters).
-
-    ``vocab`` (V,) is broadcast **against** the banned ids (N,) rather than the
-    other way round, and the membership test is reduced over the N axis.  Building
-    a ``(1, V)`` and a ``(1, N)`` array and comparing them would only broadcast
-    when ``N == 1`` or ``N == V``; with two or more suppressed tokens and a
-    vocabulary of a different size it raises instead of masking.
-    """
+    # see docs/port-notes/functions.md :: _suppress
     banned = [int(t) for t in ids]
     if not banned:
         return logits

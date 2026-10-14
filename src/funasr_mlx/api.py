@@ -1,16 +1,4 @@
-"""First-class Python API for LLM-ASR transcription.
-
-``transcribe()`` routes through the guarded CLI subprocess (same memory
-policy as ``funasr-mlx transcribe``) and parses its JSON output.
-``TranscribeWorker`` gives callers a long-lived in-process handle when they
-already run inside their own guard (resident model, KV reset-reuse).
-
-Example:
-    from funasr_mlx.api import transcribe
-    result = transcribe("audio.wav",
-                        model="/path/to/qwen3-asr-0.6b-w4a16-awq-w8tower-g32")
-    print(result["text"])
-"""
+"""Port notes: docs/port-notes/api.py.md"""
 from __future__ import annotations
 
 import json
@@ -23,7 +11,7 @@ from typing import Any
 from .memory import GB, MB, MemoryPolicy, guarded_child_active
 
 def download_model(repo, *, variant=None, dest=".", owner=None):
-    """Download a published checkpoint (see funasr_mlx.download.download)."""
+    # see docs/port-notes/functions.md :: download_model
     from .download import download
 
     kwargs = {"variant": variant, "dest": dest}
@@ -33,17 +21,7 @@ def download_model(repo, *, variant=None, dest=".", owner=None):
 
 
 def pseudo_stream(model, *, family: str | None = None, chunk_seconds: float = 1.0):
-    """Create a PseudoStream bound to a loaded LLM transcriber.
-
-    Must run inside a guard (use with TranscribeWorker / guarded child):
-
-        worker = TranscribeWorker(model)
-        stream = worker.pseudo_stream(chunk_seconds=1.0)
-        for chunk in mic_chunks:
-            ev = stream.push(chunk)
-            if ev: render(ev.text)
-        final = stream.close()   # == offline output, bit-identical
-    """
+    # see docs/port-notes/functions.md :: pseudo_stream
     from .pseudo_streaming import PseudoStream
 
     transcriber = model if hasattr(model, "transcribe_samples") else TranscribeWorker(

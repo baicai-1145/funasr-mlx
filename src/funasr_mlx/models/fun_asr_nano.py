@@ -30,14 +30,7 @@ class AdaptorConfig:
 
 
 class TransformerAdaptor(mxnn.Module):
-    """``funasr.models.llm_asr.adaptor.Transformer`` (inference).
-
-    Stacks ``k`` frames (k=1 here), projects encoder_dim -> llm_dim through
-    an FFN, then runs standard encoder layers. The reference layers are
-    ESPnet-style ``EncoderLayer`` (post-norm when normalize_before=False,
-    which is the adaptor default: EncoderLayer's default normalize_before
-    is False) with ``MultiHeadedAttention`` and ``PositionwiseFeedForward``.
-    """
+    # see docs/port-notes/functions.md :: TransformerAdaptor
 
     def __init__(self, cfg: AdaptorConfig) -> None:
         super().__init__()
@@ -72,10 +65,7 @@ class TransformerAdaptor(mxnn.Module):
 
 
 class StandardMHA(mxnn.Module):
-    """ESPnet ``MultiHeadedAttention`` (transformer/attention.py): separate
-    ``linear_q/k/v`` + ``linear_out`` and NO fsmn memory -- the adaptor
-    checkpoint keys (``blocks.N.self_attn.linear_q...``) are exactly this
-    module, distinct from the SANM attention of the speech encoders."""
+    # see docs/port-notes/functions.md :: StandardMHA
 
     def __init__(self, n_head: int, n_feat: int, dropout_rate: float = 0.0) -> None:
         super().__init__()
@@ -149,7 +139,7 @@ class FunASRNanoConfig:
 
 
 class FunASRNano(mxnn.Module):
-    """``FunASRNano`` (inference): encode -> adapt -> LLM decode."""
+    # see docs/port-notes/functions.md :: FunASRNano
 
     def __init__(self, config: FunASRNanoConfig | None = None, **kwargs: Any) -> None:
         super().__init__()
@@ -161,7 +151,7 @@ class FunASRNano(mxnn.Module):
         self.llm = Qwen3ForCausalLM(llm_args)
 
     def encode_audio(self, speech: mx.array, speech_lengths: mx.array) -> mx.array:
-        """``(B, T, 560)`` LFR fbank -> adaptor embeddings ``(B, T', llm_dim)``."""
+        # see docs/port-notes/functions.md :: encode_audio
         enc, _ = self.audio_encoder(speech, speech_lengths)
         return self.audio_adaptor(enc)
 
@@ -171,7 +161,7 @@ class FunASRNano(mxnn.Module):
         speech_embeds: mx.array,
         speech_beg: int,
     ) -> mx.array:
-        """Token embeddings with the speech span spliced in, then one LLM pass."""
+        # see docs/port-notes/functions.md :: embed_with_speech
         h = self.llm.model.embed_tokens(token_ids)
         n = speech_embeds.shape[1]
         h = mx.concatenate([h[:, :speech_beg, :], speech_embeds, h[:, speech_beg + n :, :]], axis=1)
@@ -195,12 +185,7 @@ def nano_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs: Any) 
 
 
 def nano_config_from_nano_yaml(path: str) -> FunASRNanoConfig:
-    """Build the config from the official Fun-ASR-Nano ``config.yaml``.
-
-    Reads ``audio_encoder_conf`` / ``audio_adaptor_conf`` and pins the
-    Qwen3-0.6B ``llm_conf.args`` (the architecture of the shipped ``llm.*``
-    subtree, verified against the checkpoint).
-    """
+    # see docs/port-notes/functions.md :: nano_config_from_nano_yaml
     import yaml
 
     raw = yaml.safe_load(open(path).read())

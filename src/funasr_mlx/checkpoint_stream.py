@@ -1,4 +1,4 @@
-"""Bounded safetensors writing for contiguous large inference parameters."""
+"""Port notes: docs/port-notes/checkpoint_stream.py.md"""
 
 from __future__ import annotations
 
@@ -105,13 +105,7 @@ def write_tensor(
     chunk_bytes: int = 16_000_000,
     code: str | None = None,
 ):
-    """Write one tensor, converting only bounded slices rather than its full data.
-
-    ``code`` overrides the safetensors type code written for the payload; it is
-    how a bfloat16 tensor (carried as a ``uint16`` array, since NumPy has no
-    bfloat16) is stored as ``BF16`` rather than ``U16``. The override must agree
-    with the array's element width, so no reinterpretation can silently happen.
-    """
+    # see docs/port-notes/functions.md :: write_tensor
     output_dtype = np.dtype(dtype)
     if not array.flags.c_contiguous:
         raise ValueError("Large streaming tensors must be C-contiguous")

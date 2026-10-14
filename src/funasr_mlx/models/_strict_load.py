@@ -1,18 +1,4 @@
-"""Shared strict-loading kernel for the flat-checkpoint model families.
-
-Extracted from the near-identical copies in ct_punc.py, emotion2vec.py and
-fsmn_vad.py (duplication-audit cluster B). Differences that existed between
-the copies are parameters, not branches:
-
-* ``convert_checkpoint_tensors(state, rules)``: each family passes its own
-  key-suffix -> transform rules (fsmn_vad: 4-D depthwise (D,1,K,1)->(D,K,1);
-  ct_punc: 3-D depthwise (C,1,K)->(C,K,1); emotion2vec: none).
-* ``load_state_dict_strict(model, state, ignore_prefixes=...)``: the
-  fsmn_vad allow-list behavior is kept as the general signature.
-
-All transposes were validated against exact-source golden tests by the lead;
-behavior is byte-identical to the previous per-family copies.
-"""
+"""Port notes: docs/port-notes/_strict_load.py.md"""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -68,7 +54,7 @@ def _known_fields(cls: type, mapping: Mapping[str, Any], context: str) -> dict[s
 
 
 def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
-    """Flatten ``module.parameters()`` into FunASR-style dotted names."""
+    # see docs/port-notes/functions.md :: flat_parameter_names
     flat: dict[str, mx.array] = {}
 
     def walk(prefix: str, obj: Any) -> None:
@@ -91,11 +77,7 @@ def convert_checkpoint_tensors(
     state: Mapping[str, mx.array | Any],
     rules: Mapping[str, Callable[[str, mx.array], mx.array]] | None = None,
 ) -> dict[str, mx.array]:
-    """Convert a FunASR/PyTorch ``state_dict`` into MLX layout.
-
-    ``rules`` maps key suffixes to transforms; each family's depthwise-conv
-    transpose lives there. Everything else is copied verbatim.
-    """
+    # see docs/port-notes/functions.md :: convert_checkpoint_tensors
     converted: dict[str, mx.array] = {}
     for name, value in state.items():
         if not isinstance(value, mx.array):
@@ -131,7 +113,7 @@ def load_state_dict_strict(
     ignore_prefixes: Sequence[str] = (),
     rules: Mapping[str, Callable[[str, mx.array], mx.array]] | None = None,
 ) -> dict[str, mx.array]:
-    """Strictly load ``state`` into ``model``; raise on any mismatch."""
+    # see docs/port-notes/functions.md :: load_state_dict_strict
     expected = flat_parameter_names(model)
     provided = convert_checkpoint_tensors(state, rules)
 

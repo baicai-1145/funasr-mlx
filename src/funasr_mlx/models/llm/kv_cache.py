@@ -1,10 +1,4 @@
-"""Minimal KV cache for LLM-ASR decoders, ported from mlx-lm.
-
-Source: mlx-lm 0.32.0 ``mlx_lm/models/cache.py`` (Apache 2.0,
-Copyright © 2023-2024 Apple Inc.) -- only the basic ``KVCache`` used by
-the Qwen3-family models; the quantized/rotating/paged variants of
-upstream are not ported.
-"""
+"""Port notes: docs/port-notes/kv_cache.py.md"""
 
 from __future__ import annotations
 
@@ -14,15 +8,7 @@ __all__ = ["KVCache"]
 
 
 class KVCache:
-    """mlx-lm ``KVCache``: append-only keys/values with an offset cursor.
-
-    ``reserve`` pre-allocates the buffer once (call it after prefill, when the
-    final length is known: audio positions + prompt + max decode steps). Without
-    it, the cache grows in ``step``-sized chunks, and every growth allocates a
-    fresh buffer and copies the whole history -- measured ~3 ms per event on the
-    0.6B, a 2-3x tax on a 7 ms decode step, hitting exactly when a long
-    utterance crosses a 256-position boundary mid-decode.
-    """
+    # see docs/port-notes/functions.md :: KVCache
 
     def __init__(self) -> None:
         self.keys: mx.array | None = None
@@ -31,10 +17,7 @@ class KVCache:
         self.step = 256
 
     def reserve(self, positions: int, like: "KVCache | None" = None) -> None:
-        """Grow the backing store to ``positions`` capacity immediately.
-
-        ``like`` may carry the (B, H, D) shape when this cache is still empty.
-        """
+        # see docs/port-notes/functions.md :: reserve
         if self.keys is not None and self.keys.shape[2] >= positions:
             return
         if self.keys is not None:

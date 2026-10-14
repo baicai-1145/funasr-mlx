@@ -33,22 +33,12 @@ _STORAGE_DTYPES = ("bfloat16", "float16", "float32")
 # the quantizer
 # --------------------------------------------------------------------------- #
 def _round_half_away(values: np.ndarray) -> np.ndarray:
-    """``round()`` with ties away from zero, as the MLX kernel does.
-
-    NumPy's ``np.round`` is half-to-even, which disagrees with the kernel on
-    exact .5 ties; they are rare on real weights but not on synthetic ones.
-    """
+    # see docs/port-notes/functions.md :: _round_half_away
     return np.floor(np.abs(values) + 0.5) * np.sign(values)
 
 
 class AffineQuantizer:
-    """MLX affine group quantization, bit-exact (see module docstring).
-
-    ``bits`` and ``group_size`` must be a combination ``mx.quantize`` accepts:
-    bits in (2, 3, 4, 5, 6, 8) and group size in (32, 64, 128).  ``storage``
-    names the dtype the side tensors are stored in; it only affects rounding of
-    ``scales``/``biases`` and therefore which codes are chosen.
-    """
+    # see docs/port-notes/functions.md :: AffineQuantizer
 
     def __init__(self, *, bits: int = 4, group_size: int = 64, storage: str = "bfloat16"):
         if bits not in (2, 3, 4, 5, 6, 8):
@@ -67,18 +57,14 @@ class AffineQuantizer:
 
     @property
     def storage_dtype(self) -> np.dtype:
-        """NumPy dtype the side tensors are returned in.
-
-        bfloat16 has no NumPy representation, so it is carried as float32 whose
-        *values* are already bf16-rounded -- converting to bf16 later is exact.
-        """
+        # see docs/port-notes/functions.md :: storage_dtype
         if self.storage == "float16":
             return np.dtype(np.float16)
         return np.dtype(np.float32)
 
     # -- side tensors ------------------------------------------------------- #
     def cast(self, values: np.ndarray) -> np.ndarray:
-        """Round ``values`` to the storage dtype, keeping a float32 carrier."""
+        # see docs/port-notes/functions.md :: cast
         values = np.asarray(values, dtype=np.float32)
         if self.storage == "float32":
             return values
@@ -197,7 +183,7 @@ def unpack_codes(words: np.ndarray, columns: int, *, bits: int = 4) -> np.ndarra
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class GptqConfig:
-    """GPTQ hyper-parameters, mirroring the reference implementation's knobs."""
+    # see docs/port-notes/functions.md :: GptqConfig
 
     bits: int = 4
     group_size: int = 64
@@ -315,13 +301,7 @@ def output_error(weight: np.ndarray, reconstructed: np.ndarray, hessian: np.ndar
 
 
 def _upper_cholesky_inverse(hessian: np.ndarray) -> np.ndarray:
-    """``U`` with ``Hinv = U^T U`` and ``U`` upper triangular (float32 out).
-
-    The reference implementation goes ``chol(H) -> cholesky_inverse -> chol(·,
-    upper=True)``; ``inv(H)`` then an upper Cholesky is the same matrix with one
-    fewer decomposition, and the dampening has already made ``H`` positive
-    definite.
-    """
+    # see docs/port-notes/functions.md :: _upper_cholesky_inverse
     inverse = np.linalg.inv(hessian)
     # Symmetrize: the inverse of a symmetric matrix is symmetric only up to
     # rounding, and Cholesky reads the lower triangle.
@@ -351,13 +331,7 @@ def gptq_quantize(
     *,
     with_rtn_baseline: bool = True,
 ) -> GptqOutcome:
-    """Quantize ``weight`` ``[out, in]`` with GPTQ using ``hessian`` ``[in, in]``.
-
-    ``hessian`` is the second-order statistic of the layer input,
-    ``H = 2 X^T X`` accumulated in float32 (:class:`HessianAccumulator` does
-    exactly that).  The returned triple is what a W4A16 checkpoint stores, in
-    the standard MLX affine group layout.
-    """
+    # see docs/port-notes/functions.md :: gptq_quantize
     config = config or GptqConfig()
     weight = np.asarray(weight, dtype=np.float32)
     hessian = np.asarray(hessian, dtype=np.float32)
@@ -580,13 +554,7 @@ def rtn_quantize(
     config: GptqConfig | None = None,
     hessian: np.ndarray | None = None,
 ) -> GptqOutcome:
-    """Plain round-to-nearest group quantization (``mx.quantize``'s own rule).
-
-    Provided as the baseline GPTQ has to beat, computed with the *same*
-    quantizer so the comparison isolates the algorithm and not the rounding.
-    Pass ``hessian`` to also get the layer-output error, which is the metric the
-    head-to-head claim is made on.
-    """
+    # see docs/port-notes/functions.md :: rtn_quantize
     config = config or GptqConfig()
     weight = np.asarray(weight, dtype=np.float32)
     if weight.ndim != 2:
@@ -632,13 +600,7 @@ def _rtn_reconstruct(weight: np.ndarray, quantizer: AffineQuantizer) -> np.ndarr
 def _pack_triple(
     reconstructed: np.ndarray, quantizer: AffineQuantizer
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Re-derive the stored triple from a reconstructed matrix.
-
-    Deriving the triple from the *final* reconstructed values (rather than
-    keeping the per-column codes) guarantees the checkpoint is self-consistent:
-    ``mx.dequantize(packed, scales, biases)`` reproduces exactly what GPTQ
-    decided, with no dependency on how the inner loop was organized.
-    """
+    # see docs/port-notes/functions.md :: _pack_triple
     group = quantizer.group_size
     columns = reconstructed.shape[1]
     scales = np.empty((reconstructed.shape[0], columns // group), dtype=np.float32)
@@ -728,14 +690,7 @@ class HessianAccumulator:
     def _weighted_effective_rows(
         self, language_weights: Mapping[str, float], *, balance: bool, cap_fraction
     ) -> dict[str, float]:
-        """Per-language effective rows after weighting, total preserved.
-
-        The renormalisation is done in EFFECTIVE-ROW space, which is the space
-        the 30% guard is stated in and the only one where "total mass" is
-        meaningful.  An earlier version renormalised the multipliers instead,
-        which silently changed the overall scale of the Hessian and therefore the
-        damping (defined relative to the mean diagonal).
-        """
+        # see docs/port-notes/functions.md :: _weighted_effective_rows
         effective = self._effective_rows(balance=balance, cap_fraction=cap_fraction)
         scaled = {
             name: value * float(language_weights.get(name, 1.0))
@@ -774,17 +729,7 @@ class HessianAccumulator:
     def _effective_rows(
         self, *, balance: bool = True, cap_fraction: float | None = None
     ) -> dict[str, float]:
-        """Per-language row count the Hessian effectively sees.
-
-        Both modes are one family -- a common row threshold ``T`` with
-        ``rows_i -> min(rows_i, T)``:
-
-        * ``balance`` picks ``T = min(rows)``, giving every language an equal
-          share;
-        * ``cap_fraction`` bisects for the *largest* ``T`` whose resulting
-          maximum share is still within the cap, so the most calibration data is
-          kept subject to the guard.
-        """
+        # see docs/port-notes/functions.md :: _effective_rows
         if cap_fraction is not None:
             if not 0 < cap_fraction <= 1:
                 raise ValueError("cap_fraction must be in (0, 1]")
@@ -817,11 +762,7 @@ class HessianAccumulator:
     def _row_weights(
         self, *, balance: bool = True, cap_fraction: float | None = None
     ) -> dict[str, float]:
-        """Multiplier applied to each language's accumulated ``X^T X``.
-
-        The stored products are already sums, so an unweighted Hessian needs a
-        multiplier of **1**, not the row count.
-        """
+        # see docs/port-notes/functions.md :: _row_weights
         if cap_fraction is None and not balance:
             return {name: 1.0 for name in self.rows}
         effective = self._effective_rows(balance=balance, cap_fraction=cap_fraction)
@@ -830,11 +771,7 @@ class HessianAccumulator:
     def language_mass(
         self, *, balance: bool = True, cap_fraction: float | None = None
     ) -> dict[str, float]:
-        """Share of the Hessian's effective rows per language (the guard's check).
-
-        Mirrors :meth:`hessian` exactly, so the reported shares are the weights
-        actually applied to the accumulated products.
-        """
+        # see docs/port-notes/functions.md :: language_mass
         rows = self._effective_rows(balance=balance, cap_fraction=cap_fraction)
         total = sum(rows.values())
         return {name: value / total for name, value in rows.items()}
@@ -860,7 +797,7 @@ class HessianAccumulator:
 
 
 def hessian_from_activations(activations: Iterable[np.ndarray], columns: int) -> np.ndarray:
-    """Convenience: ``H = 2 X^T X`` over a stream of activation batches."""
+    # see docs/port-notes/functions.md :: hessian_from_activations
     accumulator = HessianAccumulator(columns=columns)
     for batch in activations:
         accumulator.add(batch)

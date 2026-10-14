@@ -57,12 +57,7 @@ CAMPPLUS_FRONTEND_DEFAULTS = {"window": "povey", "upsacle_samples": False}
 # containers that reproduce PyTorch parameter names
 # --------------------------------------------------------------------------- #
 class ModuleStack(mxnn.Module):
-    """Ordered children registered under their numeric index.
-
-    ``torch.nn.Sequential`` yields ``<parent>.<i>.<leaf>`` parameter names; MLX's
-    ``nn.Sequential`` would insert an extra ``layers`` level, so children are
-    registered directly under ``"0"``, ``"1"``, ...
-    """
+    # see docs/port-notes/functions.md :: ModuleStack
 
     def __init__(self, blocks: Sequence[mxnn.Module]) -> None:
         super().__init__()
@@ -98,11 +93,7 @@ class ModuleStack(mxnn.Module):
 
 
 class NamedModuleDict(mxnn.Module):
-    """Named children applied in order; keeps the ``<parent>.<name>.<leaf>`` keys.
-
-    Used for ``CAMPPlus.xvector``, which the reference builds as an
-    ``nn.Sequential`` of named sub-modules.
-    """
+    # see docs/port-notes/functions.md :: NamedModuleDict
 
     def __init__(self) -> None:
         super().__init__()
@@ -137,11 +128,7 @@ class NamedModuleDict(mxnn.Module):
 
 
 class NamedLayerList(mxnn.Module):
-    """Named children iterated in insertion order.
-
-    Mirrors ``torch.nn.ModuleList`` with explicit names (``CAMDenseTDNNBlock``
-    uses ``tdnnd1``, ``tdnnd2``, ...).
-    """
+    # see docs/port-notes/functions.md :: NamedLayerList
 
     def __init__(self) -> None:
         super().__init__()
@@ -220,13 +207,7 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
 
 @dataclass
 class LayoutReport(Mapping):
-    """Flat parameter tensors plus the layout rule that applies to each key.
-
-    Behaves like a read-only ``Mapping`` of ``{parameter_name: mlx_array}``, so it
-    can be iterated, indexed, ``len()``-ed and fed to ``dict(...)`` exactly like a
-    plain state dict, while also carrying the per-key rule used for the
-    torch -> MLX layout conversion.
-    """
+    # see docs/port-notes/functions.md :: LayoutReport
 
     tensors: dict[str, mx.array]
     rules: dict[str, str]
@@ -257,12 +238,7 @@ class LayoutReport(Mapping):
 
 
 def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> LayoutReport:
-    """Flatten a module tree into FunASR/PyTorch-compatible parameter names.
-
-    Unlike a name-pattern heuristic, the layout rule is derived from the *owning
-    module type*, so it is correct for any naming the architecture happens to
-    use.  Attributes starting with ``_`` are configuration, never weights.
-    """
+    # see docs/port-notes/functions.md :: flatten_state_dict
     tensors: dict[str, mx.array] = {}
     rules: dict[str, str] = {}
     _flatten_into(module, prefix, tensors, rules)
@@ -272,14 +248,7 @@ def flatten_state_dict(module: mxnn.Module, prefix: str = "") -> LayoutReport:
 def flatten_state_dict_with_rules(
     module: mxnn.Module, prefix: str = ""
 ) -> tuple[dict[str, mx.array], dict[str, str]]:
-    """Like :func:`flatten_state_dict`, but also returns the per-key layout rule.
-
-    Returns ``(tensors, rules)`` with the same two dictionaries that the
-    :class:`LayoutReport` carries -- nothing is dropped.  This is the contract
-    :func:`funasr_mlx.models.sanm.flatten_state_dict_with_rules` exposes, so the
-    three model modules agree on one name for the same operation; callers that
-    want the richer object should use :func:`flatten_state_dict` instead.
-    """
+    # see docs/port-notes/functions.md :: flatten_state_dict_with_rules
     report = flatten_state_dict(module, prefix)
     return report.tensors, report.rules
 
@@ -290,11 +259,7 @@ class CheckpointKeyError(KeyError):
 
 @dataclass
 class LoadReport:
-    """Outcome of a :func:`load_strict` call.
-
-    ``dropped`` lists the torch-only buffers that were intentionally ignored.
-    It is never empty silently: callers can assert on it.
-    """
+    # see docs/port-notes/functions.md :: LoadReport
 
     loaded: list[str]
     dropped: list[str]
@@ -382,13 +347,7 @@ def _assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
 # initialisation (matches the reference's post-build kaiming pass)
 # --------------------------------------------------------------------------- #
 def kaiming_normal_(weight: mx.array) -> mx.array:
-    """In-place-style ``torch.nn.init.kaiming_normal_`` for MLX conv/linear weights.
-
-    The reference re-initialises every ``Conv1d``/``Linear`` weight with
-    ``kaiming_normal_`` and zeroes the biases *after* building ``CAMPPlus``.
-    ``fan_in`` is the number of input elements per output element, which is the
-    product of every axis except the output axis in both layouts.
-    """
+    # see docs/port-notes/functions.md :: kaiming_normal_
     fan_in = 1
     for dim in weight.shape[1:]:
         fan_in *= dim
@@ -473,7 +432,7 @@ class BatchNorm2d(BatchNorm):
 
 
 def get_nonlinear(config_str: str, channels: int) -> NamedModuleDict:
-    """Retain the reference Sequential's named children and per-channel PReLU."""
+    # see docs/port-notes/functions.md :: get_nonlinear
     blocks = NamedModuleDict()
     for name in config_str.split("-"):
         if name == "relu":
@@ -504,15 +463,7 @@ def statistics_pooling(
     keepdim: bool = True,
     eps: float = 1e-2,
 ) -> mx.array:
-    """Time-axis mean/std pooling of an ``(B, L, C)`` tensor -> ``(B, 1, 2C)``.
-
-    The reference's ``statistics_pooling(x, dim=-1)`` reduces the *time* axis of
-    an NCL tensor and concatenates along the channel axis, giving ``(B, 2C)``.
-    Reducing axis 1 of the channels-last tensor and concatenating on the last
-    axis gives ``(B, 1, 2C)`` with the same numbers in the same order, which is
-    what the following ``DenseLayer`` consumes.  ``eps`` is accepted for
-    signature parity; the reference never uses it.
-    """
+    # see docs/port-notes/functions.md :: statistics_pooling
     if x.ndim != 3:
         raise ValueError(
             "statistics_pooling expects channels-last (B, L, C); got "
@@ -535,13 +486,7 @@ class StatsPool(mxnn.Module):
 # FCM front-end
 # --------------------------------------------------------------------------- #
 class BasicResBlock(mxnn.Module):
-    """``components.BasicResBlock`` (channels-last NHWC).
-
-    The torch shortcut is an ``nn.Sequential`` (empty => identity), which puts
-    its parameters at ``shortcut.0.weight`` / ``shortcut.1.weight``; a
-    :class:`ModuleStack` (empty in the identity case) reproduces those names
-    exactly.
-    """
+    # see docs/port-notes/functions.md :: BasicResBlock
 
     expansion = 1
 
@@ -621,7 +566,7 @@ class FCM(mxnn.Module):
         self._feat_dim = feat_dim
 
     def __call__(self, x: mx.array) -> mx.array:
-        """``x`` is ``(B, F, T)`` (mel-major, as in the reference) -> ``(B, T, C*F/8)``."""
+        # see docs/port-notes/functions.md :: __call__
         x = mx.expand_dims(x, -1)  # (B, F, T, 1)
         out = mx.maximum(self.bn1(self.conv1(x)), 0.0)
         out = self.layer1(out)
@@ -642,11 +587,7 @@ class FCM(mxnn.Module):
 # TDNN building blocks (all channels-last NLC, matching MLX Conv1d)
 # --------------------------------------------------------------------------- #
 class TDNNLayer(mxnn.Module):
-    """``components.TDNNLayer``.
-
-    ``padding < 0`` selects the reference's same-padding rule
-    ``padding = (kernel_size - 1) // 2 * dilation`` and requires an odd kernel.
-    """
+    # see docs/port-notes/functions.md :: TDNNLayer
 
     def __init__(
         self,
@@ -682,13 +623,7 @@ class TDNNLayer(mxnn.Module):
 
 
 class CAMLayer(mxnn.Module):
-    """``components.CAMLayer`` (channels attention over a dilated TDNN).
-
-    ``context`` mixes the *global* time mean with a non-overlapping segment mean
-    (``seg_len=100``, average pooling with ``ceil_mode=True``), squeezes it
-    through ``linear1``/``relu``/``linear2``/``sigmoid``, and rescales the local
-    branch.  Because the channel axis is last, the time axis is axis 1.
-    """
+    # see docs/port-notes/functions.md :: CAMLayer
 
     def __init__(
         self,
@@ -749,11 +684,7 @@ class CAMLayer(mxnn.Module):
 
 
 class CAMDenseTDNNLayer(mxnn.Module):
-    """``components.CAMDenseTDNNLayer``.
-
-    ``memory_efficient`` only gates ``torch.utils.checkpoint`` during *training*
-    and is therefore inert here (documented, not silently dropped).
-    """
+    # see docs/port-notes/functions.md :: CAMDenseTDNNLayer
 
     def __init__(
         self,
@@ -823,7 +754,7 @@ class CAMDenseTDNNBlock(NamedLayerList):
 
 
 class TransitLayer(mxnn.Module):
-    """``components.TransitLayer`` (nonlinearity **before** the linear map)."""
+    # see docs/port-notes/functions.md :: TransitLayer
 
     def __init__(
         self,
@@ -841,12 +772,7 @@ class TransitLayer(mxnn.Module):
 
 
 class DenseLayer(mxnn.Module):
-    """``components.DenseLayer``.
-
-    The reference special-cases 2-D input by squeezing through a length-1 axis so
-    that a 1x1 ``Conv1d`` can be used as a plain ``Linear``; that branch is
-    reproduced (channels-last, so the squeezed axis is the time axis).
-    """
+    # see docs/port-notes/functions.md :: DenseLayer
 
     def __init__(
         self,
@@ -874,11 +800,7 @@ class DenseLayer(mxnn.Module):
 
 @dataclass
 class CAMPlusConfig:
-    """Mirror of FunASR's ``model_conf`` for ``CAMPPlus``.
-
-    Defaults are the published ``speech_campplus_sv_zh-cn_16k-common`` values
-    taken from ``funasr/models/campplus/template.yaml``.
-    """
+    # see docs/port-notes/functions.md :: CAMPlusConfig
 
     feat_dim: int = 80
     embedding_size: int = 192
@@ -910,7 +832,7 @@ class CAMPlusConfig:
 def campplus_config_from_dict(
     data: Mapping[str, Any] | None = None, **kwargs: Any
 ) -> CAMPlusConfig:
-    """Build a :class:`CAMPlusConfig` from a FunASR ``model.yaml`` mapping."""
+    # see docs/port-notes/functions.md :: campplus_config_from_dict
     data = dict(data or {})
     if "model_conf" in data and isinstance(data["model_conf"], Mapping):
         merged = dict(data["model_conf"])
@@ -925,16 +847,7 @@ def campplus_config_from_dict(
 # model
 # --------------------------------------------------------------------------- #
 class CAMPPlus(mxnn.Module):
-    """``funasr.models.campplus.model.CAMPPlus`` (inference only).
-
-    Input is 80-dim Kaldi fbank **without** the LFR stack and **without** CMVN;
-    ``funasr/models/campplus/utils.py::extract_feature`` mean-normalises each
-    utterance across all frames and zero-pads the batch.  Both steps stay
-    outside this module (frontend scope).
-
-    ``output_level="segment"`` returns ``(B, embedding_size)``;
-    ``output_level="frame"`` returns ``(B, T, channels)``.
-    """
+    # see docs/port-notes/functions.md :: CAMPPlus
 
     def __init__(self, config: CAMPlusConfig | None = None, **kwargs: Any) -> None:
         super().__init__()
@@ -1020,25 +933,16 @@ class CAMPPlus(mxnn.Module):
 
     # -- checkpoint helpers ------------------------------------------------- #
     def state_dict(self) -> LayoutReport:
-        """Flat ``{pytorch_name: mlx_array}`` plus per-key layout rules."""
+        # see docs/port-notes/functions.md :: state_dict
         return flatten_state_dict(self)
 
     def load_checkpoint(self, tensors: Mapping[str, Any], **kwargs: Any) -> LoadReport:
-        """Strict load; see :func:`load_strict`."""
+        # see docs/port-notes/functions.md :: load_checkpoint
         return load_strict(self, tensors, **kwargs)
 
     # -- forward ------------------------------------------------------------ #
     def frame_features(self, x: mx.array) -> mx.array:
-        """Run everything up to (but excluding) pooling; returns ``(B, T, C)``.
-
-        The stage order is taken from the ``xvector`` container's own insertion
-        order, which mirrors the reference's ``nn.Sequential``: ``tdnn``, then
-        ``block1, transit1, block2, transit2, ...``, then ``out_nonlinear``.
-        Iterating separate block/transit name lists instead would apply **all**
-        blocks before **any** transit, which both misorders the network and
-        desynchronises the channel arithmetic (each transit halves the channel
-        count feeding the next block).
-        """
+        # see docs/port-notes/functions.md :: frame_features
         x = mx.transpose(x, (0, 2, 1))  # (B, T, F) -> (B, F, T)
         x = self.head(x)  # (B, T', C*F/8)
         for name in self.xvector.names():
@@ -1048,13 +952,7 @@ class CAMPPlus(mxnn.Module):
         return self.xvector["out_nonlinear"](x)
 
     def forward(self, x: mx.array) -> mx.array:
-        """``x`` is fbank ``(B, T, feat_dim)``.
-
-        Literal port of the reference ``forward``: the batch is assumed to be
-        already padded (or to contain a single utterance), because the reference
-        pools without any padding mask.  See :meth:`embed` for the length-aware
-        variant.
-        """
+        # see docs/port-notes/functions.md :: forward
         features = self.frame_features(x)
         if self.output_level == "frame":
             return features  # already (B, T, C); torch returns x.transpose(1, 2)

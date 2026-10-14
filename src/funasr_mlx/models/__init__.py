@@ -1,1 +1,1 @@
-"""Native MLX inference models; import individual modules explicitly."""
+"""Port notes: docs/port-notes/__init__.py.md"""

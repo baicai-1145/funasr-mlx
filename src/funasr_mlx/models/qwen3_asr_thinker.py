@@ -1,19 +1,4 @@
-"""Qwen3-ASR thinker: audio tower + Qwen3 text decoder assembly (inference).
-
-Model structure (``thinker.*`` of the official checkpoint):
-``thinker.audio_tower`` (the conv encoder in :mod:`funasr_mlx.models.qwen3_asr`)
-+ ``thinker.model`` / ``thinker.lm_head`` -- a Qwen3-0.6B-shaped decoder that
-REUSES :class:`funasr_mlx.models.llm.Qwen3ForCausalLM` (the thinker's
-text_config matches Qwen3-0.6B; rope/mask/qk-norm semantics are identical;
-ASR never needs the MRoPE grid variant because all three position streams
-carry the same ids for pure-audio turns).
-
-Prompt (``get_generation_prompt`` of the qwen-asr package):
-``<|im_start|>system\\n{context}<|im_end|>\\n<|im_start|>user\\n<|audio_start|><|audio_pad|>*N<|audio_end|><|im_end|>\\n<|im_start|>assistant\\n``
-where N = audio-tower frames; the ``<|audio_pad|>`` span's embeddings are
-replaced by the tower output. With ``language`` forced:
-``...assistant\\nlanguage {lang}<asr_text>``.
-"""
+"""Port notes: docs/port-notes/qwen3_asr_thinker.py.md"""
 
 from __future__ import annotations
 
@@ -66,34 +51,17 @@ class Qwen3ASR(mxnn.Module):
         self.thinker = Qwen3ForCausalLM(config.text)
 
     def _decoder_dtype(self) -> mx.Dtype:
-        """Dtype the decoder activations must follow.
-
-        The token embedding produces the activations the decoder consumes, so
-        its OUTPUT dtype is the one to cast spliced audio to.  Read through
-        :func:`activation_dtype`, not ``weight.dtype``: a quantized embedding
-        stores packed ``uint32`` codes in ``weight``, and casting the audio
-        embeddings to ``uint32`` destroys them (see the helper's docstring).
-        """
+        # see docs/port-notes/functions.md :: _decoder_dtype
         from .llm.quant import activation_dtype
 
         return activation_dtype(self.thinker.model.embed_tokens)
 
     def _tower_dtype(self) -> mx.Dtype:
-        """Dtype of the audio tower's checkpoint weights (first conv)."""
+        # see docs/port-notes/functions.md :: _tower_dtype
         return self.audio_tower.conv2d1.conv.weight.dtype
 
     def encode_audio(self, mel: mx.array) -> mx.array:
-        """``(F, T)`` mel -> ``(1, T', text.hidden_size)`` tower embeddings.
-
-        The front-end always produces float32 mel, so the mel is cast to the
-        tower's **weight** dtype first (same rule as whisper's
-        ``AudioEncoder.__call__``); without it an fp16 checkpoint runs the
-        conv stack and every tower Linear in mixed precision.  Interleaved
-        A/B on M4 (25 rounds, .tmp/task4/tower-tight-*.json): 55.7 -> 44.0 ms
-        at the real 420-frame shape and 273.9 -> 214.7 ms at 30 s, i.e. 1.27x
-        at both dtypes.  For a float32 checkpoint the cast is a no-op, so
-        those numerics stay bit-identical.
-        """
+        # see docs/port-notes/functions.md :: encode_audio
         return self.audio_tower(mel.astype(self._tower_dtype()))
 
     def forward_with_audio(

@@ -19,7 +19,7 @@ def layout_rule(module: mxnn.Module, names: Mapping[str, str]) -> str:
 
 
 def convert_tensor(name: str, array: mx.array, rule: str, names: Sequence[str]) -> mx.array:
-    """Apply the transpose for ``rule``; ``names`` is the family's identity set."""
+    # see docs/port-notes/functions.md :: convert_tensor
     conv1d, conv2d = names[0], names[1]
     if rule == conv1d:
         # torch (out, in/groups, k) -> mlx (out, k, in/groups)

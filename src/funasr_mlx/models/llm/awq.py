@@ -38,16 +38,7 @@ class AwqConfig:
 
 @dataclass
 class ScaleSite:
-    """One scale search site: a norm (or Linear) feeding several Linears.
-
-    Mirrors mlx-lm's ``ScaleConfig`` for the Qwen3 block layout:
-
-    * ``prev`` -- the module whose OUTPUT is scaled (an RMSNorm for qwen3);
-      its weight is divided by the scales.
-    * ``layers`` -- the successor Linear weights are multiplied by the scales.
-    * ``block`` -- optional sub-block to inspect (``self_attn``), because the
-      loss must be measured on the attention output, not one Linear alone.
-    """
+    # see docs/port-notes/functions.md :: ScaleSite
 
     prev: str
     layers: tuple[str, ...]
@@ -73,11 +64,7 @@ def mse(x, y):
 
 
 def _to_mx(value):
-    """Captured activations are numpy (host); the search wants mx arrays.
-
-    The conversion happens once per consumer, so the device copy never
-    exceeds the capped rows either.
-    """
+    # see docs/port-notes/functions.md :: _to_mx
     import mlx.core as mx
 
     return mx.array(value)
@@ -98,14 +85,7 @@ def _is_first_norm(module, block) -> bool:
 
 
 class MultiBlockCapture:
-    """Capture Linear inputs for MANY blocks in ONE pass over the dataset.
-
-    Running the model once per block (28 x 480 prefills) is what made the
-    first calibration attempt take ~575s per block; mlx-lm's AWQ catches every
-    Linear of every block in the same forward.  Memory stays bounded by
-    stride-subsampling each Linear's rows down towards ``row_cap`` after
-    every utterance (halving whenever over the cap) and storing float16.
-    """
+    # see docs/port-notes/functions.md :: MultiBlockCapture
 
     def __init__(self, blocks, *, row_cap: int = 1536) -> None:
         import mlx.nn as nn
@@ -198,14 +178,7 @@ class AwqBlockQuantizer:
         return module
 
     def capture(self, run: Callable[[], Any]) -> None:
-        """Run ``run()`` with input hooks on this block's Linears.
-
-        ``run`` is a callable that performs the model's real prefill for one
-        utterance; the block must be part of the live model.  Each Linear's
-        input rows are appended to ``input_feat`` on the module (mlx-lm's
-        convention), in float32, and the block's own input is recorded on
-        ``self.block_input`` for the never-worse reference.
-        """
+        # see docs/port-notes/functions.md :: capture
         import mlx.core as mx
         from mlx.utils import tree_map
 
@@ -248,13 +221,7 @@ class AwqBlockQuantizer:
 
     # -- scale search --------------------------------------------------------- #
     def _run_block(self, block, x, mask=None):
-        """Run one decoder block on ``x`` [1, rows, hidden] in row batches.
-
-        Our ``Qwen3TransformerBlock`` has no ``__call__`` of its own (the
-        forward is unrolled in ``Qwen3Model.__call__``), so the qwen3 residual
-        structure is applied here: ``h += attn(norm(h)); h += mlp(norm(h))``.
-        The site's sub-block (``self_attn`` / ``mlp``) IS callable directly.
-        """
+        # see docs/port-notes/functions.md :: _run_block
         import mlx.core as mx
 
         def once(chunk):
@@ -273,14 +240,7 @@ class AwqBlockQuantizer:
         return mx.concatenate(y, axis=1)
 
     def search_scale(self, site: ScaleSite, quantize_func) -> Any:
-        """Grid-search channel scales for one site; returns the best scales.
-
-        The reference output is the block (or sub-block) run on the captured
-        input of the site's FIRST layer; each candidate scales that input's
-        channels via the successor weights only (equivalent math, see
-        upstream), quantize-dequantizes them, and the MSE of the sub-block's
-        output picks the winner.
-        """
+        # see docs/port-notes/functions.md :: search_scale
         import mlx.core as mx
         from mlx.utils import tree_flatten
 
@@ -365,14 +325,7 @@ class AwqBlockQuantizer:
 
     # -- folding --------------------------------------------------------------- #
     def apply_scale(self, site: ScaleSite, scales) -> None:
-        """Fold the chosen scales into the site's modules (bf16 stays bf16).
-
-        Two fold shapes, exactly as mlx-lm: a Linear predecessor divides its
-        OUTPUT-channel rows (``weight / scales[:, None]`` -- the scales index
-        the successor's input channels, which are the predecessor's outputs),
-        while a norm predecessor divides elementwise (its weight is a vector
-        over the same channels it normalises).
-        """
+        # see docs/port-notes/functions.md :: apply_scale
         prev = self._submodule(site.prev)
         for layer_name in site.layers:
             layer = self._submodule(layer_name)

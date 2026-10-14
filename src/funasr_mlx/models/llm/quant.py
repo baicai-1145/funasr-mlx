@@ -45,15 +45,7 @@ NON_LINEAR_WEIGHT_NAMES = (
 
 @dataclass(frozen=True)
 class QuantizationSpec:
-    """One family's quantization plan, as declared in ``config.json``.
-
-    ``method`` records *how* the stored ``scales``/``biases``/codes were
-    computed: ``rtn`` is ``mx.quantize``'s round-to-nearest, ``gptq`` is
-    Hessian-based error compensation (:mod:`funasr_mlx.models.llm.gptq`).  The
-    runtime layout is identical either way -- ``nn.QuantizedLinear`` and
-    ``mx.quantized_matmul`` cannot tell them apart -- so the loader ignores it
-    and it exists purely as provenance in the checkpoint's ``config.json``.
-    """
+    # see docs/port-notes/functions.md :: QuantizationSpec
 
     bits: int = DEFAULT_BITS
     group_size: int = DEFAULT_GROUP_SIZE
@@ -172,16 +164,7 @@ class QuantizationSpec:
         return any(module_path.startswith(target) for target in self.targets)
 
     def selects_embedding(self, module_path: str) -> bool:
-        """Whether a token-embedding module at ``module_path`` is selected.
-
-        The tied ``embed_tokens`` is the one non-Linear weight worth offering:
-        when ``tie_word_embeddings`` is set the same matrix is also the LM head,
-        so at bs=1 it is streamed once per step and is a large share of the step
-        (311 MB bf16 for a 151936-vocab family). It needs its own predicate
-        because ``nn.Embedding`` is not an ``nn.Linear`` subclass, so the Linear
-        rule can never reach it; a family opts in by naming ``embed_tokens`` in
-        ``targets``.
-        """
+        # see docs/port-notes/functions.md :: selects_embedding
         if not module_path.endswith("embed_tokens"):
             return False
         return any(
@@ -191,7 +174,7 @@ class QuantizationSpec:
         )
 
     def quantizes_embedding(self, name: str, shape: Iterable[int]) -> bool:
-        """Converter predicate for the token-embedding matrix."""
+        # see docs/port-notes/functions.md :: quantizes_embedding
         if not name.endswith("embed_tokens.weight"):
             return False
         dims = tuple(shape)
@@ -202,14 +185,7 @@ class QuantizationSpec:
         return dims[1] % self.group_size == 0
 
     def is_linear_weight(self, name: str, shape: Iterable[int]) -> bool:
-        """Whether ``name`` is a Linear weight the target prefixes select.
-
-        Rank-2 ``.weight`` under a selected prefix and not one of the
-        :data:`NON_LINEAR_WEIGHT_NAMES` exceptions -- i.e. a tensor the model
-        side would have turned into a ``QuantizedLinear`` if the group size
-        fitted. This is the predicate the converter uses to decide whether a
-        tensor it did *not* pack is a legitimate skip or an unnoticed miss.
-        """
+        # see docs/port-notes/functions.md :: is_linear_weight
         if not name.endswith(".weight"):
             return False
         module_path = name[: -len(".weight")]
@@ -229,13 +205,7 @@ class QuantizationSpec:
         return len(tuple(shape)) == 2
 
     def quantizes_tensor(self, name: str, shape: Iterable[int]) -> bool:
-        """Whether the converter should quantize checkpoint tensor ``name``.
-
-        Mirrors the model-side predicate exactly: a Linear weight (see
-        :meth:`is_linear_weight`) or a selected token embedding (see
-        :meth:`quantizes_embedding`), whose input dimension the group size
-        divides.
-        """
+        # see docs/port-notes/functions.md :: quantizes_tensor
         if self.quantizes_embedding(name, shape):
             return True
         if not self.is_linear_weight(name, shape):
@@ -253,12 +223,7 @@ class QuantizationSpec:
         return tuple(shape)[1] % self.group_size == 0
 
     def quantizes_module(self, module_path: str, module: nn.Module) -> bool:
-        """Whether ``module`` (a live ``nn.Module``) should become quantized.
-
-        The token embedding is a separate case from ``nn.Linear``: it is not a
-        ``Linear`` subclass, so it can only be selected through an explicit
-        ``embed_tokens`` target prefix, and it is the tied LM head as well.
-        """
+        # see docs/port-notes/functions.md :: quantizes_module
         if isinstance(module, nn.Embedding):
             return self.selects_embedding(module_path) and self._fits(module)
         if not isinstance(module, nn.Linear):
@@ -331,14 +296,7 @@ def activation_dtype(module: nn.Module) -> mx.Dtype:
 
 
 def apply_quantization(model: nn.Module, data: Any) -> QuantizationResult | None:
-    """Quantize ``model`` in place per the ``config.json`` section ``data``.
-
-    Called by :func:`funasr_mlx.pipeline.load_model` *before* the expected
-    parameter set is computed, so a quantized checkpoint's ``.scales`` and
-    ``.biases`` entries are part of the strict key/shape check.  Returns
-    ``None`` when the configuration carries no quantization section, i.e. the
-    checkpoint is full precision.
-    """
+    # see docs/port-notes/functions.md :: apply_quantization
     if data is None:
         return None
     spec = QuantizationSpec.from_dict(data)

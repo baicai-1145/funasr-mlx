@@ -65,7 +65,7 @@ _POS_ENC_CLASSES = {
 # --------------------------------------------------------------------------- #
 @dataclass
 class SANMEncoderConfig:
-    """Mirror of FunASR's ``encoder_conf`` for ``SANMEncoder`` (Paraformer side)."""
+    # see docs/port-notes/functions.md :: SANMEncoderConfig
 
     output_size: int = 512
     attention_heads: int = 4
@@ -94,7 +94,7 @@ class SANMEncoderConfig:
 
 @dataclass
 class ParaformerDecoderConfig:
-    """Mirror of FunASR's ``decoder_conf`` for ``ParaformerSANMDecoder``."""
+    # see docs/port-notes/functions.md :: ParaformerDecoderConfig
 
     attention_heads: int = 4
     linear_units: int = 2048
@@ -121,7 +121,7 @@ class ParaformerDecoderConfig:
 
 @dataclass
 class CifPredictorConfig:
-    """Mirror of FunASR's ``predictor_conf`` for ``CifPredictorV2``."""
+    # see docs/port-notes/functions.md :: CifPredictorConfig
 
     idim: int = 512
     threshold: float = 1.0
@@ -142,7 +142,7 @@ class CifPredictorConfig:
 
 @dataclass
 class CTCConfig:
-    """Mirror of FunASR's ``ctc_conf`` (inference-relevant fields only)."""
+    # see docs/port-notes/functions.md :: CTCConfig
 
     dropout_rate: float = 0.0
     ctc_type: str = "builtin"
@@ -159,12 +159,7 @@ class CTCConfig:
 
 @dataclass
 class ParaformerConfig:
-    """Mirror of FunASR's ``model_conf`` for ``Paraformer``.
-
-    Defaults follow the published ``paraformer-zh`` configuration
-    (``input_size=560`` LFR fbank, 50 SANM blocks of width 512, 16 decoder
-    blocks, CIF ``tail_threshold=0.45``).
-    """
+    # see docs/port-notes/functions.md :: ParaformerConfig
 
     input_size: int = 560
     vocab_size: int = 8408
@@ -225,7 +220,7 @@ class ParaformerConfig:
 
 
 def paraformer_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs: Any):
-    """Build a :class:`ParaformerConfig` from a FunASR ``model.yaml`` mapping."""
+    # see docs/port-notes/functions.md :: paraformer_config_from_dict
     data = dict(data or {})
     if "model_conf" in data and isinstance(data["model_conf"], Mapping):
         merged = dict(data["model_conf"])
@@ -240,7 +235,7 @@ def paraformer_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs:
 # CTC head (shared shape with the SenseVoice port, kept local for independence)
 # --------------------------------------------------------------------------- #
 class CTC(mxnn.Module):
-    """``funasr.models.ctc.ctc.CTC`` inference path (``ctc_lo`` projection)."""
+    # see docs/port-notes/functions.md :: CTC
 
     def __init__(
         self,
@@ -269,12 +264,7 @@ class CTC(mxnn.Module):
 # encoder
 # --------------------------------------------------------------------------- #
 class SANMEncoder(mxnn.Module):
-    """``funasr.models.sanm.encoder.SANMEncoder`` (offline inference path).
-
-    Differences from the reference that do not affect checkpoint parity:
-    intermediate CTC / ``interctc_layer_idx`` outputs and streaming
-    ``forward_chunk`` are not ported (both are training / streaming features).
-    """
+    # see docs/port-notes/functions.md :: SANMEncoder
 
     def __init__(
         self,
@@ -520,15 +510,7 @@ def _cif_v1_impl(
     # back.  That round-trip through a flat view is the part worth falsifying on
     # GPU, and it is also why a missing row offset was silent at B=1.
     def _gather(array: mx.array) -> mx.array:
-        """Gather time steps of ``array`` in fire order, independently per row.
-
-        ``mx.take_along_axis`` indexes the time axis directly, so no flatten,
-        offset arithmetic or output reshape is involved.  Per the installed stub
-        (``mlx/core/__init__.pyi:1901-1909``) ``indices`` must be "broadcastable
-        with the input array excluding the ``axis`` dimension", so a trailing
-        singleton axis broadcasts one time index across every feature lane and
-        the result keeps ``(B, T, D)``.
-        """
+        # see docs/port-notes/functions.md :: _gather
         if array.ndim == 2:
             # The fires signal carries no feature axis, so index it directly.
             return mx.take_along_axis(array, time_of_rank, axis=1)
@@ -581,12 +563,7 @@ def cif_v1(
 
 
 class CifPredictorV2(mxnn.Module):
-    """``funasr.models.paraformer.cif_predictor.CifPredictorV2`` (inference path).
-
-    Parameters: ``cif_conv1d`` (a **dense**, i.e. ``groups=1``, ``Conv1d`` in V2)
-    and ``cif_output``.  ``__call__`` returns the 4-tuple
-    ``(acoustic_embeds, token_num, alphas, cif_peak)`` of the reference.
-    """
+    # see docs/port-notes/functions.md :: CifPredictorV2
 
     def __init__(
         self,
@@ -649,7 +626,7 @@ class CifPredictorV2(mxnn.Module):
         return alphas.squeeze(-1), mask_2d
 
     def __call__(self, hidden: mx.array, mask: mx.array | None = None):
-        """Return ``(acoustic_embeds, token_num, alphas, cif_peak)``."""
+        # see docs/port-notes/functions.md :: __call__
         alphas, mask_2d = self._alphas(hidden, mask)
 
         if self._tail_threshold > 0.0:
@@ -673,12 +650,7 @@ class CifPredictorV2(mxnn.Module):
 # decoder
 # --------------------------------------------------------------------------- #
 class ParaformerSANMDecoder(mxnn.Module):
-    """``funasr.models.paraformer.decoder.ParaformerSANMDecoder`` (offline path).
-
-    Three stacks: ``decoders`` (``att_layer_num`` layers with SANM self-attention
-    *and* cross-attention), optional ``decoders2`` (self-attention only) and a
-    single ``decoders3`` feed-forward-only layer.
-    """
+    # see docs/port-notes/functions.md :: ParaformerSANMDecoder
 
     def __init__(
         self,
@@ -779,14 +751,7 @@ class ParaformerSANMDecoder(mxnn.Module):
         ys_in_lens: mx.array,
         return_hidden: bool = False,
     ):
-        """``hs_pad`` is the encoder/acoustic memory ``(B, T1, D)``.
-
-        Following the reference (``funasr/models/paraformer/decoder.py:397-450``)
-        the offline path does **not** run ``self.embed``: ``x = tgt`` with
-        ``tgt = ys_in_pad``.  Only ``forward_one_step`` (``:604``) embeds.  In
-        offline Paraformer the decoder input is therefore the CIF acoustic
-        embedding, already ``(B, T2, D)`` -- not token ids.
-        """
+        # see docs/port-notes/functions.md :: __call__
         tgt = ys_in_pad
         tgt_mask = mx.expand_dims(sequence_mask(ys_in_lens, tgt.shape[1]), 2)  # (B, T2, 1)
         memory = hs_pad
@@ -827,7 +792,7 @@ class ParaformerOutputs:
 
 
 class Paraformer(mxnn.Module):
-    """``funasr.models.paraformer.model.Paraformer`` (inference only)."""
+    # see docs/port-notes/functions.md :: Paraformer
 
     def __init__(self, config: ParaformerConfig | None = None, **kwargs: Any) -> None:
         super().__init__()
@@ -863,11 +828,11 @@ class Paraformer(mxnn.Module):
 
     # -- checkpoint helpers ------------------------------------------------- #
     def state_dict(self) -> dict[str, mx.array]:
-        """``{pytorch_name: mlx_array}`` in MLX layout."""
+        # see docs/port-notes/functions.md :: state_dict
         return checkpoint_state_dict(self)
 
     def load_checkpoint(self, tensors: Mapping[str, Any], **kwargs: Any) -> list[str]:
-        """Strict load; see :func:`funasr_mlx.models.sanm.load_strict`."""
+        # see docs/port-notes/functions.md :: load_checkpoint
         return load_strict(self, tensors, **kwargs)
 
     # -- forward ------------------------------------------------------------ #
@@ -921,12 +886,7 @@ class Paraformer(mxnn.Module):
         return results
 
     def greedy_decode(self, speech: mx.array, speech_lengths: mx.array) -> list[list[int]]:
-        """Greedy token ids per utterance.
-
-        Mirrors ``Paraformer.inference`` without beam search: ``argmax`` over the
-        decoder posteriors followed by dropping ``sos``/``eos``/``blank_id``
-        (the reference wraps the sequence in sos/eos and then strips it).
-        """
+        # see docs/port-notes/functions.md :: greedy_decode
         return self._greedy_from_outputs(self.forward(speech, speech_lengths))
 
     def timestamps(
@@ -936,11 +896,7 @@ class Paraformer(mxnn.Module):
         num_tokens: Sequence[int] | None = None,
         upsample_rate: int = 3,
     ):
-        """CIF-peak based character timestamps in milliseconds.
-
-        Returns ``(tokens, timestamps)`` where ``timestamps[i]`` is a list of
-        ``[start_ms, end_ms]`` pairs aligned with ``tokens[i]``.
-        """
+        # see docs/port-notes/functions.md :: timestamps
         outs = self.forward(speech, speech_lengths)
         tokens = self._greedy_from_outputs(outs)
         stamps: list[list[list[int]]] = []
@@ -958,12 +914,7 @@ class Paraformer(mxnn.Module):
 def ts_prediction_lfr6_standard(
     alphas: mx.array, peaks: mx.array, num_chars: int, upsample_rate: int = 3
 ) -> list[list[int]]:
-    """Port of ``funasr.utils.timestamp_tools.ts_prediction_lfr6_standard``.
-
-    Only the millisecond ``res`` output of the reference is produced here (the
-    text dump and the ``<sil>`` bookkeeping are dropped).  ``upsample_rate`` must
-    be ``1`` to match Paraformer's inference call site.
-    """
+    # see docs/port-notes/functions.md :: ts_prediction_lfr6_standard
     start_end_threshold = 5
     max_token_duration = 12
     time_rate = 10.0 * 6 / 1000 / upsample_rate
@@ -1004,11 +955,7 @@ def ts_prediction_lfr6_standard(
 
 
 def _cif_fire_positions(alphas: Sequence[float], threshold: float) -> list[int]:
-    """Fallback used when the CIF peaks do not line up with the token count.
-
-    Mirrors ``funasr.models.paraformer.cif_predictor.cif_wo_hidden``: a frame
-    "fires" when the running integral crosses an integer boundary.
-    """
+    # see docs/port-notes/functions.md :: _cif_fire_positions
     integrate = 0.0
     fires: list[int] = []
     for t, alpha in enumerate(alphas):

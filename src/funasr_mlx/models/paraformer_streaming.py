@@ -29,12 +29,7 @@ __all__ = [
 
 
 class StreamSinusoidalPositionEncoder(mxnn.Module):
-    """``transformer/embedding.py::StreamSinusoidalPositionEncoder``.
-
-    Stateful through ``cache['start_idx']``: each chunk's positions continue
-    from where the previous chunk ended, which is what makes the streamed
-    encoding equal the offline one.
-    """
+    # see docs/port-notes/functions.md :: StreamSinusoidalPositionEncoder
 
     def __call__(self, x: mx.array, cache: dict | None) -> mx.array:
         _, timesteps, input_dim = x.shape
@@ -54,12 +49,7 @@ class StreamSinusoidalPositionEncoder(mxnn.Module):
 
 
 def _attn_forward_chunk(attn: Any, x: mx.array, cache: dict | None, chunk_size, look_back: int):
-    """``MultiHeadedAttentionSANM.forward_chunk`` on the shared offline class.
-
-    Mirrors ``sanm/attention.py:329-366``: compute qkv for the (stitched)
-    chunk, merge cached ``k``/``v`` (look-back), commit each chunk's
-    right-context-free stride into the cache, attend, add the FSMN memory.
-    """
+    # see docs/port-notes/functions.md :: _attn_forward_chunk
     q_h, k_h, v_h, v = attn.forward_qkv(x)
     if chunk_size is not None and (look_back > 0 or look_back == -1):
         if cache is not None:
@@ -99,11 +89,7 @@ def _encoder_layer_forward_chunk(layer, x, cache, chunk_size, look_back):
 
 
 def _predictor_forward_chunk(pred: CifPredictorV2, hidden: mx.array, cache: dict, is_final: bool):
-    """``CifPredictorV2.forward_chunk`` (``cif_predictor.py:316-412``).
-
-    Returns ``(acoustic_embeds, token_length, alphas, fires)`` with the carry
-    state written back into ``cache``.
-    """
+    # see docs/port-notes/functions.md :: _predictor_forward_chunk
     batch_size, _, hidden_size = hidden.shape
     # MLX conv1d is NLC: hidden (B, T, D) feeds directly; the reference's two
     # transposes around the pad/conv collapse into padding on axis=1.
@@ -187,11 +173,7 @@ def _predictor_forward_chunk(pred: CifPredictorV2, hidden: mx.array, cache: dict
 def _cross_attn_forward_chunk(
     attn: Any, x: mx.array, memory: mx.array, cache: dict | None, chunk_size, look_back: int
 ):
-    """``MultiHeadedAttentionCrossAtt.forward_chunk`` (attention.py:815+ for cross).
-
-    Cross-attention to the (growing) encoder memory with the same tail-window
-    cache discipline as the decoder self-attention.
-    """
+    # see docs/port-notes/functions.md :: _cross_attn_forward_chunk
     q_h, k_h, v_h = attn.forward_qkv(x, memory)
     if chunk_size is not None and look_back > 0:
         if cache is not None:
@@ -249,12 +231,7 @@ class ParaformerStreamingConfig(ParaformerConfig):
 
 
 class ParaformerStreaming(mxnn.Module):
-    """``ParaformerStreaming`` -- chunk-wise streaming Paraformer (MLX).
-
-    Reuses the offline module tree (identical parameter names); adds
-    ``init_cache`` / ``forward_chunk`` implementing the reference streaming
-    protocol. ``generate`` feeds fixed 600 ms chunks ([0,10,5] x 960 samples).
-    """
+    # see docs/port-notes/functions.md :: ParaformerStreaming
 
     def __init__(self, config: ParaformerStreamingConfig | None = None, **kwargs: Any) -> None:
         super().__init__()
@@ -274,7 +251,7 @@ class ParaformerStreaming(mxnn.Module):
 
     # -- streaming protocol ------------------------------------------------ #
     def init_cache(self, enc_output_size: int = 512, feats_dims: int = 560) -> dict:
-        """``ParaformerStreaming.init_cache`` (model.py:511-552), MLX arrays."""
+        # see docs/port-notes/functions.md :: init_cache
         chunk_size = self._chunk_size
         return {
             "encoder": {
@@ -352,13 +329,13 @@ class ParaformerStreaming(mxnn.Module):
     def predictor_chunk(
         self, encoder_out: mx.array, cache: dict, is_final: bool = False
     ) -> tuple[mx.array, mx.array]:
-        """``calc_predictor_chunk`` -> ``CifPredictorV2.forward_chunk``."""
+        # see docs/port-notes/functions.md :: predictor_chunk
         return _predictor_forward_chunk(self.predictor, encoder_out, cache["encoder"], is_final)
 
     def decoder_chunk(
         self, encoder_out: mx.array, sematic_embeds: mx.array, cache: dict
     ) -> mx.array:
-        """``cal_decoder_with_predictor_chunk`` -> decoder ``forward_chunk``."""
+        # see docs/port-notes/functions.md :: decoder_chunk
         dec_cache = cache["decoder"]
         x = sematic_embeds
         memory = encoder_out
@@ -405,11 +382,7 @@ class ParaformerStreaming(mxnn.Module):
         cache: dict,
         is_final: bool = False,
     ) -> tuple[mx.array | None, mx.array | None]:
-        """One chunk end-to-end. Returns ``(am_scores, token_length)``.
-
-        ``None`` when the chunk fired no tokens (mirrors ``generate_chunk``
-        returning ``[]`` when ``max(pre_token_length) < 1``).
-        """
+        # see docs/port-notes/functions.md :: forward_chunk
         encoder_out, encoder_out_lens = self.encode_chunk(speech, speech_lengths, cache, is_final)
         embeds, token_length, _, _ = self.predictor_chunk(encoder_out, cache, is_final)
         if int(mx.max(token_length).item()) < 1:
@@ -421,7 +394,7 @@ class ParaformerStreaming(mxnn.Module):
 def streaming_config_from_dict(
     data: Mapping[str, Any] | None = None, **kwargs: Any
 ) -> ParaformerStreamingConfig:
-    """Build the streaming config from the official online yaml mapping."""
+    # see docs/port-notes/functions.md :: streaming_config_from_dict
     from .paraformer import paraformer_config_from_dict
 
     data = dict(data or {})
