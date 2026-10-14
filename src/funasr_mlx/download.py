@@ -53,9 +53,10 @@ def _hf_list(repo: str) -> list[str]:
 
 def _ms_list(repo: str) -> list[str]:
     url = f"https://www.modelscope.cn/api/v1/models/{OWNER}/{repo}/repo/files?Recursive=true"
-    with urllib.request.urlopen(url, timeout=30) as r:
+    req = urllib.request.Request(url, headers={"User-Agent": "funasr-mlx/0.1"})
+    with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read())
-    return [f["Path"] for f in data["Data"]["Files"] if f.get("Type") != "TREE"]
+    return [f["Path"] for f in data["Data"]["Files"] if f.get("Type") != "tree"]
 
 
 def _fetch(url: str, dest: Path, *, quiet: bool = False) -> bool:
@@ -117,7 +118,9 @@ def download(
             raise ValueError(f"Unknown variant {variant!r} for {repo}; choose from {variants}")
 
         listing = None
-        for lister, host in ((_hf_list, "huggingface.co"), (_ms_list, "modelscope.cn")):
+        # ModelScope primary (measured 20.4 MB/s vs HF 5.6 MB/s on the same
+        # shard set from this network); HF is the per-file fallback.
+        for lister, host in ((_ms_list, "modelscope.cn"), (_hf_list, "huggingface.co")):
             try:
                 listing = lister(repo)
                 primary = host
@@ -143,9 +146,6 @@ def download(
             if skip_existing and target.is_file() and target.stat().st_size > 0:
                 continue
             urls = (
-                [f"https://huggingface.co/{owner}/{repo}/resolve/main/{path}",
-                 f"https://www.modelscope.cn/models/{owner}/{repo}/resolve/master/{path}"]
-                if primary == "huggingface.co" else
                 [f"https://www.modelscope.cn/models/{owner}/{repo}/resolve/master/{path}",
                  f"https://huggingface.co/{owner}/{repo}/resolve/main/{path}"]
             )
