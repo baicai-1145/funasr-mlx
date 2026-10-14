@@ -5,8 +5,23 @@ build-backend = "hatchling.build"
 [project]
 name = "funasr-mlx"
 version = "0.1.0"
-description = "Memory-bounded native MLX speech inference on Apple Silicon"
+description = "Native MLX speech inference (SenseVoice, Paraformer, Whisper, Qwen3-ASR, GLM, MoSS, Fun-ASR-Nano) with W4A16 quantization, an OpenAI-compatible server and pseudo-streaming, for Apple Silicon"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "baicai1145" }]
 requires-python = ">=3.11"
+keywords = ["mlx", "asr", "speech-recognition", "funasr", "whisper", "sensevoice", "qwen3", "apple-silicon"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["mlx>=0.32.0", "numpy>=1.26", "safetensors>=0.4", "soundfile>=0.12", "PyYAML>=6.0", "psutil>=5.9"]
 
 [project.optional-dependencies]

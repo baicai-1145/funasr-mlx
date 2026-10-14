@@ -9,11 +9,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-def run_server(checkpoint: Path, *, family: str, host: str, port: int, max_tokens: int) -> None:
+def run_server(checkpoint, *, family: str, host: str, port: int, max_tokens: int) -> None:
+    from pathlib import Path
+
     from .llm_asr import LlmAsrTranscriber
 
+    checkpoint = Path(checkpoint)
+
     transcriber = LlmAsrTranscriber(checkpoint, family=family, max_tokens=max_tokens)
-    transcriber._ckpt_dir = checkpoint if checkpoint.is_dir() else checkpoint.parent
     lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
