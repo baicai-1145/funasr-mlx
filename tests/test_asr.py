@@ -3,8 +3,8 @@
 These tests are deliberately small (single-digit dimensions, < 20 frames) so a
 full run stays in the low-megabyte range.  They check **structure and
 checkpoint-key parity**, not model accuracy: passing them is *not* acceptance of
-a real FunASR checkpoint.  Numerical parity against PyTorch weights is the lead's
-serialized job under the memory guard.
+a real FunASR checkpoint.  Numerical parity against PyTorch weights is run
+separately by the alignment tooling.
 
 Run with ``pytest tests/test_asr.py`` from the repository root.  The whole module
 skips itself when MLX is not installed, so collection never fails.
@@ -218,7 +218,7 @@ def test_flatten_state_dict_reads_the_mapping_storage_not_dunder_dict():
     """
     leaf = mxnn.Linear(3, 2)
     assert set(flatten_state_dict(leaf)) == {"weight", "bias"}
-    # __dict__ really is empty of tensors -- this is the trap being guarded.
+    # __dict__ really is empty of tensors -- this is the trap.
     assert not any(isinstance(v, mx.array) for v in vars(leaf).values())
     # Both storage paths must agree.
     assert set(dict.keys(leaf)) == {"weight", "bias"}

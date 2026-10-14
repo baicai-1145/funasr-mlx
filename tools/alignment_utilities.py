@@ -14,7 +14,7 @@ Contract
   the officially supported loader, so the model class, its frontend and its
   tokenizer are built by FunASR's own registry rather than hand-wired here.
 * The native side goes through :func:`funasr_mlx.pipeline.load_model`, the same
-  entry the CLI uses, so the guarded child is required and the checkpoint path
+  entry the CLI uses, and the checkpoint path
   exercised is the shipping one.
 * The two sides run as **separate processes** (``--mode reference`` /
   ``--mode native``); torch and MLX never share an interpreter.

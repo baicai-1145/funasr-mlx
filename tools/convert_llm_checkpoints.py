@@ -1,7 +1,6 @@
 """Convert the five LLM-ASR source checkpoints into the repo native format.
 
-Run under the guarded launcher (see ``tools/prepare_large_alignment.py`` for the
-pattern); conversion refuses to run outside a guarded child.
+Runs directly; no launcher required.
 
     python3 tools/convert_llm_checkpoints.py -- \
         python3 tools/convert_llm_checkpoints.py --family qwen3-asr --dtype bfloat16 \

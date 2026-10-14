@@ -336,8 +336,8 @@ def build_alignment_spec(
     if native is not None and not native.exists():
         raise AlignmentError(
             f"converted native checkpoint not found at {native}; convert it first with "
-            f"convert_checkpoint(..., model={variant.family!r}, dtype='float32') inside "
-            "the memory guard, or build the spec without --native-checkpoint and add it "
+            f"convert_checkpoint(..., model={variant.family!r}, dtype='float32') first, "
+            "or build the spec without --native-checkpoint and add it "
             "before the native run"
         )
 
@@ -392,7 +392,7 @@ def build_alignment_spec(
                 "dtype": "float32",
                 "source": str(assets_root / variant.checkpoint),
                 "destination": str(native) if native is not None else None,
-                "requires_guarded_child": True,
+                "guard_required": False,
             },
             # CMVN and tokenizer filenames are declared only in configuration.json;
             # config.yaml ships cmvn_file: null, so they are never guessed here.
@@ -729,9 +729,7 @@ def _load_checkpoint_state(path: Path) -> dict[str, Any]:
 
     ``weights_only=True`` refuses arbitrary pickle globals even though these
     checkpoints are trusted and pinned; the cost is one argument. ``mmap=True``
-    avoids a second full copy of the weights in RSS, which for a full
-    SenseVoiceSmall or Whisper checkpoint is the difference between fitting the
-    memory guard and not.
+    avoids a second full copy of the weights in RSS.
     """
     import torch
 
@@ -1718,8 +1716,7 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
     prevalidation, its bounded shard loop, its strict key and shape checks --
     rather than a second reader inside this tool that could quietly disagree with
     it.
-    Must run inside the memory guard; the loader itself also enforces that, and
-    this wrapper says so in terms an operator can act on.
+    Runs directly; the loader enforces its own strict checks.
     """
     import mlx.core as mx
 
@@ -1736,7 +1733,7 @@ def run_native(spec: dict[str, Any], output_root: str | Path | None = None) -> d
             f"{variant['key']} has no converted native checkpoint; build the spec with "
             "--native-checkpoint <safetensors path|dir>, produced by "
             f"funasr_mlx.checkpoints.convert_checkpoint(..., model={variant['family']!r}, "
-            "dtype='float32') in a guarded child"
+            "dtype='float32') directly"
         )
     if variant["family"] == "whisper" and spec.get("inputs"):
         raise AlignmentError(
@@ -2013,7 +2010,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"          native artefact: convert it with "
                 f"funasr_mlx.checkpoints.convert_checkpoint(source=<assets>/"
                 f"{variant.checkpoint}, destination=<dir>, model={variant.family!r}, "
-                "dtype='float32') inside a guarded child, then pass the result to "
+                "dtype='float32') directly, then pass the result to "
                 "build --native-checkpoint"
             )
         for key, reason in sorted(UNSUPPORTED.items()):

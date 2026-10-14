@@ -231,7 +231,7 @@ def test_every_model_symbol_imported_by_the_test_suite_exists():
     one test, and that has now happened twice (a ``flatten_state_dict_with_rules``
     imported from this module before it was defined, and the same name missing
     from CAM++ earlier). A single unresolvable import takes down the whole
-    guarded run, so it is worth pinning statically.
+    run, so it is worth pinning statically.
 
     Pure ``ast``: no model module is imported and nothing is executed, so this
     costs no memory and needs no device.

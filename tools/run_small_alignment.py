@@ -53,30 +53,25 @@ def main():
     args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     modes = ("reference", "native") if args.mode == "both" else (args.mode,)
-    try:
-        for family in args.families:
-            for mode in modes:
-                policy = model_policy(family, mode)
-                print(
-                    json.dumps({"role": "full_model_inference", "family": family, "mode": mode}),
-                    flush=True,
-                )
-                report = subprocess.run(
-                    [sys.executable, *model_arguments(args.root, family, mode)], cwd=project
-                )
-                print(f"rc={report.returncode}", flush=True)
-                if report.returncode:
-                    return report.returncode
-            if args.mode != "reference":
-                report = subprocess.run(
-                    [sys.executable, *model_arguments(args.root, family, mode)], cwd=project
-                )
-                print(f"rc={report.returncode}", flush=True)
-                if report.returncode:
-                    return report.returncode
-    except MemoryBudgetExceeded as error:
-        print(json.dumps({"status": "blocked", "reason": str(error)}), flush=True)
-        return 2
+    for family in args.families:
+        for mode in modes:
+            print(
+                json.dumps({"role": "full_model_inference", "family": family, "mode": mode}),
+                flush=True,
+            )
+            report = subprocess.run(
+                [sys.executable, *model_arguments(args.root, family, mode)], cwd=project
+            )
+            print(f"rc={report.returncode}", flush=True)
+            if report.returncode:
+                return report.returncode
+        if args.mode != "reference":
+            report = subprocess.run(
+                [sys.executable, *model_arguments(args.root, family, mode)], cwd=project
+            )
+            print(f"rc={report.returncode}", flush=True)
+            if report.returncode:
+                return report.returncode
     return 0
 
 

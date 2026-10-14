@@ -3,7 +3,7 @@
 All dimensions here are toy-sized; nothing touches the network and no real
 checkpoint is loaded.  These are *architecture / post-processing* tests, not
 real-checkpoint acceptance (numerical parity against FunASR has to be run
-separately by the lead under the memory guard).
+separately against reference outputs).
 
 Run with: ``python -m pytest tests/test_ct_punc.py``
 """

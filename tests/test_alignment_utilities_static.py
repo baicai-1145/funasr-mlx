@@ -7,7 +7,7 @@ output writers, the dispatch table, and the pure helper functions.
 Nothing here imports MLX, Torch or FunASR.  That is deliberate and is asserted
 explicitly by :func:`test_module_imports_no_ml_or_torch`, because the adapter's
 whole contract is that heavy imports are lazy and confined to the functions the
-lead runs in a guarded child.
+lead runs directly.
 """
 from __future__ import annotations
 

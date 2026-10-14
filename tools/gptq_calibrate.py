@@ -17,7 +17,7 @@ the conversion is what has to be repeatable):
     Hessian, so a scope can mix GPTQ and RTN (the decoder stays RTN; only the
     head needs the help).
 
-Both phases must run under the guarded launcher.
+Both phases run directly.
 
     python3 tools/gptq_calibrate.py \
         -- python3 tools/gptq_calibrate.py --family qwen3-asr-0.6b --phase calibrate

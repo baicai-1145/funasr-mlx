@@ -38,7 +38,7 @@ The four LLM-based models (Fun-ASR-Nano, Qwen3-ASR, GLM-ASR-Nano,
 MOSS-Transcribe-Diarize) are ported and numerically verified
 (`src/funasr_mlx/models/` + `models/llm/`), with e2e validated through
 bf16 scripts; their pipeline-factory registration is pending. The seven
-speech families above run through the guarded CLI today.
+speech families above run through the CLI today.
 
 ## Local Use
 
@@ -129,7 +129,7 @@ funasr-mlx transcribe /path/to/qwen3-asr-0.6b-w4a16-awq-w8tower-g32 --audio reco
 # {"text": "...", "token_ids": [...], "family": "qwen3-asr", "wall_ms": 650.8}
 ```
 
-Python API (routes through the guarded subprocess automatically):
+Python API (loads in-process directly):
 
 ```python
 from funasr_mlx.api import transcribe, download_model
@@ -180,7 +180,7 @@ final = stream.close()            # == offline transcription
 
 Optional `test`, `reference` and `convert` dependency groups. Source
 differential tests use a sibling FunASR checkout; unavailable references
-skip. Guarded verification:
+skip. Verification:
 
 ```sh
 PYTHONPATH=src PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m funasr_mlx.runtime \
@@ -188,7 +188,7 @@ PYTHONPATH=src PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m funasr_mlx.runtime \
   python3 -m pytest -q --tb=short --basetemp=.tmp/pytest-check
 ```
 
-503 tests pass in the guarded suite. Real-checkpoint accuracy, quantized
+Tests pass in the suite. Real-checkpoint accuracy, quantized
 variants, and latency/RTF figures are documented in `PROGRESS.md`; the W4A16
 per-family numbers are in `.tmp/t9/RESULTS.md`.
 

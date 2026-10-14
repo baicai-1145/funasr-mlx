@@ -104,7 +104,7 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     shard_bound = max(256 * MB, info.largest_tensor_bytes) + 32 * MB
     for path in files:
         if path.stat().st_size > shard_bound:
-            raise MemoryBudgetExceeded(
+            raise ValueError(
                 "Checkpoint shard is too large; re-shard with bounded buffers"
             )
         header = safetensor_header(path)

@@ -139,7 +139,7 @@ def quantize_bf16_weight(
         weight = mx.array(array).view(mx.bfloat16)
     elif code == "F16":
         weight = mx.array(array).astype(mx.float16)
-    else:  # pragma: no cover - guarded above
+    else:  # pragma: no cover - rejected above
         raise ValueError(f"Quantization requires a 16-bit source weight, got {code}")
     if gptq is None:
         packed, scales, biases = mx.quantize(

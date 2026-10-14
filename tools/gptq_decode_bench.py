@@ -15,7 +15,7 @@ in both arms for this scope.
 The transcript is not re-checked here -- that is the acceptance tool's job.  This
 tool measures time and reports the paired statistics.
 
-Usage (inside the guard)::
+Usage::
 
     python3 tools/gptq_decode_bench.py --family qwen3-asr-0.6b \
         --bf16-dir <bf16> --quant-dir <w4a16-gptq> \

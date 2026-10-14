@@ -18,7 +18,7 @@ The never-worse guarantee is per block: if AWQ-adjusted quantization measures
 worse than plain RTN on the block's own captured input, the block's original
 weights are kept.
 
-Usage (inside the guard)::
+Usage::
 
     python3 tools/awq_calibrate.py \\
       -- python3 tools/awq_calibrate.py --family qwen3-asr-0.6b

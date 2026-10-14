@@ -155,7 +155,7 @@ def test_native_run_uses_the_shipping_pipeline_loader():
     """The validated artefact is the one the product loads, not a private path."""
     src = _source("run_native")
     assert "load_model" in src
-    # A missing guard, a missing artefact and a float16 checkpoint are all
+    # A missing artefact and a float16 checkpoint are all
     # refused loudly rather than silently producing numbers to compare.
     for token in ("native_checkpoint", "float32"):
         assert token in src, token
@@ -333,7 +333,7 @@ def test_native_artefact_is_named_explicitly_and_must_exist(tmp_path):
     conversion = spec["variant"]["conversion"]
     assert conversion["model"] == "paraformer"
     assert conversion["dtype"] == "float32"
-    assert conversion["requires_guarded_child"] is True
+    assert conversion["guard_required"] is False
     assert conversion["source"] == str(assets / "model.pt")
     assert spec["reference"]["init"] == "meta"
     # json.dumps of the whole spec: the plan has to be reviewable in a diff.

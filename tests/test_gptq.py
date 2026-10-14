@@ -532,7 +532,7 @@ def test_row_chunking_is_exact_and_does_not_change_the_result() -> None:
     GPTQ quantizes every row of ``W`` against the same ``H`` with no coupling
     between rows, so splitting the rows cannot change any decision.  This matters
     because a tied LM head (151936x1024) is 622 MB as one float32 array and the
-    memory guard's MLX limit is far below what the inner loop would need, so the
+    bounded-memory budget is far below what the inner loop would need, so the
     shipping path always chunks -- if chunking perturbed the result, every
     acceptance number would describe a different matrix than the one tested.
     """

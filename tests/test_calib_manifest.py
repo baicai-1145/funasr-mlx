@@ -307,7 +307,7 @@ def test_convert_tool_passes_the_source_config_with_the_quantization_section(
     with no ``config.json`` at all: the conversion reported success and the
     checkpoint could not be loaded.  A later version then let the GPTQ
     hyper-parameters (also called ``config``) overwrite the model config, so
-    ``config.json`` got a ``GptqConfig`` object.  Both are guarded here.
+    ``config.json`` got a ``GptqConfig`` object.  Both are rejected here.
     """
     import json
 

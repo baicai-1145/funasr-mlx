@@ -18,7 +18,7 @@ the only valid paired protocol given the thermal drift documented in the
 project's own measurement notes.  Each arm is exercised through
 ``pipeline.load_model`` and the family's own forward path.
 
-Usage (inside the guard)::
+Usage::
 
     python3 tools/gptq_acceptance.py --family qwen3-asr-0.6b \
         --quant-dir /path/to/native-llm/qwen3-asr-0.6b-w4a16-gptq \
