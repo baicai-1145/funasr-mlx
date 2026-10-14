@@ -48,12 +48,10 @@ __all__ = [
     "statistics_pooling",
 ]
 
-#: Buffer names that exist in a PyTorch BatchNorm but have no MLX counterpart.
 TORCH_ONLY_BUFFERS = ("num_batches_tracked",)
 CAMPPLUS_FRONTEND_DEFAULTS = {"window": "povey", "upsacle_samples": False}
 
 
-# containers that reproduce PyTorch parameter names
 class ModuleStack(mxnn.Module):
     # see docs/port-notes/functions.md :: ModuleStack
 
@@ -64,7 +62,6 @@ class ModuleStack(mxnn.Module):
         self._length = len(blocks)
 
     def __len__(self) -> int:
-        # Keep dict semantics: MLX may call len() on this object.
         return dict.__len__(self)
 
     def __iter__(self) -> Iterator[mxnn.Module]:
@@ -158,8 +155,6 @@ class NamedLayerList(mxnn.Module):
         return x
 
 
-# checkpoint plumbing
-#: Layout rule names produced by :func:`flatten_state_dict`.
 IDENTITY_LAYOUT = "identity"
 CONV1D_LAYOUT = "conv1d_torch_out_ink_to_mlx_out_ki"
 CONV2D_LAYOUT = "conv2d_torch_out_inkij_to_mlx_out_kij"
@@ -176,10 +171,8 @@ def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_L
     Full notes: docs/port-notes/functions.md :: convert_checkpoint_tensor
     """
     if rule == CONV1D_LAYOUT:
-        # torch (out, in/groups, k)  ->  MLX (out, k, in/groups)
         return mx.transpose(array, (0, 2, 1))
     if rule == CONV2D_LAYOUT:
-        # torch (out, in, kh, kw)  ->  MLX (out, kh, kw, in)
         return mx.transpose(array, (0, 2, 3, 1))
     if rule != IDENTITY_LAYOUT:
         raise ValueError(f"unknown layout rule {rule!r} for parameter {name!r}")
@@ -338,7 +331,6 @@ def _assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
     setattr(node, parts[-1], array)
 
 
-# initialisation (matches the reference's post-build kaiming pass)
 def kaiming_normal_(weight: mx.array) -> mx.array:
     # see docs/port-notes/functions.md :: kaiming_normal_
     fan_in = 1
@@ -362,7 +354,6 @@ def _reset_conv_linear(module: mxnn.Module) -> None:
                     _reset_conv_linear(item)
 
 
-# normalisation
 class BatchNorm(mxnn.Module):
     """``torch.nn.BatchNorm{1,2}d`` for channels-last MLX activations.
 
@@ -444,7 +435,6 @@ def get_nonlinear(config_str: str, channels: int) -> NamedModuleDict:
     return blocks
 
 
-# statistics pooling
 def statistics_pooling(
     x: mx.array,
     *,
@@ -471,7 +461,6 @@ class StatsPool(mxnn.Module):
         return statistics_pooling(x)
 
 
-# FCM front-end
 class BasicResBlock(mxnn.Module):
     # see docs/port-notes/functions.md :: BasicResBlock
 
@@ -538,10 +527,7 @@ class FCM(mxnn.Module):
                 in_planes = planes * block.expansion
             return ModuleStack(layers)
 
-        # Reference quirk preserved: components.py:72-73 passes ``num_blocks[0]``
-        # to BOTH ``_make_layer`` calls, so ``num_blocks[1]`` is never consulted.
-        # Irrelevant for the default (2, 2), but kept faithful rather than
-        # "corrected", so a checkpoint built with the reference cannot diverge.
+        # see docs/port-notes/comments.md :: campplus.py:530
         self.layer1 = _make_layer(m_channels, num_blocks[0], 2)
         self.layer2 = _make_layer(m_channels, num_blocks[0], 2)
 
@@ -560,7 +546,6 @@ class FCM(mxnn.Module):
         out = self.layer2(out)
         out = mx.maximum(self.bn2(self.conv2(out)), 0.0)
         b, h, w, c = out.shape
-        # torch: (B, C, H, W) -> (B, C*H, W);  here: (B, H, W, C) -> (B, W, C*H)
         out = mx.reshape(mx.transpose(out, (0, 2, 3, 1)), (b, w, c * h))
         if c * h != self.out_channels:
             raise RuntimeError(
@@ -570,7 +555,6 @@ class FCM(mxnn.Module):
         return out
 
 
-# TDNN building blocks (all channels-last NLC, matching MLX Conv1d)
 class TDNNLayer(mxnn.Module):
     # see docs/port-notes/functions.md :: TDNNLayer
 
@@ -651,8 +635,6 @@ class CAMLayer(mxnn.Module):
         seg = mx.reshape(padded, (x.shape[0], n_seg, seg_len, x.shape[2]))
         seg_valid = mx.reshape(valid, (1, n_seg, seg_len, 1))
         if stype == "avg":
-            # torch's avg_pool with ceil_mode=True excludes padded positions from
-            # the mean (it pads with -inf internally).
             pooled = mx.sum(seg, axis=2) / mx.sum(seg_valid, axis=2)
         else:
             pooled = mx.max(seg + (seg_valid - 1.0) * 1e9, axis=2)
@@ -779,7 +761,6 @@ class DenseLayer(mxnn.Module):
         return self.nonlinear(x)
 
 
-# configuration
 
 @dataclass
 class CAMPlusConfig:
@@ -826,7 +807,6 @@ def campplus_config_from_dict(
     return CAMPlusConfig.from_dict(data)
 
 
-# model
 class CAMPPlus(mxnn.Module):
     # see docs/port-notes/functions.md :: CAMPPlus
 
@@ -848,9 +828,6 @@ class CAMPPlus(mxnn.Module):
         )
         channels = self.head.out_channels
 
-        # The reference keeps everything after ``head`` inside ``self.xvector``,
-        # an ``nn.Sequential`` built by ``add_module``; keeping that wrapper
-        # preserves the ``xvector.`` prefix in the checkpoint keys.
         self.xvector = NamedModuleDict()
         self.xvector.add(
             "tdnn",
@@ -890,10 +867,7 @@ class CAMPPlus(mxnn.Module):
                 TransitLayer(channels, channels // 2, bias=False, config_str=cfg.config_str),
             )
             channels //= 2
-        # Introspection only.  These two lists must NEVER be used for execution
-        # order: the reference interleaves block_i / transit_i, so
-        # ``xvector.names()`` is the single source of truth (see
-        # ``CAMPPlus.frame_features``).
+        # see docs/port-notes/comments.md :: campplus.py:870
         self._block_names = [n for n in self.xvector.names() if n.startswith("block")]
         self._transit_names = [n for n in self.xvector.names() if n.startswith("transit")]
 

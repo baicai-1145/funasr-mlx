@@ -104,7 +104,6 @@ class _EncoderLayer(mxnn.Module):
         self._size = size
 
     def __call__(self, x: mx.array, mask: mx.array | None = None) -> mx.array:
-        # ESPnet EncoderLayer default normalize_before=True: pre-norm.
         attn = self.self_attn(self.norm1(x), mask)
         x = x + attn
         return x + self.feed_forward(self.norm2(x))

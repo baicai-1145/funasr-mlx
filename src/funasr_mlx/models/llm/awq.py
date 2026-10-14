@@ -11,8 +11,6 @@ from typing import Any, Callable
 import numpy as np
 
 try:  # mlx.nn has no no_grad context in 0.32; weights are only ever assigned,
-    # never differentiated, so the context is a no-op guard upstream added for
-    # its training runtime.  Define a local fallback rather than import it.
     from contextlib import nullcontext
 
     def no_grad():
@@ -26,13 +24,9 @@ class AwqConfig:
 
     n_grid: int = 20
     max_shrink: float = 0.5
-    #: Subsampled rows for the clip search (upstream ``n_sample_token``).
     clip_rows: int = 512
-    #: Batch width for the row dimension during the clip search.
     clip_row_batch: int = 64
-    #: Batch width over output channels during the clip search.
     clip_out_batch: int = 256
-    #: Scale grid over ``x_max ** ratio``; upstream range.
     max_ratio: float = 1.0
 
 
@@ -45,7 +39,6 @@ class ScaleSite:
     block: str | None = None
 
 
-#: Qwen3 decoder block: identical topology to mlx-lm's llama config.
 QWEN3_SCALE_SITES = (
     ScaleSite(block="self_attn", prev="input_layernorm",
               layers=("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")),
@@ -54,8 +47,6 @@ QWEN3_SCALE_SITES = (
               layers=("mlp.gate_proj", "mlp.up_proj")),
 )
 
-#: q/k projections are excluded from clipping (attention couples their error);
-#: o_proj/v_proj remain clip-eligible per upstream's no_clip=["q_proj","k_proj"].
 QWEN3_NO_CLIP = ("q_proj", "k_proj")
 
 
@@ -104,8 +95,6 @@ class MultiBlockCapture:
 
             def catcher_factory(module, nn=self._nn, mx=mx, cap=self.row_cap):
                 if isinstance(module, nn.RMSNorm):
-                    # ONLY the block's first norm records (its input IS the
-                    # block input); the mid-block norm's input is not used.
                     if not _is_first_norm(module, block):
                         return module
                     record_norm = True
@@ -116,11 +105,7 @@ class MultiBlockCapture:
 
                 class Catcher(nn.Module):
                     def __call__(self, x, *args, **kwargs):
-                        # HOST-side storage with a hard stop: once ``row_cap``
-                        # rows are held, further rows are DROPPED (the cap is
-                        # a statistical sample, not an exhaustive log).  This
-                        # avoids both the wired-GW trap of MLX-side buffers and
-                        # the O(n^2) re-concat allocation spikes.
+                        # see docs/port-notes/comments.md :: awq.py:108
                         import numpy as _np
 
                         attr = "block_input" if record_norm else "input_feat"
@@ -136,7 +121,6 @@ class MultiBlockCapture:
                                 x.reshape(-1, x.shape[-1]).astype(mx.float32), dtype=_np.float16
                             )[:need]
                             setattr(module, attr, _np.concatenate([held, more], axis=0))
-                        # else: at cap, drop
                         return module(x, *args, **kwargs)
 
                 return Catcher()
@@ -190,8 +174,6 @@ class AwqBlockQuantizer:
 
             class Catcher(self._nn.Module):
                 def __call__(self, x, *args, **kwargs):
-                    # HOST-side numpy storage (see MultiBlockCapture for why:
-                    # MLX-side buffers are wired GPU memory).
                     import numpy as _np
 
                     if record_norm_input:
@@ -224,7 +206,6 @@ class AwqBlockQuantizer:
 
         def once(chunk):
             if hasattr(block, "input_layernorm") and hasattr(block, "self_attn"):
-                # a whole transformer block: unroll the qwen3 residual pattern
                 h = chunk
                 h = h + block.self_attn(block.input_layernorm(h), mask)
                 return h + block.mlp(block.post_attention_layernorm(h))
@@ -243,10 +224,7 @@ class AwqBlockQuantizer:
         from mlx.utils import tree_flatten
 
         layers = [self._submodule(name) for name in site.layers]
-        # mlx-lm's ``module2inspect``: the sub-block when the site names one
-        # (attention), else the FIRST layer itself -- never the whole block,
-        # because the whole block's input is the residual stream, not the
-        # successor Linear's input.
+        # see docs/port-notes/comments.md :: awq.py:227
         inner = self._submodule(site.block) if site.block else layers[0]
         x = _to_mx(layers[0].input_feat)  # [rows, hidden]
         x = x[None]  # [1, rows, hidden] -- block call convention
@@ -269,7 +247,6 @@ class AwqBlockQuantizer:
                 value = float(loss.item())
                 if value < best_error:
                     best_error, best_scales = value, scales
-                # restore
                 self.block.load_weights(weights)
             if best_scales is None:
                 raise RuntimeError("scale search found no candidate")
@@ -334,8 +311,6 @@ class AwqBlockQuantizer:
             prev.weight = (prev.weight / scales.astype(prev.weight.dtype)).astype(
                 prev.weight.dtype
             )
-        # keep the captured input consistent with the folded weights (host
-        # numpy divided by the mx scales, back through numpy for the next site)
         import numpy as onp
 
         scales_np = onp.asarray(scales)
@@ -348,10 +323,7 @@ class AwqBlockQuantizer:
         import mlx.core as mx
         from mlx.utils import tree_flatten
 
-        # reference loss: plain RTN quantization of the untouched block
         weights = tree_flatten(self.block.parameters())
-        # reference output for the never-worse check uses the block's OWN
-        # input: what enters its first norm (the residual stream).
         x = _to_mx(self._submodule("input_layernorm").block_input)[None]
         linears = _linears(self.block)
         with no_grad():
@@ -386,20 +358,10 @@ class AwqBlockQuantizer:
             self.block.load_weights(weights)
 
         if after > before:
-            # NEVER-WORSE: if the AWQ-adjusted block quantizes WORSE than the
-            # untouched one, the adjustment is discarded and the block keeps
-            # its original weights. (The non-fallback path is the difference
-            # from the original port: it used to restore here unconditionally,
-            # which silently discarded every scale/clip the search had folded
-            # in -- the saved "AWQ" checkpoint was the raw weights in f16 and
-            # every downstream "AWQ vs RTN" comparison was two RTN runs.)
+            # see docs/port-notes/comments.md :: awq.py:361
             self.block.load_weights(weights)
             return {"before": before, "after": after, "fallback": True}
-        # The adjustment helps: re-fold it. ``weights`` was captured before the
-        # search started, so the adjusted parameters must be re-applied --
-        # cheapest correct path is to re-run the same deterministic search on
-        # the pristine block (the captures are unchanged, so the search
-        # reproduces the same scales/clips) rather than stash a second tree.
+        # see docs/port-notes/comments.md :: awq.py:364
         for site in QWEN3_SCALE_SITES:
             scales = self.search_scale(site, quantize_func)
             self.apply_scale(site, scales)

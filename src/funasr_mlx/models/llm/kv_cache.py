@@ -43,11 +43,7 @@ class KVCache:
             new_k = mx.zeros((B, H, offset + n, D), keys.dtype)
             new_v = mx.zeros((B, H, offset + n, D), values.dtype)
             if self.keys is not None:
-                # The backing store may be LARGER than offset (capacity is
-                # step-quantized); copy the whole store, not just [:offset] --
-                # a prefill of 253 into a 256 buffer followed by a 5-token
-                # speculative block would otherwise try to squeeze 256 columns
-                # into a 253-column slice.
+                # see docs/port-notes/comments.md :: kv_cache.py:46
                 new_k[:, :, : self.keys.shape[2]] = self.keys
                 new_v[:, :, : self.values.shape[2]] = self.values
             self.keys, self.values = new_k, new_v

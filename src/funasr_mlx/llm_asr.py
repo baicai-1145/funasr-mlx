@@ -7,7 +7,6 @@ from typing import Any
 
 import numpy as np
 
-#: family -> (tokenizer source default subdir name, eos token ids)
 _QWEN3_EOS = (151643, 151645, 151671)
 
 
@@ -54,8 +53,6 @@ class LlmAsrTranscriber:
             from transformers import AutoTokenizer
 
             directory = self._ckpt_dir
-            # tokenizer files may live in the checkpoint dir or in a sibling
-            # fp16 source dir (quant dirs don't always carry them)
             candidates = [directory, directory.parent / directory.name.split("-w4a16")[0]]
             for cand in candidates:
                 if (cand / "vocab.json").is_file() or (cand / "tokenizer.json").is_file():
@@ -116,8 +113,6 @@ class LlmAsrTranscriber:
             raise ValueError(f"Unsupported LLM-ASR family: {fam}")
 
     def model_config_directory(self) -> Path:
-        # load_model does not retain the path; the API layer passes the
-        # checkpoint directory and tokenizer files live alongside.
         return self._ckpt_dir
 
     # ---------- audio front-ends ----------
@@ -301,7 +296,6 @@ def resolve_family(checkpoint: str | Path, family: str | None) -> str:
         if family not in aliases:
             raise ValueError(f"Unknown LLM-ASR family: {family}")
         return aliases[family]
-    # infer from directory name
     name = Path(checkpoint).name.lower()
     for key, fam in {
         "qwen3-asr": "qwen3-asr", "glm": "glm-asr-nano",

@@ -22,14 +22,11 @@ __all__ = [
     "unpack_codes",
 ]
 
-#: Epsilon from MLX's ``affine_quantize`` kernel: the smallest scale it will use.
 _MLX_SCALE_EPS = 1e-7
 
-#: Storage dtypes a quantized checkpoint can carry its ``scales``/``biases`` in.
 _STORAGE_DTYPES = ("bfloat16", "float16", "float32")
 
 
-# the quantizer
 def _round_half_away(values: np.ndarray) -> np.ndarray:
     # see docs/port-notes/functions.md :: _round_half_away
     return np.floor(np.abs(values) + 0.5) * np.sign(values)
@@ -49,7 +46,6 @@ class AffineQuantizer:
         self.group_size = group_size
         self.storage = storage
         self.max_code = (1 << bits) - 1
-        #: Number of codes packed into one uint32 word (8 for 4 bits, 4 for 8).
         self.pack_factor = 32 // bits
         self._casts = 0
 
@@ -113,8 +109,6 @@ class AffineQuantizer:
             )
         x = (values - bias[:, None]) / scale[:, None]
         clipped = np.minimum(_round_half_away(x), self.max_code)
-        # A negative scale is legal in this scheme (bias is the max end), so the
-        # low clamp is applied to the code, not to x.
         return np.clip(clipped, 0, self.max_code).astype(np.uint8)
 
     def dequantize(
@@ -174,32 +168,18 @@ def unpack_codes(words: np.ndarray, columns: int, *, bits: int = 4) -> np.ndarra
     return AffineQuantizer(bits=bits).unpack(words, columns)
 
 
-# configuration
 @dataclass(frozen=True)
 class GptqConfig:
     # see docs/port-notes/functions.md :: GptqConfig
 
     bits: int = 4
     group_size: int = 64
-    #: Hessian dampening, as a fraction of ``mean(diag(H))``.
     damp_percent: float = 0.01
-    #: Columns per lazy batch update (Frantar's act-order note).
     block_size: int = 128
-    #: Quantize in descending-``diag(H)`` order (recommended for embeddings).
-    #: This permutes the columns, so it is paired with **static groups**: the
-    #: group parameters are taken once, from the original matrix, over each
-    #: group's own columns in storage order.  (Frantar's act-order note makes the
-    #: same pairing; with dynamic groups the stored codes and the stored side
-    #: tensors would describe different groups.)
+    # see docs/port-notes/comments.md :: gptq.py:179
     act_order: bool = False
-    #: Dtype the side tensors are stored in (must match the checkpoint dtype).
     storage: str = "bfloat16"
-    #: Rows processed per pass.  GPTQ is row-independent -- every row of ``W`` is
-    #: quantized against the same ``H`` with no coupling between rows -- so this
-    #: is exact, not an approximation.  It exists because a tied LM head is large
-    #: (151936x1024 is 622 MB as a single float32 array, and the inner loop wants
-    #: several such arrays live at once) while the memory guard's MLX limit is far
-    #: below that.  0 means "all rows in one pass".
+    # see docs/port-notes/comments.md :: gptq.py:182
     row_chunk: int = 8192
 
     def __post_init__(self) -> None:
@@ -236,26 +216,15 @@ class GptqOutcome:
     Full notes: docs/port-notes/functions.md :: GptqOutcome
     """
 
-    #: ``uint32`` packed codes, ``[out, in * bits / 32]``.
     packed: np.ndarray
-    #: Per-group scale, ``[out, in / group_size]``, in the storage dtype.
     scales: np.ndarray
-    #: Per-group bias, same shape and dtype as ``scales``.
     biases: np.ndarray
-    #: Mean squared Frobenius error of the reconstructed weight.
     error: float
-    #: Total squared layer-output error ``trace(D (H/2) D^T)``.
     output_error: float | None = None
-    #: Mean squared error of plain round-to-nearest on the same matrix.
     rtn_error: float | None = None
-    #: Output error of plain round-to-nearest on the same matrix.
     rtn_output_error: float | None = None
-    #: Fraction of *output* error removed relative to round-to-nearest.
     error_reduction: float | None = None
-    #: Fraction of Frobenius error removed relative to round-to-nearest (may be
-    #: negative: see the class docstring).
     frobenius_reduction: float | None = None
-    #: Column permutation applied by act-order (``None`` when disabled).
     act_order_permutation: np.ndarray | None = None
     method: str = "gptq"
 
@@ -274,7 +243,6 @@ class GptqOutcome:
         }
 
 
-# GPTQ core
 def output_error(weight: np.ndarray, reconstructed: np.ndarray, hessian: np.ndarray) -> float:
     """Total squared layer-output error of a reconstruction, from ``H`` alone.
 
@@ -295,8 +263,6 @@ def output_error(weight: np.ndarray, reconstructed: np.ndarray, hessian: np.ndar
 def _upper_cholesky_inverse(hessian: np.ndarray) -> np.ndarray:
     # see docs/port-notes/functions.md :: _upper_cholesky_inverse
     inverse = np.linalg.inv(hessian)
-    # Symmetrize: the inverse of a symmetric matrix is symmetric only up to
-    # rounding, and Cholesky reads the lower triangle.
     inverse = 0.5 * (inverse + inverse.T)
     return np.linalg.cholesky(inverse).T.astype(np.float32)
 
@@ -329,8 +295,6 @@ def gptq_quantize(
     hessian = np.asarray(hessian, dtype=np.float32)
     _check_inputs(weight, hessian, config)
 
-    # Keep the caller's basis: act-order permutes ``weight``/``hessian`` below,
-    # and the reported error must be measured in the original coordinates.
     original_weight = weight
     original_hessian = hessian
 
@@ -348,10 +312,7 @@ def gptq_quantize(
             original_weight, rtn_reconstruction, original_hessian
         )
 
-    # A column the calibration never exercised has a zero Hessian diagonal; it
-    # carries no second-order information, so it must not be allowed to blow up
-    # the inverse.  Zero the column and give the Hessian a unit diagonal there,
-    # exactly as the reference does.
+    # see docs/port-notes/comments.md :: gptq.py:315
     dead = np.diag(hessian) == 0
     if dead.any():
         hessian = hessian.copy()
@@ -372,52 +333,23 @@ def gptq_quantize(
     damped[diagonal, diagonal] += damp
     upper = _upper_cholesky_inverse(damped)
 
-    # Group parameters, keyed by the group index in the *stored* layout.
     #
-    # Without act-order the columns are visited in storage order, so a group's
-    # parameters are simply taken when the loop reaches its first column, from
-    # the running (already error-compensated) matrix -- Frantar's "dynamic
-    # groups".  With act-order the columns arrive in permuted order, so the
-    # columns of one stored group are no longer contiguous, and taking the
-    # parameters from the permuted matrix would leave the stored codes and the
-    # stored side tensors describing different groups (the checkpoint would
-    # dequantize to something the metrics never described).  act-order is
-    # therefore paired with **static groups**, as in the reference
-    # implementation: the parameters are chosen once, from the original matrix,
-    # over the group's own columns in storage order.
+    # see docs/port-notes/comments.md :: gptq.py:337
     group_count = columns // config.group_size
     codes = np.empty(weight.shape, dtype=np.uint8)
     scales = np.empty((weight.shape[0], group_count), dtype=np.float32)
     biases = np.empty_like(scales)
     chunk = config.row_chunk or weight.shape[0]
 
-    # GPTQ is row-independent: each row is quantized against the same ``H`` with
-    # no coupling between rows, so processing row chunks is exact.  It is what
-    # keeps a 151936x1024 tied head inside the guard's MLX budget -- one full
-    # float32 copy of that matrix is already 622 MB, and the inner loop wants
-    # several live at once.
+    # see docs/port-notes/comments.md :: gptq.py:344
     for row_start in range(0, weight.shape[0], chunk):
         row_stop = min(row_start + chunk, weight.shape[0])
         running = weight[row_start:row_stop].copy()
         quantized = np.empty_like(running)
 
-        # Group parameters are keyed by the group index in the *STORED* layout,
-        # because that is what the checkpoint carries.
         #
-        # Without act-order the columns are visited in storage order, so a
-        # group's parameters are simply taken when the loop reaches its first
-        # column, read off the running (already error-compensated) matrix --
-        # Frantar's "dynamic groups".  With act-order the columns arrive in
-        # permuted order, so a stored group's columns are no longer contiguous
-        # and taking the parameters from the permuted matrix would leave the
-        # stored codes and the stored side tensors describing different groups
-        # (the checkpoint would dequantize to something the metrics never
-        # described).  act-order is therefore paired with **static groups**, as
-        # in the reference implementation: the parameters are chosen once, from
-        # the original matrix, over the group's own columns in storage order.
+        # see docs/port-notes/comments.md :: gptq.py:351
         #
-        # Either way the parameters are per-chunk: they are read off this chunk's
-        # rows, so they are recomputed here rather than shared across chunks.
         static_params: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         if config.act_order:
             for index in range(group_count):
@@ -445,9 +377,6 @@ def gptq_quantize(
 
         for start in range(0, columns, config.block_size):
             stop = min(start + config.block_size, columns)
-            # ``block`` is this block's slice of the running (error-compensated)
-            # matrix.  The compensation must be applied to it as the loop
-            # proceeds, so it is kept separate from the values chosen.
             block = running[:, start:stop].copy()
             block_upper = upper[start:stop, start:stop]
             block_error = np.empty_like(block)
@@ -467,14 +396,7 @@ def gptq_quantize(
                         error, block_upper[offset, offset + 1 :]
                     )
             if stop < columns:
-                # Lazy batch update (Frantar's act-order note): every column in
-                # the block contributes ``error_i * Hinv[i, stop:]`` to the
-                # remaining columns, so the whole block's compensation is applied
-                # at once.  ``error_i`` is the *scaled* error
-                # ``(w - q) / Hinv[i, i]`` -- the reference's ``Err1`` -- and NOT
-                # ``block - block_quantized``, which differs by a factor of
-                # ``Hinv[i, i]`` per column because the running block has already
-                # absorbed the earlier columns' updates.
+                # see docs/port-notes/comments.md :: gptq.py:399
                 running[:, stop:] -= block_error @ upper[start:stop, stop:]
 
         for index in range(group_count):
@@ -491,20 +413,8 @@ def gptq_quantize(
     packed = quantizer.pack(codes)
     scales = scales.astype(dtype)
     biases = biases.astype(dtype)
-    # The metrics are computed from the STORED triple, not accumulated from the
-    # inner loop's own arrays.  Those are not the same object -- the loop's
-    # per-chunk reconstruction is built from the running (error-compensated)
-    # matrix, while the checkpoint stores codes and side tensors that are read
-    # back through a different path -- and accumulating chunk-local traces of it
-    # did not reproduce the stored triple's metric (measured 1112899.59 against
-    # the true 392.65 on the module's own test problem).  Rebuilding the
-    # reconstruction from the stored triple, in row blocks so no full float32
-    # copy is materialised, makes the reported numbers describe exactly what a
-    # reader of the checkpoint would get.
+    # see docs/port-notes/comments.md :: gptq.py:416
     #
-    # ``trace(D (H/2) D^T)`` does decompose over the rows of ``D`` (row ``i``
-    # contributes ``D[i] (H/2) D[i]^T``), so blocking it is exact, not an
-    # approximation.
     error = 0.0
     result_output_error = 0.0
     half = 0.5 * original_hessian
@@ -608,7 +518,6 @@ def _pack_triple(
     return quantizer.pack(codes), scales.astype(dtype), biases.astype(dtype)
 
 
-# Hessian collection
 @dataclass
 class HessianAccumulator:
     """``H = 2 X^T X`` in float32, with a per-language balance guard.
@@ -617,7 +526,6 @@ class HessianAccumulator:
     """
 
     columns: int
-    #: Per-language ``X^T X`` (float32) and row count.
     sums: dict[str, np.ndarray] = field(default_factory=dict)
     rows: dict[str, int] = field(default_factory=dict)
 
@@ -628,7 +536,6 @@ class HessianAccumulator:
     def add(self, activations: np.ndarray, language: str = "") -> int:
         activations = np.asarray(activations, dtype=np.float32)
         if activations.ndim == 3:
-            # [batch, sequence, hidden] -> rows
             activations = activations.reshape(-1, activations.shape[-1])
         if activations.ndim != 2 or activations.shape[1] != self.columns:
             raise ValueError(

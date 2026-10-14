@@ -52,7 +52,6 @@ __all__ = [
 ]
 
 
-# masking / padding helpers
 def sequence_mask(lengths: Any, maxlen: int | None = None, dtype: Any = mx.float32) -> mx.array:
     # see docs/port-notes/functions.md :: sequence_mask
     lens = mx.asarray(lengths)
@@ -91,7 +90,6 @@ def decimate_mask(x_mask: mx.array, stride: int = 2, end_offset: int = 2) -> mx.
     return mx.take(x_mask, mx.array(indices, dtype=mx.int32), axis=-1)
 
 
-# checkpoint plumbing
 IDENTITY_LAYOUT = "identity"
 CONV1D_LAYOUT = "conv1d_torch_out_ink"
 CONV2D_LAYOUT = "conv2d_torch_out_ink"
@@ -105,8 +103,6 @@ _LAYOUT_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(^|\.)conv\.\d+\.weight$"), CONV2D_LAYOUT),
 )
 
-#: Public mapping ``"<key suffix regex>" -> layout rule name`` for consumers that
-#: need to build a conversion table themselves.
 LAYOUT_RULES: Mapping[str, str] = {
     "fsmn_block.weight": CONV1D_LAYOUT,
     "cif_conv1d.weight": CONV1D_LAYOUT,
@@ -185,12 +181,8 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
             _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
             tensors[name] = value
-            # Only the kernel needs a transpose.  The rule follows the OWNING
-            # module, so a conv's 1-D ``bias`` would inherit it and then be
-            # transposed with three axes; the bias is IDENTITY in both layouts.
             rules[name] = _module_layout_rule(module) if key == "weight" else IDENTITY_LAYOUT
         elif isinstance(value, Mapping):
-            # A plain dict of tensors stored directly on a Module.
             for sub_key, sub_value in value.items():
                 if isinstance(sub_value, mx.array):
                     tensors[f"{name}.{sub_key}"] = sub_value
@@ -214,7 +206,6 @@ def _assign(module: mxnn.Module, key_parts: Sequence[str], array: mx.array) -> N
     node: Any = module
     for part in key_parts[:-1]:
         node = _resolve_child(node, part)
-    # ``mx.array`` values go into the mapping storage via MLX's ``__setattr__``.
     setattr(node, key_parts[-1], array)
 
 
@@ -248,8 +239,6 @@ def load_strict(
         short = name[len(prefix) :]
         array = mx.asarray(incoming[name])
         if convert:
-            # The rule comes from the owning module type, so a renamed
-            # parameter still gets the right layout conversion.
             array = convert_checkpoint_tensor(short, array, rules.get(short))
         if dtype is not None:
             array = array.astype(dtype)
@@ -264,7 +253,6 @@ def load_strict(
     return loaded
 
 
-# containers
 class ModuleStack(mxnn.Module):
     """A stack of sibling modules with PyTorch-compatible parameter names.
 
@@ -278,7 +266,6 @@ class ModuleStack(mxnn.Module):
         self._length = len(blocks)
 
     def __len__(self) -> int:
-        # Keep dict semantics: MLX may call len() on this object.
         return dict.__len__(self)
 
     def __iter__(self) -> Iterator[mxnn.Module]:
@@ -309,7 +296,6 @@ def repeat(num_blocks: int, factory: Callable[[int], mxnn.Module]) -> ModuleStac
     return ModuleStack([factory(index) for index in range(num_blocks)])
 
 
-# normalisation
 class LayerNorm(mxnn.LayerNorm):
     # see docs/port-notes/functions.md :: LayerNorm
 
@@ -330,7 +316,6 @@ class Float32LayerNorm(mxnn.LayerNorm):
         return super().__call__(x.astype(mx.float32)).astype(out_dtype)
 
 
-# positional encodings
 class PositionalEncoding(mxnn.Module):
     """``funasr.models.transformer.embedding.PositionalEncoding``.
 
@@ -351,20 +336,14 @@ class PositionalEncoding(mxnn.Module):
         self._xscale = math.sqrt(float(d_model))
 
     def _table(self, length: int, dtype: Any) -> mx.array:
-        # ``reverse`` flips the position index here; the reference instead
-        # reverses an already-built table of length ``max_len``.  Identical for
-        # ``reverse=False``, which is the only configured path.
         if self._reverse:
             positions = mx.arange(length - 1, -1, -1).astype(mx.float32)[:, None]
         else:
             positions = mx.arange(0, length).astype(mx.float32)[:, None]
-        # reference: torch.arange(0, d_model, 2) * -(log(10000) / d_model)
         div_term = mx.exp(
             mx.arange(0, self._d_model, 2).astype(mx.float32) * -(math.log(10000.0) / self._d_model)
         )
         phase = positions * div_term  # (length, d_model // 2)
-        # stack(...).reshape(...) yields [sin0, cos0, sin1, cos1, ...], which is
-        # exactly pe[:, 0::2] = sin / pe[:, 1::2] = cos.
         return (
             mx.stack([mx.sin(phase), mx.cos(phase)], axis=-1)
             .reshape(length, self._d_model)
@@ -400,7 +379,6 @@ class SinusoidalPositionEncoder(mxnn.Module):
         return x + position_encoding
 
 
-# feed forward
 class PositionwiseFeedForward(mxnn.Module):
     # see docs/port-notes/functions.md :: PositionwiseFeedForward
 
@@ -432,7 +410,6 @@ class PositionwiseFeedForwardDecoderSANM(mxnn.Module):
         return self.w_2(self.norm(mx.maximum(self.w_1(x), 0.0)))
 
 
-# attention
 class MultiHeadedAttentionSANM(mxnn.Module):
     # see docs/port-notes/functions.md :: MultiHeadedAttentionSANM
 
@@ -487,7 +464,6 @@ class MultiHeadedAttentionSANM(mxnn.Module):
 
     def forward_attention(self, value: mx.array, scores: mx.array, mask: mx.array | None):
         if mask is not None:
-            # (B, 1, T) -> (B, 1, 1, T) boolean "is padding" mask.
             blocked = attention_blocked(mask)
             neg_inf = mx.array(-float("inf"), scores.dtype)
             scores = mx.where(blocked, neg_inf, scores)
@@ -505,11 +481,7 @@ class MultiHeadedAttentionSANM(mxnn.Module):
         q, k, v = mx.split(q_k_v, 3, axis=-1)
         q_h, k_h, v_h, v = self._split_heads(q), self._split_heads(k), self._split_heads(v), v
         fsmn_memory = self.forward_fsmn(v, mask)
-        # The unmasked branch uses the fused SDPA kernel (one kernel for
-        # scale+BMM+softmax+BMM, softmax in float32 internally). Numerically
-        # equivalent to the manual path -- asserted by tests -- but without
-        # four separate kernel launches per layer, which dominates latency on
-        # short sequences.
+        # see docs/port-notes/comments.md :: sanm.py:484
         if mask is None:
             attn = mx.fast.scaled_dot_product_attention(q_h, k_h, v_h, scale=self._d_k**-0.5)
             b, _, t, _ = attn.shape
@@ -634,7 +606,6 @@ class MultiHeadedAttentionCrossAtt(mxnn.Module):
         return self.forward_attention(v_h, scores, memory_mask, ret_attn)
 
 
-# encoder / decoder layers
 class EncoderLayerSANM(mxnn.Module):
     # see docs/port-notes/functions.md :: EncoderLayerSANM
 
@@ -734,7 +705,6 @@ class DecoderLayerSANM(mxnn.Module):
         return x, tgt_mask, memory, memory_mask
 
 
-# subsampling front-ends
 class TooShortUttError(Exception):
     # see docs/port-notes/functions.md :: TooShortUttError
 
@@ -779,7 +749,6 @@ class Conv2dSubsampling(mxnn.Module):
         x = mx.expand_dims(x, -1)  # (B, T, F, C=1), MLX NHWC
         x = self.conv(x)
         b, t, f, c = x.shape
-        # (B, T, F, C) -> (B, T, C, F) -> flatten in PyTorch's (C, F) order.
         x = mx.reshape(mx.transpose(x, (0, 1, 3, 2)), (b, t, c * f))
         x = self.out(x)
         if x_mask is None:

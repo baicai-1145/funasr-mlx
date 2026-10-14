@@ -53,7 +53,6 @@ __all__ = [
     "whisper_config_from_dict",
 ]
 
-#: OpenAI Whisper defaults (see ``whisper/__init__.py`` of the reference).
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_N_MELS = 80
 DEFAULT_N_FFT = 400
@@ -65,7 +64,6 @@ IDENTITY_LAYOUT = "identity"
 CONV1D_LAYOUT = "conv1d_torch_out_ink_to_mlx_out_ki"
 
 
-# containers / checkpoint plumbing (self-contained by design)
 class ModuleStack(mxnn.Module):
     # see docs/port-notes/functions.md :: ModuleStack
 
@@ -76,7 +74,6 @@ class ModuleStack(mxnn.Module):
         self._length = len(blocks)
 
     def __len__(self) -> int:
-        # Keep dict semantics: MLX may call len() on this object.
         return dict.__len__(self)
 
     def __iter__(self) -> Iterator[mxnn.Module]:
@@ -108,7 +105,6 @@ def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_L
     Full notes: docs/port-notes/functions.md :: convert_checkpoint_tensor
     """
     if rule == CONV1D_LAYOUT:
-        # torch (out, in, k) -> MLX (out, k, in)
         return mx.transpose(array, (0, 2, 1))
     if rule != IDENTITY_LAYOUT:
         raise ValueError(f"unknown layout rule {rule!r} for parameter {name!r}")
@@ -120,21 +116,7 @@ def _rule_for(module: mxnn.Module) -> str:
     return CONV1D_LAYOUT if isinstance(module, mxnn.Conv1d) else IDENTITY_LAYOUT
 
 
-#: Buffers canonical registers with ``persistent=False``, which are therefore
-#: **absent from every published checkpoint**: its derived causal ``mask``
-#: (OpenAI release v20250625 ``model.py:225``) and ``alignment_heads``
-#: (``:276``, ``:285``).
-#:
-#: The actual table is :data:`NON_PERSISTENT_BUFFERS`, defined **after** the
-#: class definitions it names and reached through
-#: :func:`_is_non_persistent_buffer`, which resolves the global at call time.
-#: It pairs each buffer with the module type that owns it, rather than matching
-#: a leaf name, so an unrelated parameter called ``_mask`` on some other module
-#: is still collected.
-#:
-#: Either way this is an explicit list of exactly those buffers.  A blanket
-#: "skip every private array" rule would swallow real parameters -- both
-#: ``positional_embedding`` buffers are *persistent* (``:181``) and must stay.
+# see docs/port-notes/comments.md :: whisper.py:119
 
 
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
@@ -147,8 +129,6 @@ def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
         if isinstance(value, mxnn.Module):
             _flatten_into(value, name, tensors, rules)
         elif isinstance(value, mx.array):
-            # Owner + native key, so the full model, a standalone submodule and
-            # any caller prefix are all covered by one entry.
             if _is_non_persistent_buffer(module, key):
                 continue
             tensors[name] = value
@@ -272,7 +252,6 @@ def _assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
     setattr(node, parts[-1], array)
 
 
-# building blocks
 class Linear(mxnn.Linear):
     """``torch.nn.Linear`` alias.
 
@@ -305,10 +284,7 @@ def sinusoids(length: int, channels: int, max_timescale: int = 10000) -> mx.arra
     return mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], axis=1)
 
 
-#: ``torch.nn.GELU()``'s default is the *exact* erf formulation, and MLX's
-#: ``nn.GELU`` defaults to ``approx="none"`` (exact), so the two agree.  If MLX's
-#: default ever changed, this constant would silently switch to the tanh
-#: approximation -- hence the explicit note rather than an inline call.
+# see docs/port-notes/comments.md :: whisper.py:287
 _GELU = mxnn.GELU()
 
 
@@ -354,9 +330,6 @@ class MultiHeadAttention(mxnn.Module):
         qk = mx.matmul(q, k)  # (B, H, T, T)
         if mask is not None:
             key_len = k.shape[-1]
-            # The reference slices the same ``n_ctx`` from both axes; that only
-            # broadcasts for a full-length pass (n_ctx == key_len) or for the
-            # single-token incremental steps this decoder performs.
             if n_ctx not in (key_len, 1):
                 raise ValueError(
                     f"causal mask slice [:{n_ctx}, :{n_ctx}] does not broadcast "
@@ -364,8 +337,6 @@ class MultiHeadAttention(mxnn.Module):
                     "full-length or one-token-at-a-time decoding"
                 )
             qk = qk + mask[:n_ctx, :n_ctx]
-        # The reference computes the scores in fp32, takes the softmax there and
-        # casts the weights back to the query dtype.
         qk = qk.astype(mx.float32)
         attn = mx.softmax(qk, axis=-1).astype(q.dtype)
         out = mx.matmul(attn, v)
@@ -386,8 +357,6 @@ class MultiHeadAttention(mxnn.Module):
         key_name = f"{self._prefix}.key"
         value_name = f"{self._prefix}.value"
 
-        # ``xa is None`` forces the recompute branch for self-attention, which is
-        # what makes the cache append and cover the current step.
         if not use_cache or xa is None or key_name not in kv_cache:
             k = self.key(src)
             v = self.value(src)
@@ -406,14 +375,7 @@ class MultiHeadAttention(mxnn.Module):
             k = kv_cache[key_name]
             v = kv_cache[value_name]
 
-        # Fused path: with no mask (cross-attention or any unmasked pass) the
-        # whole scale+QK^T+softmax+@V chain is one SDPA kernel -- at T=1500 the
-        # manual path materializes a (B,H,T,T) score matrix whose traffic
-        # dominates the encoder. Whisper's dual ``d^-0.25`` scaling is exactly
-        # SDPA's ``scale=d_k**-0.5``, and SDPA's internal softmax runs in
-        # float32 like the reference. The causal-masked self-attention path
-        # keeps the manual implementation (mask semantics + qk return value
-        # are covered by tests against the reference).
+        # see docs/port-notes/comments.md :: whisper.py:378
         if mask is None:
             attn = mx.fast.scaled_dot_product_attention(
                 self._split(q),
@@ -477,7 +439,6 @@ class ResidualAttentionBlock(mxnn.Module):
         return x
 
 
-# dimensions / configuration
 @dataclass
 class ModelDimensions:
     # see docs/port-notes/functions.md :: ModelDimensions
@@ -562,7 +523,6 @@ def whisper_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs: An
     return WhisperConfig(dims=ModelDimensions.from_dict(dims), **kwargs_)
 
 
-# encoder / decoder / model
 class AudioEncoder(mxnn.Module):
     # see docs/port-notes/functions.md :: AudioEncoder
 
@@ -594,11 +554,7 @@ class AudioEncoder(mxnn.Module):
         x = _GELU(self.conv1(x))
         x = _GELU(self.conv2(x))
 
-        # The canonical encoder *asserts* an exact length rather than adapting to
-        # whatever it produced: ``positional_embedding`` has ``n_ctx`` rows.  The
-        # previous version sliced the table down to whatever length it got, which
-        # silently returned a short encoder output and is precisely what hid the
-        # ``conv1`` stride bug from the test suite.
+        # see docs/port-notes/comments.md :: whisper.py:557
         if x.shape[1] != self.positional_embedding.shape[0]:
             raise ValueError(
                 "incorrect audio shape: the encoder produced "
@@ -607,18 +563,7 @@ class AudioEncoder(mxnn.Module):
                 "(pass exactly 2 * n_audio_ctx mel frames)"
             )
         x = (x + self.positional_embedding).astype(x.dtype)
-        # Evaluate block by block instead of letting the whole 32-block graph
-        # accumulate.  MLX frees a block's intermediates only once its output is
-        # materialised; left lazy, every block's activation stays live until the
-        # single `mx.eval` at the call site.  On the 30 s window (1500 frames)
-        # that transient is the largest single allocation in the encoder path.
-        # Measured on M4 (whisper-large-v3, 30 s, peak `Physical footprint` from
-        # vmmap, 6 alternating rounds x 3 calls): 3600 MB -> 3000 MB, i.e.
-        # -600 MB (-16.7%), reproducible to +-100 MB.  Speed is unchanged:
-        # paired in-process A/B over 30 pairs gives -0.04%, CI95 [-0.36, +0.14]%
-        # (median 973.6 vs 976.6 ms).  The arithmetic is untouched -- the same
-        # `block(x)` calls in the same order, only the evaluation boundary moves
-        # -- so results are bit-identical.
+        # see docs/port-notes/comments.md :: whisper.py:566
         for block in self.blocks:
             x = block(x)
             mx.eval(x)
@@ -646,7 +591,6 @@ class TextDecoder(mxnn.Module):
         )
         self.ln = LayerNorm(n_state)
         mask = mx.arange(0, n_ctx)
-        # torch: empty(n_ctx, n_ctx).fill_(-inf).triu_(1)
         self._mask = mx.where(mask[None, :] > mask[:, None], -float("inf"), mx.array(0.0))
         for block in self.blocks:
             block.attn._cache_limit = n_ctx
@@ -685,18 +629,11 @@ class TextDecoder(mxnn.Module):
         emb = self.token_embedding(x)
         pos = self.positional_embedding[offset : offset + x.shape[1]]
         emb = emb + pos.reshape(1, pos.shape[0], pos.shape[1])
-        # Follow the **decoder's own weight dtype**, not ``xa``/the mel dtype.
-        # The front-end mel is float32, so casting to ``xa.dtype`` used to lock
-        # the entire decoder into float32 activations against fp16 weights: a
-        # mixed-dtype promotion at every Linear, every step (measured on M4:
-        # 9.12 ms/step vs 2.02 ms/step for a 24-step decode).  A float32
-        # checkpoint is unaffected -- the cast is a no-op there.
+        # see docs/port-notes/comments.md :: whisper.py:632
         emb = emb.astype(self._weight_dtype())
         for block in self.blocks:
             emb = block(emb, xa=xa, mask=mask, kv_cache=kv_cache)
         emb = self.ln(emb)
-        # Tied projection (reference: x @ token_embedding.weight.T), with the weight
-        # cast to the activation dtype first.  The logits are always float32.
         weight = mx.swapaxes(self.token_embedding.weight.astype(emb.dtype), -1, -2)
         return mx.matmul(emb, weight).astype(mx.float32)
 
@@ -763,7 +700,6 @@ class Whisper(mxnn.Module):
         return load_strict(self, tensors, **kwargs)
 
 
-# front-end helpers (raw mel only -- no tokenizer, no downloads)
 def reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
     # see docs/port-notes/functions.md :: reflect_pad_1d
     if pad <= 0:
@@ -859,7 +795,6 @@ def mel_filterbank(
     lower = -ramps[:-2] / fdiff[:-1, None]
     upper = ramps[2:] / fdiff[1:, None]
     weights = mx.maximum(mx.array(0.0), mx.minimum(lower, upper))
-    # Slaney normalisation
     enorm = 2.0 / (mel_f[2 : n_mels + 2] - mel_f[:n_mels])
     return weights * enorm[:, None]
 
@@ -896,23 +831,17 @@ def log_mel_spectrogram(
     frames = mx.take(mx.reshape(audio, (-1,)), flat)
     frames = mx.reshape(frames, (audio.shape[0], n_frames, n_fft)) * window
     spectrum = mx.fft.rfft(frames, axis=-1)
-    # torch slices ``[..., :-1]`` along the *frame* axis.
     spectrum = spectrum[:, : n_frames - 1, :]
     magnitudes = mx.abs(spectrum) ** 2
     if filters is None:
         filters = mel_filterbank(n_mels=n_mels, n_fft=n_fft)
-    # MLX's matmul does not accept a 2-D right-hand side against a 3-D left-hand
-    # side (it treats the pair as batched and then requires the feature axis to
-    # match), so the transposed filterbank gets an explicit leading batch axis.
     filters_t = mx.expand_dims(mx.swapaxes(filters.astype(magnitudes.dtype), -1, -2), 0)
-    # (B, frames-1, freq) @ (1, freq, n_mels) -> (B, frames-1, n_mels)
     log_spec = mx.matmul(magnitudes, filters_t)
     log_spec = mx.log10(mx.maximum(log_spec, 1e-10))
     log_spec = mx.maximum(log_spec, mx.max(log_spec) - 8.0)
     return (log_spec + 4.0) / 4.0
 
 
-# raw decoding helpers (token ids only -- no text, no tokenizer)
 @dataclass
 class GreedyDecodeConfig:
     # see docs/port-notes/functions.md :: GreedyDecodeConfig
@@ -1005,11 +934,7 @@ def greedy_decode(
             break
         tokens = mx.expand_dims(next_tokens, -1)
 
-    # Only the SELF-attention cache grows, one step at a time.  Cross-attention is
-    # keyed and stored once at ``n_audio_ctx`` and never appended, so including
-    # it would compare an audio length against a text bound -- and since
-    # ``n_audio_ctx`` is larger than ``n_text_ctx`` for every published Whisper
-    # (1500 vs 448), that trips the check on the very first decode.
+    # see docs/port-notes/comments.md :: whisper.py:937
     self_cache_len = max(
         (v.shape[1] for k, v in kv_cache.items() if "cross_attn" not in k),
         default=0,

@@ -166,7 +166,6 @@ def _infer(args):
     ) * model.vad_opts.frame_shift_length + model.vad_opts.frame_sample_length
     if samples.size < needed:
         raise ValueError("VAD feature frames exceed the supplied waveform")
-    # Snipped fbank frames do not consume a trailing incomplete frame.
     segments = model(
         features[None],
         mx.array(samples[:needed])[None],

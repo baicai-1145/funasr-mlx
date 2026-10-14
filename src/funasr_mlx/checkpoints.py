@@ -20,16 +20,12 @@ SUPPORTED_MODELS = (
     "campplus",
     "emotion2vec",
     "whisper",
-    # LLM-based ASR families (safetensors sources; see SOURCE_RULES).
     "fun-asr-nano",
     "qwen3-asr",
     "glm-asr-nano",
     "moss-transcribe-diarize",
 )
 
-#: Output precisions ``convert_checkpoint`` may emit. ``bfloat16`` is only
-#: reachable through the streaming writer (NumPy has no bfloat16), so it is
-#: admitted for families whose canonical dtype is bf16.
 SUPPORTED_DTYPES = ("float16", "float32", "bfloat16")
 
 
@@ -56,15 +52,7 @@ class SourceRule:
         return short
 
 
-#: The five LLM-ASR families. Fun-ASR-Nano's ``llm.*`` subtree is an
-#: unmodified ``Qwen3ForCausalLM`` state dict (PROGRESS.md), so it is bound
-#: under the model's ``llm.`` attribute with the prefix stripped. That family's
-#: source is a torch ZIP and keeps the identity rule; the rest are safetensors.
-#:
-#: ``llm.lm_head.weight`` is absent from the native fun-asr-nano checkpoint
-#: because the Qwen3 backbone is built with ``tie_word_embeddings=True`` and the
-#: port reaches the head through ``embed_tokens.as_linear``; the source ships a
-#: separate (numerically identical) copy that the strict loader would reject.
+# see docs/port-notes/comments.md :: checkpoints.py:55
 SOURCE_RULES = {
     "fun-asr-nano": SourceRule(
         prefixes=(
@@ -75,27 +63,18 @@ SOURCE_RULES = {
         drop=("llm.lm_head.weight",),
     ),
     "qwen3-asr": SourceRule(
-        # The audio tower is a top-level attribute of the native model, but the
-        # decoder stays under ``thinker.`` (``Qwen3ASR.thinker`` wraps
-        # ``Qwen3ForCausalLM``, whose transformer is its own ``model``).
         prefixes=(("thinker.audio_tower.", "audio_tower."), ("thinker.", "thinker.")),
         renames=tuple(
             (f"audio_tower.conv2d{index}.{suffix}", f"audio_tower.conv2d{index}.conv.{suffix}")
             for index in (1, 2, 3)
             for suffix in ("weight", "bias")
         ),
-        # ``lm_head`` is dropped because the decoder is tied
-        # (``tie_word_embeddings=True``) and the port reaches the head through
-        # ``embed_tokens.as_linear``. The audio tower's sinusoidal table is not
-        # in the checkpoint at all: the port rebuilds it from the config, so it
-        # is declared in :data:`DERIVED_NATIVE_PARAMETERS` instead.
+        # see docs/port-notes/comments.md :: checkpoints.py:72
         drop=("thinker.lm_head.weight",),
     ),
     "glm-asr-nano": SourceRule(
         prefixes=(
             ("audio_tower.", "audio_tower."),
-            # The port folds the projector into the encoder, so its two linears
-            # sit under ``audio_tower.`` rather than beside it.
             ("multi_modal_projector.linear_1", "audio_tower.linear_1"),
             ("multi_modal_projector.linear_2", "audio_tower.linear_2"),
             ("language_model.", "language_model."),
@@ -103,32 +82,17 @@ SOURCE_RULES = {
     ),
     "moss-transcribe-diarize": SourceRule(
         prefixes=(("model.", ""),),
-        # ``Qwen3ForCausalLM`` nests the transformer under ``model``, so the
-        # source's ``language_model.<...>`` becomes ``language_model.model.<...>``.
         renames=(("language_model.", "language_model.model."),),
     ),
 }
 
-#: Sentinel ``source_rule`` for a source that is already in the native layout
-#: (a converted bf16 checkpoint being re-emitted as W4A16, for instance). Keys
-#: pass through unchanged; the strict loader still checks every name.
 IDENTITY_SOURCE_RULE = "native"
 
-#: Families whose source tensors are bfloat16 and whose canonical native
-#: dtype is therefore bfloat16 (no lossy cast on conversion).
 BFLOAT16_FAMILIES = frozenset(SOURCE_RULES)
 
-#: Families whose source is a torch ZIP rather than safetensors.
 TORCH_SOURCE_FAMILIES = frozenset({"fun-asr-nano"})
 
-#: Native parameters a port *derives* at construction rather than loading from a
-#: checkpoint, so the strict key diff must not expect them on disk. Listed here
-#: as data beside the layout rules and consumed by ``pipeline.load_model``,
-#: which validates that each declared name really is a model parameter (a stale
-#: declaration is an error, not a silent skip).
-#:
-#: ``qwen3-asr`` builds its sinusoidal position table from the config in
-#: ``_Sinusoids``; the source checkpoint stores no equivalent tensor.
+# see docs/port-notes/comments.md :: checkpoints.py:95
 DERIVED_NATIVE_PARAMETERS = {
     "qwen3-asr": ("audio_tower.positional_embedding.table",),
 }
@@ -147,9 +111,6 @@ DTYPE_BYTES = {
     "U64": 8,
 }
 
-#: Suffix added to a quantized ``<module>.weight`` for MLX's group-quantization
-#: side tensors. ``nn.QuantizedLinear`` owns exactly these three parameters, so
-#: the emitted names are what the strict loader expects to find.
 QUANTIZED_SUFFIXES = (".weight", ".scales", ".biases")
 
 
@@ -194,8 +155,6 @@ def quantize_bf16_weight(
     del weight
     if biases is None:
         raise ValueError(f"Mode {mode} produced no group biases for {name}")
-    # NumPy cannot name bfloat16, so the 16-bit side tensors go back out as raw
-    # uint16 carriers under the same BF16 code the full-precision path uses.
     carry = (
         (lambda tensor: np.array(tensor.view(mx.uint16)))
         if code == "BF16"
@@ -217,15 +176,8 @@ class GptqWeight:
     hessians: Mapping[str, np.ndarray]
     configs: Mapping[str, Any] = field(default_factory=dict)
     default_config: Any = None
-    #: ``gptq`` runs Hessian-based error compensation; ``rtn`` runs plain
-    #: round-to-nearest **through this same code path**, using the identical
-    #: packing, side-tensor layout and dtype handling.  That is what makes an
-    #: rtn-vs-gptq comparison honest: both arms differ only in how the stored
-    #: values were computed, so any measured difference is the algorithm's.
-    #: ``rtn`` still requires a Hessian entry (the matrix is what marks a tensor
-    #: as GPTQ-path); pass an identity if none was collected.
+    # see docs/port-notes/comments.md :: checkpoints.py:179
     method: str = "gptq"
-    #: Per-tensor reported outcome, filled in as tensors are quantized.
     outcomes: dict[str, dict] = field(default_factory=dict)
 
     def has(self, name: str) -> bool:
@@ -260,20 +212,13 @@ class GptqWeight:
                 f"group_size={config.group_size}, but the converter asked for "
                 f"bits={bits} group_size={group_size}"
             )
-        # Convert to float32 in row blocks.  ``weight.astype(mx.float32)`` on a
-        # 151936x1024 head would materialise a 622 MB float32 array on the device
-        # and ``np.array`` a second 622 MB one on the host, on top of the
-        # bfloat16 original -- enough to push the conversion past the guard's
-        # budget on its own.  Blocked conversion keeps a few tens of MB live at a
-        # time, and the host array it fills is the one GPTQ consumes.
+        # see docs/port-notes/comments.md :: checkpoints.py:215
         rows, width = int(weight.shape[0]), int(weight.shape[1])
         source = np.empty((rows, width), dtype=np.float32)
         step = max(int(config.row_chunk) or rows, 1)
         for start in range(0, rows, step):
             stop = min(start + step, rows)
             source[start:stop] = np.array(weight[start:stop].astype(mx.float32))
-        # ``np.asarray`` is a no-op when the Hessian is already float32, which is
-        # how the calibrator writes it; a copy here would double it for nothing.
         hessian32 = np.asarray(hessian, dtype=np.float32)
         if self.method == "rtn":
             outcome = rtn_quantize(source, config, hessian32)
@@ -281,11 +226,7 @@ class GptqWeight:
             outcome = gptq_quantize(source, hessian32, config)
         del source, hessian32
         self.outcomes[name] = outcome.to_json()
-        # Side tensors must land in the checkpoint dtype (bfloat16/float16), the
-        # same as mx.quantize would produce, or the runtime would promote.
         dtype = weight.dtype
-        # ``mx.array`` copies straight into the device buffer, so the host arrays
-        # are dropped as soon as the tensors are evaluated.
         packed = mx.array(outcome.packed)
         scales = mx.array(outcome.scales).astype(dtype)
         biases = mx.array(outcome.biases).astype(dtype)
@@ -419,17 +360,14 @@ def convert_tensor(name: str, tensor: np.ndarray, model: str) -> np.ndarray:
             raise ValueError(f"Expected rank-3 Whisper convolution for {name}")
         return tensor.transpose(0, 2, 1)
     elif model == "fun-asr-nano":
-        # SANM fsmn_block: torch (D, 1, K) -> MLX Conv1d (D, K, 1).
         if name.endswith("fsmn_block.weight"):
             if tensor.ndim != 3:
                 raise ValueError(f"Expected rank-3 FSMN block for {name}")
             return tensor.transpose(0, 2, 1)
     elif model == "qwen3-asr":
-        # Qwen3-ASR audio tower: torch Conv2d (O, I, KH, KW) -> MLX (O, KH, KW, I).
         if ".conv." in name and name.endswith("weight") and tensor.ndim == 4:
             return tensor.transpose(0, 2, 3, 1)
     elif model in {"glm-asr-nano", "moss-transcribe-diarize"}:
-        # torch Conv1d (O, I, K) -> MLX Conv1d (O, K, I).
         if name.endswith(("conv1.weight", "conv2.weight")):
             if tensor.ndim != 3:
                 raise ValueError(f"Expected rank-3 convolution for {name}")
@@ -461,7 +399,6 @@ def convert_checkpoint(
     """
     from .memory import MemoryPolicy
 
-    # guard optional (host choice); policies only bound when present
     if model not in SUPPORTED_MODELS or dtype not in SUPPORTED_DTYPES:
         raise ValueError("Unsupported model or output precision")
     if dtype == "bfloat16" and model not in BFLOAT16_FAMILIES:
@@ -475,10 +412,7 @@ def convert_checkpoint(
         raise ValueError("Unsafe shard/tensor buffer size")
     source, destination = Path(source), Path(destination)
     is_safetensors = source.is_dir() or source.suffix == ".safetensors"
-    # A safetensors source of a non-torch family must declare its layout rule
-    # (otherwise nothing renames its keys onto the native names). A torch
-    # source's layout lives in convert_tensor, but a rule may still be passed
-    # for its `drop` list (fun-asr-nano's tied lm_head).
+    # see docs/port-notes/comments.md :: checkpoints.py:415
     if is_safetensors and model not in TORCH_SOURCE_FAMILIES and source_rule is None:
         raise ValueError("Safetensors sources must declare their layout: pass source_rule")
     source_is_file = source.is_file()
@@ -534,17 +468,12 @@ def convert_checkpoint(
     skipped: list[str] = []
     dropped: list[str] = []
 
-    # A bfloat16 source kept at bfloat16 stays a raw uint16 carrier (NumPy has
-    # no bfloat16) and is written under the BF16 code, exactly as the
-    # safetensors path does. Anything else is rounded on the host, in place.
     output_code = {"float16": "F16", "float32": "F32", "bfloat16": "BF16"}[dtype]
     write_shard = None
     if output_code == "BF16":
         from .checkpoint_stream import write_shard
 
     def metadata() -> dict:
-        # Exactly the two keys every already-published native shard carries;
-        # the output dtype belongs in the index metadata, not here.
         return {"format": "funasr-mlx", "model": model}
 
     def flush():
@@ -601,8 +530,6 @@ def convert_checkpoint(
             array = array.astype(np.dtype(dtype), copy=False)
         if name.endswith(("running_mean", "running_var")) and not is_bf16:
             array = array.astype(np.float32, copy=False)
-        # ascontiguousarray promotes a 0-d array to shape (1,), which would
-        # corrupt the rank-0 BatchNorm training counters; keep those as-is.
         if array.ndim:
             array = np.ascontiguousarray(array)
         if large:
@@ -651,10 +578,7 @@ def convert_checkpoint(
     return inspect_checkpoint(destination)
 
 
-#: safetensors type code -> NumPy dtype used to carry the payload in memory.
-#: ``BF16`` maps to ``uint16``: NumPy has no bfloat16, so a bfloat16 tensor is
-#: moved around as its raw 16-bit words and only ever written under the
-#: ``BF16`` code. Every other code maps to its exact NumPy equivalent.
+# see docs/port-notes/comments.md :: checkpoints.py:581
 _CARRIER_DTYPES = {
     "BF16": np.uint16,
     "F16": np.float16,
@@ -733,8 +657,6 @@ def _convert_safetensors_source(
 
     from .models.llm.quant import QuantizationSpec
 
-    # Bound here rather than at module scope: ``checkpoints`` is imported by the
-    # package root, and the runtime requires MLX imports to stay lazy.
     import mlx.core as mx
 
     spec = QuantizationSpec.from_dict(quantization) if quantization is not None else None
@@ -758,16 +680,11 @@ def _convert_safetensors_source(
             declared[name] = (entry["dtype"], tuple(entry["shape"]))
     if not declared:
         raise ValueError("Checkpoint contains no tensors")
-    # Resolve every source key to its native name up front, so a key outside
-    # the declared layout fails before anything is written to disk.
     native_names = {name: (rule.apply(name) if rule is not None else name) for name in declared}
     dropped = sorted(name for name, target in native_names.items() if target is None)
     if not any(target is not None for target in native_names.values()):
         raise ValueError("The source layout maps no tensor onto a native parameter")
 
-    # One output code per shard, so a bf16 checkpoint stays bf16 on disk. A
-    # quantized run mixes widths -- 4-byte packed codes beside 2-byte group
-    # scales -- so those shards carry a per-tensor code map instead.
     output_code = {"float16": "F16", "float32": "F32", "bfloat16": "BF16"}[dtype]
     write_shard = None
     if output_code == "BF16" or spec is not None:
@@ -782,8 +699,6 @@ def _convert_safetensors_source(
     skipped_quantization: list[str] = []
 
     def metadata() -> dict:
-        # Two keys only, matching every already-published native shard; the
-        # output dtype is recorded in the index metadata instead.
         return {"format": "funasr-mlx", "model": model}
 
     def next_shard() -> Path:
@@ -834,30 +749,11 @@ def _convert_safetensors_source(
                 array = _carry(handle.get_tensor(name), code)
                 if source_rule != IDENTITY_SOURCE_RULE:
                     array = convert_tensor(native, array, model)
-                # A bfloat16 source kept at bfloat16 stays a raw uint16 carrier
-                # and is written under the BF16 code; anything else is rounded
-                # to the requested precision here, on the host.
                 keep_bf16 = code == "BF16" and dtype == "bfloat16"
                 if spec is not None and spec.quantizes_tensor(native, array.shape):
-                    # A quantized Linear must land in ONE shard together with its
-                    # scales/biases: `pipeline.load_model` binds the group as a
-                    # unit, and splitting it across shards is not supported. So
-                    # flush whatever is buffered, then check the group itself
-                    # against the loader's per-shard bound -- `max(256MB,
-                    # largest_tensor) + 32MB` -- and fail loudly rather than
-                    # emit a checkpoint that cannot be loaded.  The bound is
-                    # sized by the LARGEST group the conversion itself packs
-                    # (a 1.7B tied embedding at w4/g64 packs to ~175MB), so a
-                    # legal conversion can always be loaded on the machine
-                    # class the memory policy targets: one mmap's wired swing
-                    # is bounded by one shard, and the measured conversion
-                    # peak (~4.4GB on 16GB hosts) leaves 2x headroom to the
-                    # per-process wired limit.
+                    # see docs/port-notes/comments.md :: checkpoints.py:754
                     flush_quantized()
-                    # Per-target bit width: a w8 head beside a w4 stack (see
-                    # QuantizationSpec.bits_for).  This must match what
-                    # apply_quantization builds at load time or the strict
-                    # loader rejects the shapes.
+                    # see docs/port-notes/comments.md :: checkpoints.py:756
                     tensor_bits = spec.bits_for_weight(native)
                     tensor_group = spec.group_for(native[: -len(".weight")])
                     packed = quantize_bf16_weight(
@@ -870,11 +766,7 @@ def _convert_safetensors_source(
                         gptq=gptq if (gptq is not None and gptq.has(native)) else None,
                     )
                     del array
-                    # A GPTQ pass on a large head allocates several hundred MB of
-                    # host scratch.  MLX's allocator is capped by the policy but
-                    # keeps freed blocks in its cache, so hand them back before
-                    # the next tensor rather than letting the cache grow to its
-                    # limit on top of the Python-side peak.
+                    # see docs/port-notes/comments.md :: checkpoints.py:769
                     mx.clear_cache()
                     side_code = "BF16" if keep_bf16 else "F16"
                     module = native[: -len(".weight")]
@@ -905,11 +797,7 @@ def _convert_safetensors_source(
                     and not spec.quantizes_tensor(native, array.shape)
                     and spec.is_linear_weight(native, array.shape)
                 ):
-                    # A Linear the group size cannot divide (e.g. fun-asr-nano's
-                    # (1536, 560) q_k_v). The model predicate skips it too, so
-                    # the loader stays consistent -- but it is recorded, because
-                    # an unnoticed skip would silently leave the model partly
-                    # full precision.
+                    # see docs/port-notes/comments.md :: checkpoints.py:800
                     skipped_quantization.append(native)
                 if code == "BF16" and not keep_bf16:
                     array = _bf16_carrier_to(array, dtype)

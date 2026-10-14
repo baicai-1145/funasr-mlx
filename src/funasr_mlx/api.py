@@ -68,9 +68,6 @@ def transcribe(
     family: str | None = None,
     max_tokens: int = 96,
 ) -> dict[str, Any]:
-    # Library callers load in-process by default (the guard is a host choice,
-    # not a project requirement); the CLI subprocess stays as the fallback so
-    # the process boundary still applies where a caller wants it.
     try:
         worker = TranscribeWorker(model, family=family, max_tokens=max_tokens)
         return worker.transcribe(audio)

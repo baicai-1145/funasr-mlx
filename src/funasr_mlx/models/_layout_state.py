@@ -22,10 +22,8 @@ def convert_tensor(name: str, array: mx.array, rule: str, names: Sequence[str]) 
     # see docs/port-notes/functions.md :: convert_tensor
     conv1d, conv2d = names[0], names[1]
     if rule == conv1d:
-        # torch (out, in/groups, k) -> mlx (out, k, in/groups)
         return mx.transpose(array, (0, 2, 1))
     if rule == conv2d:
-        # torch (out, in, kh, kw) -> mlx (out, kh, kw, in)
         return mx.transpose(array, (0, 2, 3, 1))
     return array
 

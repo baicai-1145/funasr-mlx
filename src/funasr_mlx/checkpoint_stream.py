@@ -22,12 +22,7 @@ _CODES = {
     "bool": "BOOL",
 }
 
-#: safetensors type codes the bounded writer can emit directly, with their
-#: bytes per element. Includes ``BF16``, which NumPy cannot name as a dtype:
-#: a bfloat16 payload is carried as raw ``uint16`` words and written under the
-#: ``BF16`` code, so the bits reach disk unchanged. ``U32`` is the packed-code
-#: width of group quantization, which is why a W4A16 shard mixes it with the
-#: 2-byte ``BF16`` scales and needs a per-tensor code map.
+# see docs/port-notes/comments.md :: checkpoint_stream.py:25
 _CODE_BYTES = {
     "BF16": 2,
     "F16": 2,

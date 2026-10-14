@@ -91,8 +91,6 @@ def _encoder_layer_forward_chunk(layer, x, cache, chunk_size, look_back):
 def _predictor_forward_chunk(pred: CifPredictorV2, hidden: mx.array, cache: dict, is_final: bool):
     # see docs/port-notes/functions.md :: _predictor_forward_chunk
     batch_size, _, hidden_size = hidden.shape
-    # MLX conv1d is NLC: hidden (B, T, D) feeds directly; the reference's two
-    # transposes around the pad/conv collapse into padding on axis=1.
     queries = constant_pad_1d(hidden, pred._l_order, pred._r_order, axis=1)
     output = mx.maximum(pred.cif_conv1d(queries), 0.0)
     output = pred.cif_output(output)
@@ -219,7 +217,6 @@ def _dec_layer_forward_chunk(
     return x, memory, fsmn_cache, opt_cache
 
 
-# model
 @dataclass
 class ParaformerStreamingConfig(ParaformerConfig):
 
@@ -280,8 +277,6 @@ class ParaformerStreaming(mxnn.Module):
         if cache["encoder"]["tail_chunk"]:
             xs_pad = cache["encoder"]["feats"]
         else:
-            # ``_add_overlap_chunk`` (scama/encoder.py:480-494): stitch the
-            # retained look-back window with the new chunk, keep a tail window.
             enc_cache = cache["encoder"]
             overlap = mx.concatenate([enc_cache["feats"], xs_pad], axis=1)
             keep = enc_cache["chunk_size"][0] + enc_cache["chunk_size"][2]

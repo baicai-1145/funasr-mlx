@@ -34,9 +34,6 @@ class MemoryPolicy:
     min_available: int = 3 * GB
     headroom: int = 500 * MB
     poll_seconds: float = 0.05
-    #: macOS frees purgeable pages on demand, so "available" snapshots deny
-    #: jobs the compressor would satisfy. The RSS ceilings stay binding;
-    #: enable only for jobs that cannot tolerate paging at all.
     enforce_min_available: bool = False
 
     def __post_init__(self):
@@ -134,7 +131,6 @@ def _project_roots(root: Path) -> tuple[Path, ...]:
                 checkout = Path(line[len("worktree ") :]).resolve()
                 roots.append(checkout)
                 if ".pi" in checkout.parts:
-                    # Herdr stores worktrees under the lead repository.
                     index = checkout.parts.index(".pi")
                     roots.append(Path(*checkout.parts[:index]))
     return tuple(dict.fromkeys(roots))
@@ -162,10 +158,7 @@ def preflight(root: Path, policy: MemoryPolicy) -> dict[str, int]:
     current = project_rss(root)
     if current + policy.process_limit + policy.headroom > policy.project_limit:
         raise MemoryBudgetExceeded("Project RSS plus job reservation exceeds budget")
-    # The macOS purgeable/paging path frees memory on demand; an "available"
-    # snapshot would wrongly deny jobs the compressor can satisfy. The
-    # external RSS watchdog (project ceiling + per-process kill) stays the
-    # binding constraint, so min_available is advisory only by default.
+    # see docs/port-notes/comments.md :: memory.py:161
     if policy.enforce_min_available and available < policy.process_limit + policy.min_available:
         raise MemoryBudgetExceeded(
             f"Only {available / GB:.2f} GB available; need "
@@ -177,7 +170,6 @@ def preflight(root: Path, policy: MemoryPolicy) -> dict[str, int]:
 def configure_mlx(policy: MemoryPolicy) -> dict[str, int]:
     import mlx.core as mx
 
-    # Configure before constructing any model or evaluating any array.
     mx.set_memory_limit(policy.mlx_limit)
     mx.set_cache_limit(policy.cache_limit)
     if hasattr(mx, "set_wired_limit"):

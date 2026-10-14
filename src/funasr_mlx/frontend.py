@@ -61,10 +61,7 @@ def apply_lfr(features, m: int = 7, n: int = 6):
     count, dimension = features.shape
     if count == 0:
         return mx.zeros((0, dimension * m), dtype=features.dtype)
-    # Reference (wav_frontend.apply_lfr): prepend (m-1)//2 COPIES of the first
-    # row, then take strided windows of m rows. Clipping instead would repeat
-    # the first frame one extra time at the left edge (4 copies for m=7), which
-    # shifts every fused row's content by one frame.
+    # see docs/port-notes/comments.md :: frontend.py:64
     left_padding = mx.repeat(features[0:1], (m - 1) // 2, axis=0)
     padded = mx.concatenate([left_padding, features], axis=0)
     rows = (count + n - 1) // n

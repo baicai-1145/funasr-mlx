@@ -49,18 +49,14 @@ __all__ = [
 ]
 
 
-# FunASR maps the full-width marks to ASCII when the neighbouring token is ASCII.
 ASCII_PUNC_MAP: Mapping[str, str] = {"，": ",", "。": ".", "？": "?", "、": ","}
 
-# ``forward_attention`` fills masked scores with this value before the softmax.
 MASK_SCORE_VALUE = float("-inf")
 
-# Depthwise SANM convolution weights are the only tensors needing a layout change.
 CONV1D_WEIGHT_SUFFIX = ".self_attn.fsmn_block.weight"
 
 
 def _depthwise_conv1d(name: str, value):
-    # (C, 1, K) -> (C, K, 1); SANM depthwise memory kernels only
     if value.ndim != 3:
         raise ValueError(
             f"{name}: expected a 3-D depthwise conv weight (C, 1, K), got shape {value.shape}"
@@ -78,19 +74,13 @@ def convert_checkpoint_tensors(state):
 def load_state_dict_strict(model, state, *, ignore_prefixes=()):
     return _strict_load(model, state, ignore_prefixes=ignore_prefixes, rules=CONV1D_RULES)
 
-# FunASR's ``LayerNorm`` (funasr/models/transformer/layer_norm.py) overrides the
-# PyTorch default of 1e-5.  Getting this wrong silently changes every output.
 FUNASR_LAYER_NORM_EPS = 1e-12
 
-# FunASR's jieba word-level expansion only considers CJK Unified Ideographs
-# (``"\u4e00" <= token[0] <= "\u9fa5"`` in the reference).
 CJK_RANGE = ("\u4e00", "\u9fa5")
 
 
-# validation helpers
 
 
-# config
 @dataclass(frozen=True)
 class SanmEncoderConfig:
     # see docs/port-notes/functions.md :: SanmEncoderConfig
@@ -169,10 +159,7 @@ class SanmEncoderConfig:
         # see docs/port-notes/functions.md :: from_dict
         if not isinstance(config, Mapping):
             raise TypeError(f"encoder_conf must be a mapping, got {type(config).__name__}")
-        # The official config passes pos_enc_class (a class object the SANM
-        # encoder only reads for other input_layers; input_layer="pe" never
-        # touches it). It selects no weights here, so accept-and-ignore keeps
-        # the config loadable while adding no silent behaviour.
+        # see docs/port-notes/comments.md :: ct_punc.py:162
         config = {k: v for k, v in config.items() if k != "pos_enc_class"}
         return cls(**_known_fields(cls, config, "encoder_conf"))
 
@@ -191,16 +178,10 @@ class CtPuncConfig:
     sentence_end_id: int = 3
     punc_list: tuple[str, ...] = ("_", "，", "。", "？", "、")
     punc_weight: tuple[float, ...] = ()
-    #: Marks that terminate a sentence for the mini-sentence cache search.
     sentence_end_puncs: tuple[str, ...] = ("。", "？")
-    #: Mark considered as the fallback cut point when a chunk grows past the limit.
     comma_punc: str = "，"
-    #: ``CTTransformer.inference``'s ``split_size`` kwarg.
     split_size: int = 20
-    #: ``CTTransformer.inference``'s ``cache_pop_trigger_limit``.
     cache_pop_trigger_limit: int = 200
-    #: Hard bound on tokens fed to the encoder in one forward (attention is O(T^2);
-    #: the mini-sentence cache keeps T far below this).
     max_input_tokens: int = 4096
     encoder: SanmEncoderConfig = SanmEncoderConfig()
 
@@ -280,7 +261,6 @@ class CtPuncConfig:
         return cls(encoder=SanmEncoderConfig.from_dict(encoder_conf), **payload)
 
 
-# vocabulary
 class CharVocab:
     # see docs/port-notes/functions.md :: CharVocab
 
@@ -331,7 +311,6 @@ class CharVocab:
         return [self.token2id.get(token, unk) for token in tokens]
 
 
-# tensor helpers
 def is_first_byte_ascii(token: str) -> bool:
     # see docs/port-notes/functions.md :: is_first_byte_ascii
     if not token:
@@ -369,7 +348,6 @@ def sinusoidal_position_encoding(x: mx.array) -> mx.array:
     return x + encoding.astype(x.dtype)
 
 
-# modules
 class ModuleLayerList(nn.Module):
     # see docs/port-notes/functions.md :: ModuleLayerList
 
@@ -515,7 +493,6 @@ class SanmEncoderLayer(nn.Module):
         if self.normalize_before:
             x = self.norm1(x)
         attn = self.self_attn(x, mask)
-        # FunASR only adds the residual when in_size == size (encoders0).
         x = residual + attn if self.in_size == self.size else attn
         if not self.normalize_before:
             x = self.norm1(x)
@@ -612,10 +589,8 @@ class CtPuncModel(nn.Module):
         return [ids[i * t : (i + 1) * t] for i in range(b)]
 
 
-# strict checkpoint loading
 
 
-# text post-processing (pure Python, mirrors funasr/models/ct_transformer)
 def split_words(text: str) -> list[str]:
     # see docs/port-notes/functions.md :: split_words
     words: list[str] = []
@@ -750,8 +725,6 @@ class CtPuncPunctuator:
             if chunk_index < last_index:
                 sentence_end = -1
                 last_comma_index = -1
-                # FunASR scans [len - 2 .. 2]; index 0/1 and the final token are
-                # never eligible to close a sentence.
                 for i in range(len(punctuations) - 2, 1, -1):
                     mark = punc_list[punctuations[i]]
                     if mark in cfg.sentence_end_puncs:
@@ -792,9 +765,6 @@ class CtPuncPunctuator:
                 previous_ascii = ascii_first
             accumulated_text += "".join(words_with_punc)
 
-            # FunASR keeps `new_mini_sentence_punc` as the running list and returns
-            # it verbatim as `punc_array`; the trailing sentence-end rewrite below
-            # is applied to both, so `punc_array` is accumulated directly here.
             out_text = accumulated_text
             rewrite_last_punc = False
             if chunk_index == last_index and accumulated_text:

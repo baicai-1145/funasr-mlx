@@ -50,12 +50,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# Depthwise FSMN convolutions: ``(D, 1, K, 1)`` -> ``(D, K, 1)``.
 CONV2D_WEIGHT_SUFFIXES = (".fsmn_block.conv_left.weight", ".fsmn_block.conv_right.weight")
 
 
 def _depthwise_conv2d(name: str, value):
-    # (D, 1, K, 1) -> (D, K, 1); only depthwise trailing-width-1 kernels exist here
     if value.ndim != 4:
         raise ValueError(
             f"{name}: expected a 4-D depthwise conv weight (D, 1, K, 1), "
@@ -78,11 +76,9 @@ def convert_checkpoint_tensors(state):
 def load_state_dict_strict(model, state, *, ignore_prefixes=()):
     return _strict_load(model, state, ignore_prefixes=ignore_prefixes, rules=CONV2D_RULES)
 
-# FunASR's ``ComputeDecibel`` adds this before the log.
 DECIBEL_EPSILON = 0.000001
 
 
-# enums (values mirror funasr/models/fsmn_vad_streaming/model.py)
 class FrameState(enum.Enum):
     INVALID = -1
     SIL = 0
@@ -109,10 +105,8 @@ class VadDetectMode(enum.Enum):
     MULTIPLE_UTTERANCE = 1
 
 
-# validation helpers
 
 
-# config
 @dataclass(frozen=True)
 class FsmnEncoderConfig:
     # see docs/port-notes/functions.md :: FsmnEncoderConfig
@@ -264,7 +258,6 @@ class VadOptions:
         return cls(**_known_fields(cls, config, "model_conf"))
 
 
-# modules
 class ModuleLayerList(nn.Module):
     # see docs/port-notes/functions.md :: ModuleLayerList
 
@@ -358,9 +351,6 @@ class FSMNBlock(nn.Module):
         out = x_per + mx.transpose(left_out, (0, 2, 1))
 
         if self.conv_right is not None:
-            # FunASR right-pads by rorder*rstride then drops rstride frames, which
-            # is exactly "slice the first rstride frames, then right-pad by the
-            # same amount".
             if x_per.shape[2] >= self.rstride:
                 future = x_per[:, :, self.rstride :]
                 future = mx.pad(
@@ -446,7 +436,6 @@ class FSMN(nn.Module):
         return scores, caches
 
 
-# decision logic (pure Python; mirrors funasr/models/fsmn_vad_streaming/model.py)
 class WindowDetector:
 
     def __init__(
@@ -572,21 +561,14 @@ class VadStats:
     scores: mx.array | None = None
     max_time_out: bool = False
     decibel: list[float] = field(default_factory=list)
-    #: ``sum(scores[0][t][sil_pdf_id] for sil_pdf_id in sil_pdf_ids)`` per frame,
-    #: kept host-side so the decision loop stays pure Python.  Trimmed in lockstep
-    #: with ``decibel`` by :meth:`FsmnVadModel.drop_cached_frames`.
     noise_scores: list[float] = field(default_factory=list)
     waveform: mx.array | None = None
     last_drop_frames: int = 0
-    #: Sample counts replacing FunASR's ``data_buf`` / ``data_buf_all`` tensors.
     data_buf_len: int = 0
     data_buf_all_len: int = 0
-    #: ``True`` once ``data_buf_all_len`` holds real samples (FunASR tests
-    #: ``data_buf_all is None``; a 0-length buffer is not the same as "unset").
     data_buf_all_init: bool = False
 
 
-# model + driver
 def _require_cache(cache: dict | None) -> dict:
     if not isinstance(cache, dict) or "stats" not in cache:
         raise ValueError("cache must be initialised with FsmnVadModel.init_cache()")
@@ -768,9 +750,6 @@ class FsmnVadModel(nn.Module):
             stats.scores = mx.concatenate([stats.scores, scores], axis=1)
 
         ids = [int(i) for i in self.vad_opts.sil_pdf_ids]
-        # FunASR: ``sum(scores[0][t][sil_pdf_id] for sil_pdf_id in sil_pdf_ids)``.
-        # ``mx.take`` with an explicit axis is used instead of ``scores[0][:, ids]``
-        # so the semantics do not depend on list-index broadcasting.
         index = mx.array(ids, dtype=mx.int32)
         noise = mx.sum(mx.take(scores[0], index, axis=1), axis=-1)
         stats.noise_scores.extend(float(v) for v in noise.tolist())
@@ -789,7 +768,6 @@ class FsmnVadModel(nn.Module):
                 stats.data_buf_len = max(0, stats.data_buf_all_len - offset)
                 stalled = 0
             else:
-                # FunASR's loop here spins forever; break out instead of hanging.
                 stalled += 1
                 if stalled > 2:
                     logger.warning(
@@ -869,7 +847,6 @@ class FsmnVadModel(nn.Module):
         cache = _require_cache(cache)
         stats = cache["stats"]
         if stats.confirmed_start_frame != -1:
-            # FunASR only prints here and keeps the stale value; mirror that.
             logger.warning(
                 "VAD not reset properly: confirmed_start_frame=%d is already set",
                 stats.confirmed_start_frame,
@@ -891,7 +868,6 @@ class FsmnVadModel(nn.Module):
         for frame in range(stats.latest_confirmed_speech_frame + 1, end_frame):
             self.on_voice_detected(frame, cache=cache)
         if stats.confirmed_end_frame != -1:
-            # FunASR only prints here and keeps the stale value; mirror that.
             logger.warning(
                 "VAD not reset properly: confirmed_end_frame=%d is already set",
                 stats.confirmed_end_frame,
@@ -1199,4 +1175,3 @@ class FsmnVadModel(nn.Module):
         return batches[0]
 
 
-# strict checkpoint loading

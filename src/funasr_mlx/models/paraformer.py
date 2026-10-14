@@ -59,7 +59,6 @@ _POS_ENC_CLASSES = {
 }
 
 
-# configuration
 @dataclass
 class SANMEncoderConfig:
     # see docs/port-notes/functions.md :: SANMEncoderConfig
@@ -192,7 +191,6 @@ class ParaformerConfig:
         if self.decoder_conf is None:
             self.decoder_conf = ParaformerDecoderConfig()
         if self.predictor_conf is None:
-            # ``idim`` must follow the encoder width unless given explicitly.
             self.predictor_conf = CifPredictorConfig(idim=self.encoder_conf.output_size)
         if self.ctc_conf is None:
             self.ctc_conf = CTCConfig()
@@ -228,7 +226,6 @@ def paraformer_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs:
     return ParaformerConfig.from_dict(data)
 
 
-# CTC head (shared shape with the SenseVoice port, kept local for independence)
 class CTC(mxnn.Module):
     # see docs/port-notes/functions.md :: CTC
 
@@ -255,7 +252,6 @@ class CTC(mxnn.Module):
         return mx.argmax(self(hs_pad), axis=-1)
 
 
-# encoder
 class SANMEncoder(mxnn.Module):
     # see docs/port-notes/functions.md :: SANMEncoder
 
@@ -325,9 +321,6 @@ class SANMEncoder(mxnn.Module):
         if layer == "conv2d2":
             return Conv2dSubsampling2(input_size, cfg.output_size, cfg.dropout_rate)
         if layer == "embed":
-            # FunASR's ``nn.Embedding(..., padding_idx=...)`` only affects weight
-            # *initialisation*; MLX's ``Embedding`` has no such argument, and the
-            # forward pass is identical, so it is intentionally dropped here.
             return ModuleStack(
                 [
                     mxnn.Embedding(input_size, cfg.output_size),
@@ -341,9 +334,6 @@ class SANMEncoder(mxnn.Module):
         if layer == "pe":
             return SinusoidalPositionEncoder()
         if layer == "pe_online":
-            # The streaming position encoder; parameters-free like the offline
-            # one, so the checkpoint tree is unchanged. ``forward_chunk`` in
-            # ``paraformer_streaming`` drives it through ``cache['start_idx']``.
             from .paraformer_streaming import StreamSinusoidalPositionEncoder
 
             return StreamSinusoidalPositionEncoder()
@@ -357,9 +347,6 @@ class SANMEncoder(mxnn.Module):
 
     def __call__(self, xs_pad: mx.array, ilens: mx.array) -> tuple[mx.array, mx.array]:
         masks = mx.expand_dims(~make_pad_mask(ilens, xs_pad.shape[1]), 1)  # (B, 1, T)
-        # When every sample fills the window the mask is uniformly True and all
-        # its uses are identity; fold it to None so each layer takes the fused
-        # SDPA path (numerically identical, covered by the alignment suite).
         uniform = bool(mx.all(masks).item())
         layer_mask = None if uniform else masks
         xs_pad = xs_pad * (self.output_size() ** 0.5)
@@ -394,7 +381,6 @@ class SANMEncoder(mxnn.Module):
         return xs_pad, olens
 
 
-# CIF predictor
 CIF_DEVICE = mx.cpu
 """Device the CIF predictor evaluates on.
 
@@ -424,13 +410,7 @@ def _cif_stream(device: mx.array | None):
 
 
 def _cif_wo_hidden_v1_impl(alphas: mx.array) -> tuple[mx.array, mx.array]:
-    # The reference accumulates in float64 and only then narrows:
-    #   torch.cumsum(prefix_sum, dim=1, dtype=torch.float64).to(torch.float32)
-    # ``mx.cumsum(..., dtype=...)`` casts the input to that type before summing,
-    # so this is the same operation, not an approximation of it.  The narrowing
-    # cast matters: a running sum that lands just below an integer in float64
-    # can round up to exactly that integer in float32 and fire a token the
-    # reference would not.
+    # see docs/port-notes/comments.md :: paraformer.py:413
     prefix_sum = mx.cumsum(alphas, axis=1, dtype=mx.float64).astype(mx.float32)
     prefix_sum_floor = mx.floor(prefix_sum)
     dislocation_prefix_sum = mx.roll(prefix_sum, shift=1, axis=1)
@@ -475,8 +455,6 @@ def _cif_v1_impl(
 
     total_fires = int(mx.sum(mx.sum(fire_idxs.astype(mx.int32), axis=-1)).item())
     if total_fires == 0:
-        # Very short / silent segment: the reference returns zero frames here
-        # (the upstream fix that avoids an IndexError in the export variant).
         max_label_len = int(mx.max(mx.round(mx.sum(alphas, axis=-1))).item())
         return mx.zeros((b, max_label_len, d), hidden.dtype), fires
 
@@ -485,44 +463,24 @@ def _cif_v1_impl(
     max_label_len = max(max_label_len, 1)
     max_label_len = min(max_label_len, t)
 
-    # ``time_of_rank[b, j]`` = time of the j-th fire of utterance b.
-    # The sort key is **tie-free**: fires carry 0..batch_len-1 and non-fires carry
-    # t..2t-1, so the resulting order never depends on sort stability.  Keying all
-    # non-fires with a single sentinel value left the tail of the permutation
-    # backend-dependent, which is a needless nondeterminism source.
+    # see docs/port-notes/comments.md :: paraformer.py:466
     rank = mx.cumsum(fire_idxs.astype(mx.int32), axis=1) - 1
     filler = t + mx.arange(t, dtype=mx.int32)[None, :]
     time_of_rank = mx.argsort(mx.where(fire_idxs, rank, filler), axis=1)  # (B, T)
 
-    # Gather along the **time** axis natively rather than flattening the batch.
-    # The reference's ``prefix_sum_hidden[fire_idxs]`` over a (B, T, D) tensor is a
-    # batched gather on axis 1; the flattened form instead reshapes (B, T, D) to
-    # (B*T, D), adds a per-row ``b * T`` offset and takes on axis 0, then reshapes
-    # back.  That round-trip through a flat view is the part worth falsifying on
-    # GPU, and it is also why a missing row offset was silent at B=1.
+    # see docs/port-notes/comments.md :: paraformer.py:471
     def _gather(array: mx.array) -> mx.array:
         # see docs/port-notes/functions.md :: _gather
         if array.ndim == 2:
-            # The fires signal carries no feature axis, so index it directly.
             return mx.take_along_axis(array, time_of_rank, axis=1)
         indices = mx.expand_dims(time_of_rank, -1)  # (B, T, 1) broadcasts over D
         return mx.take_along_axis(array, indices, axis=1)
 
     prefix_sum_hidden = mx.cumsum(mx.expand_dims(alphas, -1) * hidden, axis=1)
 
-    # One boundary per fire, then subtract the previous one.
     #
-    #   boundary[j] = P[t_j] - rem[t_j] * h[t_j]
-    #   frames[j]   = boundary[j] - boundary[j-1]          (boundary[-1] = 0)
     #
-    # Expanding the second line gives exactly the reference expression
-    #   P[t_j] - P[t_{j-1}] + rem[t_{j-1}] * h[t_{j-1}] - rem[t_j] * h[t_j]
-    # with ``rem[t] = fires[t] - floor(fires[t])`` and every previous term zero at
-    # j = 0.  That is the same algebra the reference reaches by rolling the
-    # gathered frames by one and zeroing the first entry of each batch
-    # (``cif_predictor.py:881-895``); this form needs a single gather per operand
-    # instead of two, and builds no separate "previous" tensors and no
-    # first-position ``where`` masks.
+    # see docs/port-notes/comments.md :: paraformer.py:483
     cur_p = _gather(prefix_sum_hidden)[:, :max_label_len]
     cur_h = _gather(hidden)[:, :max_label_len]
     cur_f = _gather(fires)[:, :max_label_len]
@@ -602,9 +560,6 @@ class CifPredictorV2(mxnn.Module):
         return hidden, alphas, mx.floor(token_num)
 
     def _alphas(self, hidden: mx.array, mask: mx.array | None) -> tuple[mx.array, mx.array | None]:
-        # MLX conv1d is channels-last (NLC), so ``hidden`` (B, T, D) feeds the
-        # Conv1d directly and both reference transposes disappear.  Padding is
-        # applied on the time axis, i.e. axis=1.
         queries = constant_pad_1d(hidden, self._l_order, self._r_order, axis=1)
         output = mx.maximum(self.cif_conv1d(queries), 0.0)  # (B, T, D)
         output = self.cif_output(output)  # (B, T, 1)
@@ -623,11 +578,7 @@ class CifPredictorV2(mxnn.Module):
         if self._tail_threshold > 0.0:
             hidden, alphas, token_num = self.tail_process_fn(hidden, alphas, mask_2d)
         else:
-            # Reference ``cif_predictor.py:293`` is a plain ``alphas.sum(-1)`` with
-            # **no floor**; ``hidden`` is likewise left unextended because the
-            # reference has no ``else`` branch at all when tail_threshold <= 0.
-            # Flooring here would change ``round(token_num)`` downstream, which
-            # the reference's ``Paraformer.forward`` applies to the raw sum.
+            # see docs/port-notes/comments.md :: paraformer.py:581
             token_num = mx.sum(alphas, axis=-1)
 
         acoustic_embeds, cif_peak = cif_v1(hidden, alphas, self._threshold)
@@ -637,7 +588,6 @@ class CifPredictorV2(mxnn.Module):
         return acoustic_embeds, token_num, alphas, cif_peak
 
 
-# decoder
 class ParaformerSANMDecoder(mxnn.Module):
     # see docs/port-notes/functions.md :: ParaformerSANMDecoder
 
@@ -656,7 +606,6 @@ class ParaformerSANMDecoder(mxnn.Module):
         if cfg.wo_input_layer:
             self.embed = None
         elif cfg.input_layer == "embed":
-            # The reference intentionally drops the positional encoder here.
             self.embed = ModuleStack([mxnn.Embedding(vocab_size, attention_dim)])
         elif cfg.input_layer == "linear":
             self.embed = ModuleStack(
@@ -764,7 +713,6 @@ class ParaformerSANMDecoder(mxnn.Module):
         return hidden, olens
 
 
-# model
 @dataclass
 class ParaformerOutputs:
 
@@ -916,7 +864,6 @@ def ts_prediction_lfr6_standard(
         alphas_list = [a / total * (num_chars + 1) for a in alphas_list]
         fire_place = _cif_fire_positions(alphas_list, threshold=1.0 - 1e-4)
     if not fire_place:
-        # Degenerate case (alphas all zero): no integration boundary at all.
         return [[0, int(num_frames * time_rate * 1000)] for _ in range(num_chars)]
 
     timestamps: list[list[float]] = []

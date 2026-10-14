@@ -45,14 +45,10 @@ __all__ = [
     "preprocess_waveform",
 ]
 
-#: Prefixes that exist in the published checkpoint but carry no inference
-#: parameters.  They are dropped by :func:`convert_checkpoint_tensors` only when
-#: this exact prefix list matches, and the dropped names are returned so the
-#: caller can log them.  Any *other* unexpected key is an error.
+# see docs/port-notes/comments.md :: emotion2vec.py:48
 INFERENCE_ONLY_PREFIXES: tuple[str, ...] = ("modality_encoders.AUDIO.decoder.",)
 
 
-# small helpers
 
 def _as_int(value: Any, name: str, *, minimum: int | None = None) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
@@ -91,7 +87,6 @@ def get_alibi(max_positions: int, attention_heads: int) -> mx.array:
     return slopes.reshape(-1, 1, 1) * pos_bias[None, :, :]
 
 
-# containers that preserve PyTorch Sequential / ModuleList key indices
 class OrderedModules(nn.Module):
     # see docs/port-notes/functions.md :: OrderedModules
 
@@ -163,7 +158,6 @@ class Identity(nn.Module):
         return x
 
 
-# norms and activations
 class Fp32LayerNorm(nn.LayerNorm):
     # see docs/port-notes/functions.md :: Fp32LayerNorm
 
@@ -192,7 +186,6 @@ class Mlp(nn.Module):
         return self.fc2(self.act(self.fc1(x)))
 
 
-# ConvFeatureExtractionModel (fairseq v0.12.2 wav2vec2.py:819-895)
 def parse_feature_encoder_spec(spec: str) -> list[tuple[int, int, int]]:
     # see docs/port-notes/functions.md :: parse_feature_encoder_spec
     if not isinstance(spec, str) or not spec.strip():
@@ -295,8 +288,6 @@ class ConvFeatureBlock(OrderedModules):
         ntc = self["0"](mx.swapaxes(x, 1, 2))  # NTC conv boundary -> NTC out
         nct = mx.swapaxes(ntc, 1, 2)  # back to NCT for the rest of the chain
         nct = self["1"](nct)  # Identity (Dropout at inference)
-        # self["2"] is Sequential(TransposeLast, Fp32LayerNorm, TransposeLast):
-        # NCT -> NTC puts the 512 channels on the norm's last axis -> NCT.
         nct = self["2"](nct)
         return self["3"](nct)  # GELU is elementwise; returns NCT
 
@@ -326,7 +317,6 @@ class ConvFeatureExtraction(nn.Module):
         return y
 
 
-# relative positional encoder (audio.py:83-106)
 class SamePad(OrderedModules):
     """``fairseq.modules.SamePad`` (non-causal), ``same_pad.py:18-22``.
 
@@ -340,7 +330,6 @@ class SamePad(OrderedModules):
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.remove > 0:
-            # reference: x[:, :, : -remove] -- the final slot on the last axis
             x = x[..., : -self.remove]
         return x
 
@@ -400,7 +389,6 @@ class PositionalEncoder(OrderedModules):
         return super().__call__(x)
 
 
-# AltBlock / AltAttention (modules.py)
 class AltAttention(nn.Module):
     # see docs/port-notes/functions.md :: AltAttention
 
@@ -420,11 +408,7 @@ class AltAttention(nn.Module):
         q = mx.swapaxes(qkv[:, :, 0], 1, 2)  # (B, H, N, d)
         k = mx.swapaxes(qkv[:, :, 1], 1, 2)
         v = mx.swapaxes(qkv[:, :, 2], 1, 2)
-        # The entire score pipeline (scale + QK^T + bias + softmax + @V) is one
-        # fused SDPA kernel; the ALiBi bias goes in as the additive ``mask``
-        # argument and SDPA's internal softmax runs in float32. Equivalent to
-        # the manual path (covered by the alignment suite) minus four kernel
-        # launches per layer.
+        # see docs/port-notes/comments.md :: emotion2vec.py:411
         bias = None
         if alibi_bias is not None:
             _require(
@@ -503,12 +487,10 @@ class BlockEncoder(nn.Module):
         return x
 
 
-# config
 @dataclass(frozen=True)
 class Emotion2VecConfig:
     # see docs/port-notes/functions.md :: Emotion2VecConfig
 
-    # model
     embed_dim: int = 1024
     depth: int = 8
     num_heads: int = 16
@@ -518,22 +500,18 @@ class Emotion2VecConfig:
     layer_norm_first: bool = False
     end_of_block_targets: bool = False
 
-    # feature encoder
     feature_encoder_spec: str = "[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] + [(512, 2, 2)]"
     extractor_mode: str = "layer_norm"
     conv_bias: bool = False
     normalize: bool = True
 
-    # relative positional encoder
     conv_pos_depth: int = 5
     conv_pos_width: int = 95
     conv_pos_groups: int = 16
     conv_pos_pre_ln: bool = False
 
-    # context encoder
     prenet_depth: int = 4
 
-    # extra tokens / alibi
     num_extra_tokens: int = 10
     init_extra_token_zero: bool = True
     use_alibi_encoder: bool = True
@@ -545,11 +523,9 @@ class Emotion2VecConfig:
     learned_alibi_scale_per_head: bool = True
     learned_alibi_scale_per_layer: bool = False
 
-    # classifier
     vocab_size: int = -1
     labels: tuple[str, ...] = ()
 
-    # memory bounds (attention is O(T^2) in 16 * heads * frames)
     max_samples: int = 160_000
     max_frames: int = 640
 
@@ -649,7 +625,6 @@ class Emotion2VecConfig:
         return frames
 
 
-# modality encoder
 class AudioEncoder(nn.Module):
 
     def __init__(self, config: Emotion2VecConfig) -> None:
@@ -728,15 +703,9 @@ class AudioEncoder(nn.Module):
         # see docs/port-notes/functions.md :: contextualized_features
         if samples.ndim != 2:
             raise ValueError(f"expected (B, samples), got shape {samples.shape}")
-        # Bound the O(T^2) attention here too, not only via Emotion2VecModel.
         self.config.frames_for(int(samples.shape[-1]))
 
-        # Follow the module's own weight dtype, exactly as whisper's
-        # ``AudioEncoder.__call__`` does.  The waveform is normalised in float32
-        # (``preprocess_waveform``), so without this cast an fp16 checkpoint
-        # runs the conv stack and all 12 blocks with float32 activations against
-        # fp16 weights and pays a mixed-dtype promotion at every op (measured on
-        # M4, 3.3 s window: 51.7 ms vs 37.2 ms, 1.39x).
+        # see docs/port-notes/comments.md :: emotion2vec.py:708
         weight_dtype = self._weight_dtype()
         samples = samples.astype(weight_dtype)
 
@@ -769,7 +738,6 @@ class AudioEncoder(nn.Module):
         return self.contextualized_features(samples)
 
 
-# top level model
 @dataclass(frozen=True)
 class EmotionResult:
     # see docs/port-notes/functions.md :: EmotionResult
@@ -831,8 +799,6 @@ class Emotion2VecModel(nn.Module):
         # see docs/port-notes/functions.md :: extract_features
         if samples.ndim != 2:
             raise ValueError(f"expected (B, samples), got shape {samples.shape}")
-        # Attention is O(T^2) * num_heads, so the bound is enforced here rather
-        # than only by callers who pre-flight with config.frames_for.
         self.config.frames_for(int(samples.shape[-1]))
         encoder = self.modality_encoders["AUDIO"]
         x, alibi_bias, alibi_scale = encoder.contextualized_features(samples)
@@ -892,7 +858,6 @@ class Emotion2VecModel(nn.Module):
         )
 
 
-# checkpoint loading
 def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
     """``{dotted.name: array}`` for every parameter leaf.
 
@@ -902,13 +867,7 @@ def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
     return {key: value for key, value in flat.items() if isinstance(value, mx.array)}
 
 
-#: Exact checkpoint keys whose layout differs between PyTorch and MLX.  These
-#: are written out in full rather than derived from a positional guess, because
-#: the sequence index sits at ``parts[-3]`` and a ``parts[-3] == "conv_layers"``
-#: check silently stops matching.
-#:
-#: * ``conv_layers.<i>.0.weight`` -- ``nn.Conv1d`` weight ``(out, in//g, K)``
-#: * ``relative_positional_encoder.<i>.0.weight`` -- same ``nn.Conv1d``
+# see docs/port-notes/comments.md :: emotion2vec.py:870
 CONV_WEIGHT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^modality_encoders\.AUDIO\.local_encoder\.conv_layers\.\d+\.0\.weight$"),
     re.compile(r"^modality_encoders\.AUDIO\.relative_positional_encoder\.\d+\.0\.weight$"),

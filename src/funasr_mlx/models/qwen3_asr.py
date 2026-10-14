@@ -55,7 +55,6 @@ class _Conv2dStride2(mxnn.Module):
         self.conv = mxnn.Conv2d(cin, cout, kernel_size=3, stride=2, padding=1)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x and output are NHWC (B, F, T, C) -- MLX Conv2d's native layout
         return self.conv(x)
 
 
@@ -108,9 +107,6 @@ class _Sinusoids(mxnn.Module):
 
     def __init__(self, length: int, channels: int) -> None:
         super().__init__()
-        # reference: inv_timescales[i] = exp(-log(1e4)/(C/2-1) * i) -- the
-        # exponent multiplies arange BEFORE exp; my old form computed
-        # exp(-log(1e4)*i)/(C/2-1) which is a different frequency ladder.
         position = mx.arange(length, dtype=mx.float32)[:, None]
         half = channels // 2
         exponent = -math.log(10000.0) / (half - 1) * mx.arange(half, dtype=mx.float32)
@@ -132,7 +128,6 @@ class Qwen3ASRAudioEncoder(mxnn.Module):
         self.conv2d1 = _Conv2dStride2(1, h)
         self.conv2d2 = _Conv2dStride2(h, h)
         self.conv2d3 = _Conv2dStride2(h, h)
-        # conv_out: Linear over (h * F_after_cnn)
         f_after = _get_feat_extract_output_lengths(cfg.n_mels)  # 80 -> 10
         self.conv_out = mxnn.Linear(h * f_after, cfg.d_model, bias=False)  # checkpoint ships no bias
         self.positional_embedding = _Sinusoids(cfg.max_source_positions, cfg.d_model)
@@ -145,13 +140,7 @@ class Qwen3ASRAudioEncoder(mxnn.Module):
         cfg = self.cfg
         t = mel.shape[1]
 
-        # The reference time-splits into 2*n_window-mel chunks, pads every
-        # chunk to the full window (pad_sequence), convolves per chunk, adds
-        # positional embeddings computed for the PADDED length, then keeps
-        # only each chunk's real frames (padded_mask_after_cnn). Verified
-        # per-block against the reference hooks: padding the tail chunk
-        # before the conv matters (4.2 abs otherwise), and the pos table is
-        # applied on the padded 13 frames before slicing.
+        # see docs/port-notes/comments.md :: qwen3_asr.py:143
         win = cfg.n_window * 2
         n_chunks = max(1, -(-t // win))
         pe_len = _get_feat_extract_output_lengths(win)
@@ -174,12 +163,7 @@ class Qwen3ASRAudioEncoder(mxnn.Module):
 
         t_out = e.shape[1]
 
-        # Reference windowing: after concatenating the chunk frames, the
-        # layers attend within windows of window_aftercnn = padded_chunk_frames
-        # * (n_window_infer / (n_window*2)) AFTER-CNN frames (modeling file's
-        # cu_chunk_lens over aftercnn_lens). For the default n_window_infer=
-        # 800 and n_window=50 that is 104 frames; utterances shorter than one
-        # window attend globally (mask None).
+        # see docs/port-notes/comments.md :: qwen3_asr.py:166
         win_mel = cfg.n_window * 2
         padded_chunk_frames = _get_feat_extract_output_lengths(win_mel)
         window_aftercnn = int(padded_chunk_frames * (cfg.n_window_infer // win_mel))

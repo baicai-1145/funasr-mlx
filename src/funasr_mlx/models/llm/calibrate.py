@@ -67,12 +67,8 @@ class HeadActivationCollector:
     """
 
     target: HeadTarget
-    #: Rows to accumulate per observation before folding into the Hessian. The
-    #: hidden states of one utterance are a few hundred rows, so this is a
-    #: memory guard rather than a performance knob.
     max_rows_per_call: int = 8192
     accumulator: HessianAccumulator = field(init=False)
-    #: Per-language row counts, mirrored from the accumulator for reporting.
     observations: dict[str, int] = field(default_factory=dict, init=False)
     _original: Callable | None = field(default=None, init=False, repr=False)
     _patched_owner: Any = field(default=None, init=False, repr=False)
@@ -87,9 +83,6 @@ class HeadActivationCollector:
             raise RuntimeError("The collector is already installed")
         owner = self.target.module
         if self.target.kind == "tied":
-            # nn.Embedding.as_linear is looked up on the *instance* dict first
-            # (verified against mlx 0.32), so an instance attribute is enough and
-            # is restored by deleting it.
             original = owner.as_linear
             self._patched_attribute = "as_linear"
 
@@ -98,8 +91,6 @@ class HeadActivationCollector:
                 return original(x, *args, **kwargs)
 
         else:
-            # An nn.Linear head is called through nn.Linear.__call__, which is a
-            # *class* attribute: patch the class and restore it in uninstall.
             import mlx.nn as nn
 
             original = nn.Linear.__call__
@@ -151,7 +142,6 @@ class HeadActivationCollector:
                 f"Head input has width {array.shape[-1]}, expected "
                 f"{self.target.hidden_size}"
             )
-        # Zero rows (a batch that happened to be empty) carry no information.
         if array.shape[0]:
             self._pending.append(array)
 

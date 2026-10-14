@@ -8,7 +8,6 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-#: The 14 published repos (``baicai1145/*`` on both platforms).
 CATALOG: dict[str, dict] = {
     "sensevoice-mlx-fp16": {"variants": ["."]},
     "paraformer-mlx-fp16": {"variants": ["."]},
@@ -99,8 +98,6 @@ def download(
             raise ValueError(f"Unknown variant {variant!r} for {repo}; choose from {variants}")
 
         listing = None
-        # ModelScope primary (measured 20.4 MB/s vs HF 5.6 MB/s on the same
-        # shard set from this network); HF is the per-file fallback.
         for lister, host in ((_ms_list, "modelscope.cn"), (_hf_list, "huggingface.co")):
             try:
                 listing = lister(repo)

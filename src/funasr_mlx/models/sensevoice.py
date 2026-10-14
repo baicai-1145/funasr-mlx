@@ -43,7 +43,6 @@ __all__ = [
 ]
 
 
-# metadata dictionaries (verbatim from sense_voice/model.py)
 LID_DICT: dict[str, int] = {
     "auto": 0,
     "zh": 3,
@@ -71,21 +70,16 @@ EMO_DICT: dict[str, int] = {
     "neutral": 25004,
 }
 
-#: ``self.embed = nn.Embedding(7 + len(lid_dict) + len(textnorm_dict), input_size)``
-#: i.e. rows ``0..6`` are reserved for the rich-transcription/event slots.
 NUM_METADATA_EMBEDDINGS = 7 + len(LID_DICT) + len(TEXTNORM_DICT)
 
-#: Index pairs used verbatim by ``SenseVoiceSmall.encode`` / ``.inference``.
 LANGUAGE_SLOT = 0
 EVENT_ID, EMO_ID = 1, 2
 TEXTNORM_SLOT_RANGE = (LID_DICT["nospeech"], TEXTNORM_DICT["woitn"] + 1)
 EVENT_EMO_IDS = (EVENT_ID, EMO_ID)
 
-#: language + event + emotion + textnorm
 NUM_PREFIX_FRAMES = 4
 
 
-# configuration
 @dataclass
 class SenseVoiceEncoderSmallConfig:
     # see docs/port-notes/functions.md :: SenseVoiceEncoderSmallConfig
@@ -185,7 +179,6 @@ def sensevoice_config_from_dict(data: Mapping[str, Any] | None = None, **kwargs:
     return SenseVoiceSmallConfig.from_dict(data)
 
 
-# modules
 class CTC(mxnn.Module):
     # see docs/port-notes/functions.md :: CTC
 
@@ -208,9 +201,6 @@ class CTC(mxnn.Module):
         return self.ctc_lo(hs_pad)
 
     def log_softmax(self, hs_pad: mx.array) -> mx.array:
-        # ``mx.logsoftmax`` does not exist in MLX; the max-shifted functional
-        # ``mlx.nn.log_softmax`` is the API.  Qualified as ``mxnn.`` because this
-        # class also defines a *method* named ``log_softmax``.
         return mxnn.log_softmax(self(hs_pad), axis=-1)
 
     def argmax(self, hs_pad: mx.array) -> mx.array:
@@ -243,8 +233,6 @@ class SenseVoiceEncoderSmall(mxnn.Module):
             )
 
         self._output_size = cfg.output_size
-        # The reference hard-codes SinusoidalPositionEncoder regardless of
-        # ``input_layer`` (SenseVoice has no Conv2dSubsampling front-end).
         self.embed = SinusoidalPositionEncoder()
         self._normalize_before = cfg.normalize_before
 
@@ -282,20 +270,11 @@ class SenseVoiceEncoderSmall(mxnn.Module):
         return self._output_size
 
     def __call__(self, xs_pad: mx.array, ilens: mx.array) -> tuple[mx.array, mx.array]:
-        # The front-end always produces float32 fbank.  Without this cast an
-        # fp16 checkpoint runs the whole 70-layer SANM stack with float32
-        # activations against fp16 weights and pays a mixed-dtype promotion at
-        # every Linear (measured on M4, 3.275 s window: 37.5 ms vs 19.2 ms,
-        # 1.95x).  For a float32 checkpoint the cast is a no-op, so those
-        # numerics stay bit-identical.
+        # see docs/port-notes/comments.md :: sensevoice.py:273
         xs_pad = xs_pad.astype(self._weight_dtype())
         maxlen = xs_pad.shape[1]
         masks = mx.expand_dims(sequence_mask(ilens, maxlen=maxlen), 1)  # (B, 1, T)
-        # When every sample fills the whole window the mask is uniformly 1.0:
-        # every ``where(blocked, ...)`` is a no-op and the mask products in the
-        # FSMN branch are identity. Fold it to None so each layer can take the
-        # fused SDPA path (numerically identical; covered by the alignment
-        # suite). ``olens`` is then just ``ilens``.
+        # see docs/port-notes/comments.md :: sensevoice.py:277
         uniform = bool(mx.all(masks == 1.0).item())
         layer_mask = None if uniform else masks
 
@@ -308,8 +287,6 @@ class SenseVoiceEncoderSmall(mxnn.Module):
             xs_pad, _ = layer(xs_pad, layer_mask)
 
         xs_pad = self.after_norm(xs_pad)
-        # ``olens`` is derived here, before the tail blocks (faithful to the
-        # reference; the mask is unchanged by the tail blocks anyway).
         olens = (
             mx.sum(mx.squeeze(masks, 1), axis=-1).astype(mx.int32)
             if not uniform
@@ -372,10 +349,7 @@ class SenseVoiceSmall(mxnn.Module):
         tn = TEXTNORM_DICT.get(text_norm, TEXTNORM_DICT["woitn"])
 
         ids = mx.array([[lid, EVENT_ID, EMO_ID, tn]], dtype=mx.int32)
-        # One row of ``NUM_PREFIX_FRAMES`` token ids, tiled across the batch.
-        # Note the broadcast target is ``(B, NUM_PREFIX_FRAMES)``: ``ids`` is
-        # token *indices*, so its width is the number of prefix frames and has
-        # nothing to do with ``input_size``.
+        # see docs/port-notes/comments.md :: sensevoice.py:352
         return self.embed(mx.broadcast_to(ids, (batch_size, NUM_PREFIX_FRAMES)))
 
     def encode(

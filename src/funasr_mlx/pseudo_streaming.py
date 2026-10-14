@@ -70,7 +70,6 @@ class PseudoStream:
         return joined
 
 
-# Adapters: offline callables per family
 
 
 def classic_transcriber(model, config: dict, *, family: str, tokens=None, cmvn=None):

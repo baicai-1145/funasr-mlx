@@ -26,9 +26,6 @@ def read_config(path: str | Path) -> dict:
     if path.stat().st_size > 1_000_000:
         raise ValueError("Model configuration exceeds the metadata bound")
     text = path.read_text()
-    # YAML 1.1 reads bare exponent forms like 1e-05 as strings, silently
-    # corrupting numeric config fields. JSON is the artifact format, so parse
-    # it as JSON first and only fall back to YAML for hand-written configs.
     try:
         config = json.loads(text)
     except ValueError:
@@ -39,7 +36,6 @@ def read_config(path: str | Path) -> dict:
 
 
 def create_model(family: str, config: dict):
-    # guard is a host choice, not a project requirement
     if not isinstance(config, dict):
         raise ValueError("Model configuration must be a mapping")
     if family == "sensevoice":
@@ -93,8 +89,6 @@ def create_model(family: str, config: dict):
 
 def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict | None = None):
     # see docs/port-notes/functions.md :: load_model
-    # The guard is an OPTIONAL host-protection wrapper (CLI default for this
-    # 16GB dev box), not a project requirement: library callers load directly.
     policy = None
     if "FUNASR_MLX_MEMORY_POLICY" in os.environ:
         policy = MemoryPolicy(**json.loads(os.environ["FUNASR_MLX_MEMORY_POLICY"]))
@@ -116,11 +110,7 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     config_dict = config if isinstance(config, dict) else read_config(config)
     headers = {}
     files = tuple(checkpoint_files(checkpoint))
-    # Same bound the converter enforces when packing quantized groups (see
-    # checkpoints.py): one shard bounds one mmap's wired swing.  256MB+32MB
-    # admits the largest single group a legal conversion can emit (a 1.7B
-    # tied embedding at w4/g64 is ~175MB) while keeping the per-file
-    # residency predictable on 16GB hosts.
+    # see docs/port-notes/comments.md :: pipeline.py:113
     shard_bound = max(256 * MB, info.largest_tensor_bytes) + 32 * MB
     for path in files:
         cap = policy.mlx_limit - info.tensor_bytes if policy is not None else None
@@ -139,22 +129,14 @@ def load_model(checkpoint: str | Path, *, family: str, config: str | Path | dict
     from mlx.utils import tree_flatten, tree_unflatten
 
     model = create_model(family, config_dict)
-    # Weight quantization is applied BEFORE the expected parameter set is
-    # computed, so a quantized checkpoint's `.scales`/`.biases` tensors are
-    # part of the strict key/shape check like every other parameter. The
-    # converter uses the same declaration to decide which tensors to pack, so
-    # a mismatch between the two rules fails here instead of mis-binding.
+    # see docs/port-notes/comments.md :: pipeline.py:132
     from .models.llm.quant import apply_quantization
 
     quantization = apply_quantization(model, config_dict.get("quantization"))
     if quantization is not None:
         model._quantization = quantization
     expected = dict(tree_flatten(model.parameters()))
-    # A port may derive a parameter at construction instead of loading it (the
-    # Qwen3-ASR sinusoidal position table is computed from the config). Those
-    # names are declared as data beside the layout rules; each declaration is
-    # checked against the built model here, so a stale entry fails loudly
-    # instead of quietly excusing a missing tensor.
+    # see docs/port-notes/comments.md :: pipeline.py:139
     derived = set(DERIVED_NATIVE_PARAMETERS.get(family, ()))
     unknown_derived = sorted(derived - set(expected))
     if unknown_derived:
