@@ -47,6 +47,22 @@ def _parser():
     infer.add_argument("--prompt-tokens", help="Whisper prefix token ids, comma-separated")
     infer.add_argument("--eot-token", type=int, default=50257)
     infer.add_argument("--max-tokens", type=int, default=128)
+    transcribe = commands.add_parser(
+        "transcribe",
+        help="Transcribe audio with an LLM-ASR checkpoint (qwen3-asr, glm-asr-nano, moss, fun-asr-nano)",
+    )
+    transcribe.add_argument("checkpoint", type=Path)
+    transcribe.add_argument("--family", default=None, help="Model family; inferred from the directory name when omitted")
+    transcribe.add_argument("--audio", type=Path, required=True)
+    transcribe.add_argument("--max-tokens", type=int, default=96)
+    serve = commands.add_parser(
+        "serve", help="Run a local OpenAI-compatible transcription server"
+    )
+    serve.add_argument("checkpoint", type=Path)
+    serve.add_argument("--family", default=None)
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--max-tokens", type=int, default=96)
     return parser
 
 
@@ -153,6 +169,29 @@ def _infer(args):
 
 
 def _execute(args):
+    if args.command == "transcribe":
+        from .llm_asr import LlmAsrTranscriber, resolve_family
+
+        family = resolve_family(args.checkpoint, args.family)
+        transcriber = LlmAsrTranscriber(args.checkpoint, family=family, max_tokens=args.max_tokens)
+        transcriber._ckpt_dir = args.checkpoint if args.checkpoint.is_dir() else args.checkpoint.parent
+        result = transcriber.transcribe_file(args.audio)
+        print(json.dumps(result.to_dict(), ensure_ascii=False))
+        return
+    if args.command == "serve":
+        from .server import run_server
+
+        family = __import__("funasr_mlx.llm_asr", fromlist=["resolve_family"]).resolve_family(
+            args.checkpoint, args.family
+        )
+        run_server(
+            args.checkpoint,
+            family=family,
+            host=args.host,
+            port=args.port,
+            max_tokens=args.max_tokens,
+        )
+        return
     if args.command == "convert":
         from .checkpoints import convert_checkpoint
         from .pipeline import read_config

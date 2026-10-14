@@ -100,6 +100,37 @@ Per-family scope, checkpoint sizes, measured speedups and peak-memory drops are
 in `.tmp/t9/RESULTS.md`; the scheme and its failure modes are in
 `.tmp/t9/LEDGER.md`.
 
+## LLM-ASR transcription
+
+Three interfaces share one resident-worker protocol (KV cache reset-reuse
+between requests; RTF 0.079 on the 0.6B w4, M4 Air):
+
+CLI (single file):
+
+```sh
+funasr-mlx transcribe /path/to/qwen3-asr-0.6b-w4a16-awq-w8tower-g32 --audio recording.wav
+# {"text": "...", "token_ids": [...], "family": "qwen3-asr", "wall_ms": 650.8}
+```
+
+Python API (routes through the guarded subprocess automatically):
+
+```python
+from funasr_mlx.api import transcribe
+result = transcribe("recording.wav", model="/path/to/checkpoint")
+print(result["text"])
+```
+
+HTTP server (OpenAI-compatible endpoint; raw body or multipart form):
+
+```sh
+funasr-mlx serve /path/to/checkpoint --port 8000
+curl -X POST http://127.0.0.1:8000/v1/audio/transcriptions -F "file=@recording.wav"
+```
+
+Supported families: `qwen3-asr` (0.6B/1.7B), `glm-asr-nano`,
+`moss-transcribe-diarize`, `fun-asr-nano` (family inferred from the
+checkpoint directory name when omitted).
+
 ## Memory Policy
 
 The hard ceiling is 12 GB (decimal) for project processes. Numerical jobs
