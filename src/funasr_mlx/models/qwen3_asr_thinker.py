@@ -75,11 +75,11 @@ class Qwen3ASR(mxnn.Module):
         cfg = self.config
         return splice_and_forward(
             token_ids, audio_embeds, pad_span, caches,
-            audio_token_id=cfg.audio_token_id,
+            audio_token_id=cfg.audio_pad_token_id,
             embed_tokens=th.model.embed_tokens,
             decoder=th.model,
             embeds_as_linear=th.model.embed_tokens.as_linear,
-            lm_head=th.lm_head,
+            lm_head=getattr(th, "lm_head", None),
             tied=cfg.text.tie_word_embeddings,
             decoder_dtype=self._decoder_dtype(),
         )

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .memory import GB, MB, MemoryPolicy, guarded_child_active
+from .memory import MemoryBudgetExceeded
 
 def download_model(repo, *, variant=None, dest=".", owner=None):
     # see docs/port-notes/functions.md :: download_model
@@ -68,9 +68,14 @@ def transcribe(
     family: str | None = None,
     max_tokens: int = 96,
 ) -> dict[str, Any]:
-    if guarded_child_active():
+    # Library callers load in-process by default (the guard is a host choice,
+    # not a project requirement); the CLI subprocess stays as the fallback so
+    # the process boundary still applies where a caller wants it.
+    try:
         worker = TranscribeWorker(model, family=family, max_tokens=max_tokens)
         return worker.transcribe(audio)
+    except MemoryBudgetExceeded:
+        pass  # fall through to the guarded CLI subprocess
 
     cmd = [sys.executable, "-m", "funasr_mlx.cli", "transcribe", str(model),
            "--audio", str(audio), "--max-tokens", str(max_tokens)]

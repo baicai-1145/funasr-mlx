@@ -175,14 +175,20 @@ for chunk in mic:                 # numpy float32 @16k, any sizes
 final = stream.close()            # == offline transcription
 ```
 
-## Memory Policy
+## Memory guard (optional, dev-machine tool)
 
-The hard ceiling is 12 GB (decimal) for project processes. Numerical jobs
-are serialized with a git-common-directory lock. Default job budget 2 GB,
-project stop threshold 10 GB, minimum host reserve 3 GB. Bounded
-input/shards, admission checks, MLX allocation/cache guidelines, an
-external RSS watchdog and supervisor-liveness pipe work together. No
-automatic downloads or simultaneous model loading.
+`funasr_mlx.memory.run_guarded` is a host-protection wrapper developed on a
+16GB MacBook Air: it bounds per-process RSS and wired-memory headroom while
+big checkpoints load. It is NOT a project requirement:
+
+* Library callers (`funasr_mlx.api`, `pipeline.load_model`) load and run
+  in-process by default, with no guard and no policy environment.
+* `funasr-mlx` CLI still wraps execution in the guard by default
+  (`--memory-gb`), convenient for constrained machines; set
+  `FUNASR_MLX_MEMORY_POLICY=""` handling per platform if you want to bypass.
+* Budget checks (weights-vs-limit, shard caps) apply only when a policy is
+  present in the environment.
+
 
 ## Development
 
