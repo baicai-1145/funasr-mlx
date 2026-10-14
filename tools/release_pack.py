@@ -27,6 +27,8 @@ LICENSE_APACHE = "https://www.apache.org/licenses/LICENSE-2.0"
 
 CLASSIC = {
     "sensevoice": "sensevoice",
+    "fsmn-vad": "fsmn-vad",
+    "campplus": "campplus",
     "paraformer": "paraformer",
     "whisper": "whisper-tiny",
     "whisper-large-v3": "whisper-large-v3",
