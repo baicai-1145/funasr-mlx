@@ -22,7 +22,6 @@ __all__ = ["swiglu", "initialize_rope"]
 
 
 def swiglu(gate: mx.array, x: mx.array) -> mx.array:
-    """mlx-lm ``models/activations.py`` -- silu(gate) * x."""
     return nn.silu(gate) * x
 
 

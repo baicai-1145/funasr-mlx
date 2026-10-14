@@ -561,7 +561,6 @@ class FSMN(nn.Module):
 # decision logic (pure Python; mirrors funasr/models/fsmn_vad_streaming/model.py)
 # --------------------------------------------------------------------------- #
 class WindowDetector:
-    """``WindowDetector``: sliding window frame-state machine."""
 
     def __init__(
         self, window_size_ms: int, sil_to_speech_time: int, speech_to_sil_time: int,
@@ -600,7 +599,6 @@ class WindowDetector:
     def detect_one_frame(
         self, frame_state: FrameState, frame_count: int = 0, cache: dict | None = None
     ) -> AudioChangeState:
-        """Feed one frame; returns the resulting transition."""
         del frame_count, cache  # unused, kept for signature parity
         if frame_state == FrameState.SPEECH:
             current = 1
@@ -633,7 +631,6 @@ class WindowDetector:
 
 @dataclass
 class SpeechSegment:
-    """``E2EVadSpeechBufWithDoa`` (DOA is always 0 for fsmn-vad)."""
 
     start_ms: int = 0
     end_ms: int = 0
@@ -654,7 +651,6 @@ class SpeechSegment:
 
 @dataclass
 class FrameProb:
-    """``E2EVadFrameProb`` (populated only when ``output_frame_probs`` is set)."""
 
     noise_prob: float = 0.0
     speech_prob: float = 0.0
@@ -665,7 +661,6 @@ class FrameProb:
 
 @dataclass
 class VadStats:
-    """``Stats`` with the waveform buffers reduced to sample counts."""
 
     sil_pdf_ids: tuple[int, ...]
     max_end_sil_frame_cnt_thresh: int
@@ -822,7 +817,6 @@ class FsmnVadModel(nn.Module):
         stats.data_buf_len = max(0, stats.data_buf_all_len - offset)
 
     def reset_detection(self, cache: dict) -> None:
-        """``ResetDetection``: soft reset after a detected endpoint."""
         stats = cache["stats"]
         stats.continous_silence_frame_count = 0
         stats.latest_confirmed_speech_frame = 0
@@ -841,7 +835,6 @@ class FsmnVadModel(nn.Module):
 
     # -- feature / score stages ---------------------------------------------
     def compute_decibel(self, waveform: mx.array, cache: dict, frame_count: int) -> None:
-        """``ComputeDecibel``: 10*log10(frame energy + 1e-6) per 10 ms frame."""
         if frame_count <= 0:
             return
         stats = cache["stats"]
@@ -880,7 +873,6 @@ class FsmnVadModel(nn.Module):
         stats.decibel.extend(float(v) for v in decibel.tolist())
 
     def compute_scores(self, feats: mx.array, cache: dict) -> None:
-        """``ComputeScores``: run the FSMN encoder and append the probabilities."""
         stats = cache["stats"]
         scores = self.encoder(feats, cache=cache["encoder"])
         if scores.shape[1] != feats.shape[1]:
@@ -905,7 +897,6 @@ class FsmnVadModel(nn.Module):
 
     # -- endpoint bookkeeping ------------------------------------------------
     def pop_data_buf_till_frame(self, frame_idx: int, cache: dict) -> None:
-        """``PopDataBufTillFrame``: advance the sample cursor to ``frame_idx``."""
         stats = cache["stats"]
         frame_shift_length = self.vad_opts.frame_shift_length
         stalled = 0
@@ -936,7 +927,6 @@ class FsmnVadModel(nn.Module):
         end_point_is_sent_end: bool,
         cache: dict,
     ) -> None:
-        """``PopDataToOutputBuf``: open/extend/close an output segment."""
         stats = cache["stats"]
         self.pop_data_buf_till_frame(start_frm, cache=cache)
 
@@ -1053,7 +1043,6 @@ class FsmnVadModel(nn.Module):
 
     # -- per-frame decision --------------------------------------------------
     def get_frame_state(self, t: int, cache: dict) -> FrameState:
-        """``GetFrameState``: decibel gate + FSMN log-odds comparison."""
         stats = cache["stats"]
         if t >= len(stats.decibel):
             return FrameState.SIL
@@ -1100,7 +1089,6 @@ class FsmnVadModel(nn.Module):
     def detect_one_frame(
         self, cur_frm_state: FrameState, cur_frm_idx: int, is_final_frame: bool, cache: dict
     ) -> None:
-        """``DetectOneFrame``: the full state machine step for a single frame."""
         stats = cache["stats"]
         if cur_frm_state == FrameState.SPEECH:
             if abs(1.0) > self.vad_opts.fe_prior_thres:
@@ -1218,7 +1206,6 @@ class FsmnVadModel(nn.Module):
             self.reset_detection(cache=cache)
 
     def detect_common_frames(self, cache: dict) -> int:
-        """``DetectCommonFrames``: replay the block backwards (streaming)."""
         stats = cache["stats"]
         if stats.vad_state_machine == VadStateMachine.END_POINT_DETECTED:
             return 0
@@ -1230,7 +1217,6 @@ class FsmnVadModel(nn.Module):
         return 0
 
     def detect_last_frames(self, cache: dict) -> int:
-        """``DetectLastFrames``: replay the block backwards, final frame flagged."""
         stats = cache["stats"]
         if stats.vad_state_machine == VadStateMachine.END_POINT_DETECTED:
             return 0

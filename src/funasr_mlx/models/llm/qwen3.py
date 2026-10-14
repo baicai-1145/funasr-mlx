@@ -29,7 +29,6 @@ __all__ = ["Qwen3ModelArgs", "Qwen3Model"]
 
 @dataclass
 class Qwen3ModelArgs:
-    """HF ``Qwen3Config`` fields the architecture reads."""
 
     model_type: str = "qwen3"
     hidden_size: int = 1024
@@ -123,7 +122,6 @@ class Qwen3TransformerBlock(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    """The Qwen3 transformer (embeddings + blocks + norm), LM head separate."""
 
     def __init__(self, args: Qwen3ModelArgs) -> None:
         super().__init__()

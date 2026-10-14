@@ -101,7 +101,6 @@ class QuantizationSpec:
     target_groups: tuple[tuple[str, int], ...] = ()
 
     def bits_for(self, module_path: str) -> int:
-        """Bit width for ``module_path``: longest matching override, else ``bits``."""
         best_prefix = ""
         best_bits = self.bits
         for prefix, value in self.target_bits:
@@ -110,7 +109,6 @@ class QuantizationSpec:
         return best_bits
 
     def group_for(self, module_path: str) -> int:
-        """Group size for ``module_path``: longest matching override, else the default."""
         best_prefix = ""
         best_group = self.group_size
         for prefix, value in self.target_groups:
@@ -119,7 +117,6 @@ class QuantizationSpec:
         return best_group
 
     def bits_for_weight(self, name: str) -> int:
-        """Bit width for checkpoint tensor ``name`` (strips the ``.weight`` tail)."""
         module = name[: -len(".weight")] if name.endswith(".weight") else name
         return self.bits_for(module)
 
@@ -197,7 +194,6 @@ class QuantizationSpec:
         return payload
 
     def selects(self, module_path: str) -> bool:
-        """Whether ``module_path`` sits under one of the declared prefixes."""
         return any(module_path.startswith(target) for target in self.targets)
 
     def selects_embedding(self, module_path: str) -> bool:
@@ -305,14 +301,12 @@ class QuantizationSpec:
         return self._fits(module)
 
     def _fits(self, module: nn.Module) -> bool:
-        """Whether the group size divides the module's input dimension."""
         weight = getattr(module, "weight", None)
         return weight is not None and weight.ndim == 2 and weight.shape[1] % self.group_size == 0
 
 
 @dataclass
 class QuantizationResult:
-    """What :func:`apply_quantization` actually did to a model."""
 
     bits: int
     group_size: int

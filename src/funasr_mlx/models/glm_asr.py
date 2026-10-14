@@ -46,12 +46,10 @@ def glmasr_audio_config_from_dict(data: dict[str, Any]) -> GlmAsrAudioConfig:
 
 
 def _downsample_length(n: int) -> int:
-    """One stride-2 conv (kernel 3, padding 1): floor((L + 1) / 2)."""
     return (n + 1) // 2
 
 
 class _Block(mxnn.Module):
-    """Pre-norm block, Llama naming, partial RoPE on q/k."""
 
     def __init__(self, cfg: GlmAsrAudioConfig) -> None:
         super().__init__()
@@ -71,7 +69,6 @@ class _Block(mxnn.Module):
 
 
 class _Attn(mxnn.Module):
-    """q/v/o with bias, k without; partial RoPE (first half of head dim)."""
 
     def __init__(self, cfg: GlmAsrAudioConfig) -> None:
         super().__init__()

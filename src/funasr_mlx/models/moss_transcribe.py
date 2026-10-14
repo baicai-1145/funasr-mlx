@@ -23,7 +23,6 @@ from .llm.qwen3 import Qwen3ForCausalLM
 
 
 class _HfWhisperBlock(mxnn.Module):
-    """HF WhisperEncoderLayer: pre-norm MHA + GELU MLP, LN with bias."""
 
     def __init__(self, d: int, heads: int, ffn: int) -> None:
         super().__init__()
@@ -88,7 +87,6 @@ class HfWhisperEncoder(mxnn.Module):
         self.layer_norm = mxnn.LayerNorm(d)  # top-level (HF 5.x)
 
     def __call__(self, mel: mx.array) -> mx.array:
-        """mel: ``(F, T)``; returns ``(1, T/2, d)``."""
         x = mxnn.GELU()(self.conv1(mx.transpose(mel[None], (0, 2, 1))))
         x = mxnn.GELU()(self.conv2(x))  # (1, T/2, d) channels-last
         x = x + self.embed_positions.weight[: x.shape[1]]

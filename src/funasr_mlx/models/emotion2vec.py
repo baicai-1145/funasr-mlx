@@ -128,7 +128,6 @@ def _as_float(value: Any, name: str) -> float:
 
 
 def get_slopes(n: int) -> list[float]:
-    """``get_alibi.get_slopes`` (verbatim, including the power-of-2 branch)."""
 
     def power_of_2(n: int) -> list[float]:
         start = 2 ** (-(2 ** -(math.log2(n) - 3)))
@@ -198,7 +197,7 @@ class SequentialStack(OrderedModules):
 
 
 class ModuleListStack(nn.Module):
-    """``nn.ModuleList``; children are registered under their decimal index."""
+    """``nn.ModuleList``; children registered under their decimal index."""
 
     def __init__(self, modules: Sequence[nn.Module]) -> None:
         super().__init__()
@@ -337,7 +336,6 @@ def parse_feature_encoder_spec(spec: str) -> list[tuple[int, int, int]]:
 
 
 def conv_feature_output_length(samples: int, layers: Sequence[tuple[int, int, int]]) -> int:
-    """``floor((L - kernel) / stride + 1)`` folded over the stack."""
     length = int(samples)
     for _, kernel, stride in layers:
         length = math.floor((length - kernel) / stride + 1)
@@ -430,7 +428,6 @@ class ConvFeatureExtraction(nn.Module):
         self.spec = tuple(tuple(entry) for entry in layers)
 
     def __call__(self, x: mx.array) -> mx.array:
-        """``x`` is ``(B, samples)``; returns ``(B, C, frames)``."""
         if x.ndim != 2:
             raise ValueError(f"expected (B, samples), got shape {x.shape}")
         y = x[:, None, :]  # BxT -> Bx1xT
@@ -472,7 +469,6 @@ class SamePad(OrderedModules):
 
 
 class PositionalBlock(OrderedModules):
-    """One of the ``conv_pos_depth`` blocks (``audio.py:88-100``)."""
 
     def __init__(self, dim: int, kernel_size: int, groups: int, eps: float) -> None:
         super().__init__(
@@ -672,7 +668,6 @@ class AltBlock(nn.Module):
 
 
 class BlockEncoder(nn.Module):
-    """``modules.py:63-95`` ``BlockEncoder`` (the prenet / context encoder)."""
 
     def __init__(
         self, blocks: Sequence[nn.Module], norm: nn.Module | None, layer_norm_first: bool
@@ -685,12 +680,6 @@ class BlockEncoder(nn.Module):
     def __call__(
         self, x: mx.array, alibi_bias: mx.array | None, alibi_scale: mx.array | None = None
     ) -> mx.array:
-        """``modules.py:72-93``.
-
-        ``learned_alibi_scale_per_layer`` is honoured here: block ``i`` uses
-        ``alibi_scale[i]`` when the leading dimension is greater than 1, otherwise
-        the single shared row is folded in once by the caller.
-        """
         if self.norm is not None and not self.layer_norm_first:
             x = self.norm(x)
         for index, block in enumerate(self.blocks):
@@ -854,7 +843,6 @@ class Emotion2VecConfig:
 # modality encoder
 # --------------------------------------------------------------------------- #
 class AudioEncoder(nn.Module):
-    """``ModalitySpecificEncoder`` specialised to ``AUDIO`` (``audio.py``)."""
 
     def __init__(self, config: Emotion2VecConfig) -> None:
         super().__init__()

@@ -94,7 +94,6 @@ class GlmAsrThinker(mxnn.Module):
         pad_span: int,
         caches: list[KVCache] | None = None,
     ) -> mx.array:
-        """Replace the pad run with tower output; one decoder pass (shared splice)."""
         lm = self.language_model
         return splice_and_forward(
             token_ids, audio_embeds, pad_span, caches,

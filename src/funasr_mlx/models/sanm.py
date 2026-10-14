@@ -237,7 +237,6 @@ def convert_checkpoint_tensor(name: str, array: mx.array, rule: str | None = Non
 
 
 def _rule_for_name(name: str) -> str:
-    """Name-based fallback for :func:`convert_checkpoint_tensor`."""
     for pattern, rule in _LAYOUT_RULES:
         if pattern.search(name):
             return rule
@@ -340,12 +339,6 @@ def checkpoint_state_dict(module: mxnn.Module) -> dict[str, mx.array]:
 
 
 def _resolve_child(module: mxnn.Module, key: str) -> Any:
-    """Fetch a child by mapping key, falling back to a plain attribute.
-
-    Numeric keys (``"0"``, ``"1"``, ...) live in the mapping storage and are
-    reachable through ``Module.__getattr__``, but going through the mapping
-    explicitly keeps this independent of MLX's attribute fallbacks.
-    """
     if key in dict.keys(module):
         return dict.__getitem__(module, key)
     return getattr(module, key)
@@ -702,7 +695,6 @@ class MultiHeadedAttentionSANM(mxnn.Module):
         return self._split_heads(q), self._split_heads(k), self._split_heads(v), v
 
     def forward_fsmn(self, inputs: mx.array, mask: mx.array | None) -> mx.array:
-        """Depth-wise FSMN memory branch; ``inputs`` is ``(B, T, D)`` (MLX NLC)."""
         b = inputs.shape[0]
         if mask is not None:
             mask = mx.reshape(mask, (b, -1, 1))

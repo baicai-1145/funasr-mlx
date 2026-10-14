@@ -53,7 +53,6 @@ except Exception:  # pragma: no cover
 
 @dataclass(frozen=True)
 class AwqConfig:
-    """Search hyper-parameters (mlx-lm defaults)."""
 
     n_grid: int = 20
     max_shrink: float = 0.5
@@ -115,7 +114,6 @@ def _to_mx(value):
 
 
 def _linears(block):
-    """The block's Linear modules as ``{path: module}`` (nested paths)."""
     import mlx.nn as nn
 
     return {
@@ -126,7 +124,6 @@ def _linears(block):
 
 
 def _is_first_norm(module, block) -> bool:
-    """Whether ``module`` is the block's input_layernorm (by identity)."""
     return module is getattr(block, "input_layernorm", None)
 
 
@@ -199,7 +196,6 @@ class MultiBlockCapture:
             self._installed.append(orig)
 
     def observe(self, run: Callable[[], Any]) -> None:
-        """Run one utterance's prefill; catchers stop growing at the cap."""
         run()
 
     def uninstall(self) -> None:
@@ -216,7 +212,6 @@ class MultiBlockCapture:
 
 
 class AwqBlockQuantizer:
-    """Scale+clip search for one transformer block, on captured input."""
 
     def __init__(self, block, config: AwqConfig | None = None) -> None:
         import mlx.nn as nn
@@ -355,7 +350,6 @@ class AwqBlockQuantizer:
 
     # -- clip search ---------------------------------------------------------- #
     def search_clip(self, name: str, module, quantize_func) -> Any:
-        """Per-group shrink search for one Linear; returns the clipped weight."""
         import mlx.core as mx
 
         cfg = self.config
@@ -433,7 +427,6 @@ class AwqBlockQuantizer:
 
     # -- orchestration ---------------------------------------------------------- #
     def optimize(self, quantize_func, *, do_clip: bool = True) -> dict:
-        """Run the full scale+clip pass on this block. Returns a small report."""
         import mlx.core as mx
         from mlx.utils import tree_flatten
 

@@ -58,7 +58,6 @@ def qwen3asr_config_from_dict(data: dict[str, Any]) -> Qwen3ASRConfig:
 
 
 class Qwen3ASR(mxnn.Module):
-    """Audio tower + Qwen3 decoder with the audio span spliced in."""
 
     def __init__(self, config: Qwen3ASRConfig) -> None:
         super().__init__()
@@ -104,7 +103,6 @@ class Qwen3ASR(mxnn.Module):
         pad_span: int,
         caches: list[KVCache] | None = None,
     ) -> mx.array:
-        """Replace the ``pad_span`` audio run with tower output (shared splice)."""
         th = self.thinker
         cfg = self.config
         return splice_and_forward(

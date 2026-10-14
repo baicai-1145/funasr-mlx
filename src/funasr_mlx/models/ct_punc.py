@@ -550,7 +550,6 @@ class SanmAttention(nn.Module):
             )
 
     def forward_qkv(self, x: mx.array) -> tuple[mx.array, mx.array, mx.array, mx.array]:
-        """Return ``(q_h, k_h, v_h, v)`` as ``(B, H, T, d_k)`` / ``(B, T, C)``."""
         b, t, _ = x.shape
         q_k_v = self.linear_q_k_v(x)
         q, k, v = mx.split(q_k_v, 3, axis=-1)
@@ -610,7 +609,6 @@ class SanmAttention(nn.Module):
 
 
 class SanmEncoderLayer(nn.Module):
-    """``EncoderLayerSANM`` (pre-norm branch used by ct-punc)."""
 
     def __init__(self, in_size: int, size: int, config: SanmEncoderConfig) -> None:
         super().__init__()
@@ -679,7 +677,6 @@ class SanmEncoder(nn.Module):
         return self._output_size
 
     def __call__(self, xs_pad: mx.array, ilens: Sequence[int] | mx.array):
-        """Return ``(hidden, output_lengths)`` for ``xs_pad`` of shape ``(B, T, D)``."""
         if xs_pad.ndim != 3:
             raise ValueError(f"expected (B, T, D) input, got shape {xs_pad.shape}")
         maxlen = xs_pad.shape[1]
@@ -712,7 +709,6 @@ class CtPuncModel(nn.Module):
     def punc_forward(
         self, text: mx.array, text_lengths: Sequence[int] | mx.array | None = None
     ) -> mx.array:
-        """Return punc logits of shape ``(B, T, punc_size)``."""
         if text.ndim != 2:
             raise ValueError(f"expected (B, T) token ids, got shape {text.shape}")
         if text_lengths is None:
@@ -816,7 +812,6 @@ def expand_word_level_punc(
 
 @dataclass(frozen=True)
 class PuncResult:
-    """Result of :meth:`CtPuncPunctuator.punctuate`."""
 
     text: str
     punc_array: list[int] | None = None
@@ -859,7 +854,6 @@ class CtPuncPunctuator:
 
     # -- prediction ----------------------------------------------------------
     def predict_punc_ids(self, token_ids: Sequence[int]) -> list[int]:
-        """Run encoder/decoder over one mini-sentence and argmax the classes."""
         ids = [int(i) for i in token_ids]
         if not ids:
             return []

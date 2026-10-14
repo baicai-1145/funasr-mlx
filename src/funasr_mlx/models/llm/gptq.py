@@ -192,11 +192,6 @@ class AffineQuantizer:
         return self.cast(scale), self.cast(bias)
 
     def codes(self, values: np.ndarray, scale: np.ndarray, bias: np.ndarray) -> np.ndarray:
-        """Codes for ``values`` ``[rows, cols]`` under per-row ``scale``/``bias``.
-
-        A 1-D ``values`` is treated as a single column (``[rows, 1]``), which is
-        the shape the GPTQ inner loop works in.
-        """
         values = np.asarray(values, dtype=np.float32)
         single = values.ndim == 1
         if single:
@@ -219,7 +214,6 @@ class AffineQuantizer:
     def dequantize(
         self, codes: np.ndarray, scale: np.ndarray, bias: np.ndarray
     ) -> np.ndarray:
-        """``scale * code + bias`` -- the affine reconstruction the runtime does."""
         codes = np.asarray(codes, dtype=np.float32)
         single = codes.ndim == 1
         if single:
@@ -232,11 +226,6 @@ class AffineQuantizer:
     def quantize(
         self, values: np.ndarray, scale: np.ndarray, bias: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(codes, reconstruction)`` for ``values`` under given params.
-
-        The output rank follows the input: a 1-D column gives 1-D results, which
-        is the shape the GPTQ inner loop works in.
-        """
         single = np.asarray(values).ndim == 1
         codes = self.codes(values, scale, bias)
         reconstruction = self.dequantize(codes, scale, bias)
@@ -246,12 +235,6 @@ class AffineQuantizer:
 
     # -- packing ------------------------------------------------------------ #
     def pack(self, codes: np.ndarray) -> np.ndarray:
-        """Pack ``uint8`` codes into ``uint32`` words, MLX's bit order.
-
-        Element ``j`` of a group occupies bits ``bits * (j % pack_factor)`` of
-        word ``j // pack_factor`` -- little-endian, lowest code in the lowest
-        bits, as documented for ``mx.quantize``.
-        """
         codes = np.asarray(codes)
         if codes.ndim != 2:
             raise ValueError("Codes must be a 2-D array")
@@ -268,7 +251,6 @@ class AffineQuantizer:
         return words
 
     def unpack(self, words: np.ndarray, columns: int) -> np.ndarray:
-        """Inverse of :meth:`pack` (used by the tests and the verifier)."""
         words = np.asarray(words, dtype=np.uint32)
         codes = np.zeros((words.shape[0], columns), dtype=np.uint8)
         mask = np.uint32(self.max_code)
@@ -280,12 +262,10 @@ class AffineQuantizer:
 
 
 def pack_codes(codes: np.ndarray, *, bits: int = 4) -> np.ndarray:
-    """Convenience wrapper: pack ``uint8`` codes with MLX's bit order."""
     return AffineQuantizer(bits=bits).pack(codes)
 
 
 def unpack_codes(words: np.ndarray, columns: int, *, bits: int = 4) -> np.ndarray:
-    """Convenience wrapper: unpack ``uint32`` words with MLX's bit order."""
     return AffineQuantizer(bits=bits).unpack(words, columns)
 
 
@@ -586,7 +566,6 @@ def gptq_quantize(
         def stored_params(
             index: int, current: np.ndarray = running
         ) -> tuple[np.ndarray, np.ndarray]:
-            """Parameters for stored group ``index`` on this chunk's rows."""
             if index in static_params:
                 return static_params[index]
             if index not in dynamic_params:
@@ -597,7 +576,6 @@ def gptq_quantize(
             return dynamic_params[index]
 
         def params_for(column: int) -> tuple[np.ndarray, np.ndarray]:
-            """Parameters for the stored group that column ``column`` lands in."""
             stored_column = column if permutation is None else int(permutation[column])
             return stored_params(stored_column // config.group_size)
 
@@ -744,7 +722,6 @@ def rtn_quantize(
 
 
 def _rtn_reconstruct(weight: np.ndarray, quantizer: AffineQuantizer) -> np.ndarray:
-    """Reconstruct ``weight`` by quantizing each group independently."""
     group = quantizer.group_size
     out = np.empty_like(weight, dtype=np.float32)
     for start in range(0, weight.shape[1], group):
@@ -808,7 +785,6 @@ class HessianAccumulator:
             raise ValueError("columns must be positive")
 
     def add(self, activations: np.ndarray, language: str = "") -> int:
-        """Accumulate one batch of activations ``[N, columns]`` (float32 math)."""
         activations = np.asarray(activations, dtype=np.float32)
         if activations.ndim == 3:
             # [batch, sequence, hidden] -> rows
@@ -904,7 +880,6 @@ class HessianAccumulator:
         balance: bool,
         cap_fraction,
     ) -> dict[str, float]:
-        """Multipliers to apply to the raw ``X^T X`` sums, after weighting."""
         weighted = self._weighted_effective_rows(
             language_weights, balance=balance, cap_fraction=cap_fraction
         )
@@ -917,12 +892,6 @@ class HessianAccumulator:
         balance: bool = True,
         cap_fraction: float | None = None,
     ) -> dict[str, float]:
-        """Per-language mass shares that ``language_weights`` would produce.
-
-        The brief's guard is on the *share*, so a reweighting has to be checked
-        against it before the Hessian is built -- otherwise a rebalance can push
-        a language past the bound and only surface as a failed run much later.
-        """
         scaled = self._weighted_effective_rows(
             language_weights, balance=balance, cap_fraction=cap_fraction
         )
@@ -998,7 +967,6 @@ class HessianAccumulator:
         return {name: value / total for name, value in rows.items()}
 
     def save(self, path) -> None:
-        """Write the accumulator as an ``.npz`` (one array per language)."""
         payload = {"rows": np.array(sorted(self.rows.items()), dtype=object)}
         for language, product in self.sums.items():
             payload["sum:" + (language or "_")] = product

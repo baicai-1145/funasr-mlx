@@ -37,7 +37,6 @@ __all__ = ["AdaptorConfig", "FunASRNanoConfig", "FunASRNano", "nano_config_from_
 
 @dataclass
 class AdaptorConfig:
-    """``Transformer`` adaptor (llm_asr/adaptor.py) fields."""
 
     downsample_rate: int = 1
     encoder_dim: int = 512
@@ -122,7 +121,6 @@ from .sanm import PositionwiseFeedForward  # noqa: E402
 
 
 class _EncoderLayer(mxnn.Module):
-    """ESPnet post-norm ``EncoderLayer`` (transformer/encoder.py)."""
 
     def __init__(self, size: int, self_attn: mxnn.Module, feed_forward: mxnn.Module) -> None:
         super().__init__()

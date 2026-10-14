@@ -87,7 +87,6 @@ def _fetch(url: str, dest: Path, *, quiet: bool = False) -> bool:
 
 
 def _fetch_all(urls: list[str], dest: Path) -> bool:
-    """Try each mirror in order; return True when one succeeds."""
     for url in urls:
         if _fetch(url, dest, quiet=True):
             return True
@@ -102,11 +101,6 @@ def download(
     owner: str = OWNER,
     skip_existing: bool = True,
 ) -> Path:
-    """Download one repo (or one variant subdirectory) into ``dest``.
-
-    Returns the local model directory (``dest/<repo>`` or
-    ``dest/<repo>/<variant>``).
-    """
     global OWNER
     old_owner, OWNER = OWNER, owner
     try:

@@ -155,13 +155,6 @@ class ModuleStack(mxnn.Module):
         return [str(index) for index in range(dict.__len__(self))]
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Chain blocks with canonical ``nn.Sequential`` semantics.
-
-        The leading argument is threaded through the chain while the remaining
-        positional arguments and keywords stay fixed.  Feeding a block's return
-        value back as ``*args`` would unpack an ``mx.array`` along axis 0 and hand
-        the next block ``B`` separate arguments, which only works at batch size 1.
-        """
         if not args:
             raise TypeError(f"{type(self).__name__}.__call__() requires at least one argument")
         head, *rest = args
@@ -376,7 +369,6 @@ def load_strict(
 
 
 def _resolve_child(module: mxnn.Module, key: str) -> Any:
-    """Fetch a child by mapping key, falling back to a plain attribute."""
     if key in dict.keys(module):
         return dict.__getitem__(module, key)
     return getattr(module, key)
@@ -848,7 +840,6 @@ class TextDecoder(mxnn.Module):
 
     @property
     def mask(self) -> mx.array:
-        """The ``(n_ctx, n_ctx)`` lower-triangular ``-inf`` mask."""
         return self._mask
 
     def _weight_dtype(self) -> mx.Dtype:
@@ -899,11 +890,6 @@ class TextDecoder(mxnn.Module):
 
 
 class Whisper(mxnn.Module):
-    """``whisper.model.Whisper``.
-
-    Only inference helpers are provided; :func:`greedy_decode` and
-    :func:`detect_language` in this module consume this class.
-    """
 
     def __init__(self, dims: ModelDimensions | None = None) -> None:
         super().__init__()

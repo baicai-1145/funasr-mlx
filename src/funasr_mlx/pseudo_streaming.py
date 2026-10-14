@@ -72,7 +72,6 @@ class PseudoStream:
     _last_emitted_seconds: float = -1.0
 
     def push(self, samples: np.ndarray) -> StreamEvent | None:
-        """Feed more audio; returns the event when a re-transcribe ran."""
         self._buffer.append(np.asarray(samples, dtype=np.float32))
         self._n += len(samples)
         seconds = self._n / self.sample_rate
@@ -81,7 +80,6 @@ class PseudoStream:
         return self._emit(seconds, is_final=False)
 
     def close(self) -> StreamEvent:
-        """Final pass over the whole buffer: equals offline output."""
         return self._emit(self._n / self.sample_rate, is_final=True)
 
     def stream(self) -> Iterator[StreamEvent]:

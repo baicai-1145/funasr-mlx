@@ -83,7 +83,6 @@ class HeadTarget:
         return cls(module=module, kind=kind, name=head_path, hidden_size=int(weight.shape[1]))
 
     def weight(self) -> np.ndarray:
-        """The head's ``[out, in]`` weight, as float32 on the host."""
         import mlx.core as mx
 
         weight = self.module.weight
@@ -125,7 +124,6 @@ class HeadActivationCollector:
 
     # -- hook management ---------------------------------------------------- #
     def install(self) -> None:
-        """Patch the head so its input is captured on every call."""
         if self._original is not None:
             raise RuntimeError("The collector is already installed")
         owner = self.target.module
@@ -163,7 +161,6 @@ class HeadActivationCollector:
         self._original = original
 
     def uninstall(self) -> None:
-        """Restore the head to its original callable (idempotent)."""
         if self._original is None:
             return
         if self._patched_owner is not None:
@@ -182,7 +179,6 @@ class HeadActivationCollector:
 
     # -- capture ------------------------------------------------------------ #
     def _capture(self, x: Any) -> None:
-        """Record one head input ``[batch, sequence, hidden]`` (or 2-D)."""
         import mlx.core as mx
 
         hidden = x.astype(mx.float32)
@@ -202,7 +198,6 @@ class HeadActivationCollector:
             self._pending.append(array)
 
     def flush(self, language: str) -> int:
-        """Fold every pending batch into the Hessian under ``language``."""
         if not self._pending:
             return 0
         rows = 0
@@ -215,11 +210,6 @@ class HeadActivationCollector:
         return rows
 
     def observe(self, *, language: str, run: Callable[[], Any]) -> int:
-        """Run ``run()`` (a real prefill) and accumulate its head inputs.
-
-        The hook is installed for the duration of the call only, so a model can
-        be calibrated head by head without the hooks interfering.
-        """
         self._pending.clear()
         with self:
             run()
@@ -227,11 +217,9 @@ class HeadActivationCollector:
 
     # -- results ------------------------------------------------------------ #
     def hessian(self, *, balance: bool = True, cap_fraction: float | None = None) -> np.ndarray:
-        """The calibration Hessian, language-balanced by default."""
         return self.accumulator.hessian(balance=balance, cap_fraction=cap_fraction)
 
     def language_mass(self, **kwargs) -> dict[str, float]:
-        """Per-language share of the Hessian mass (the 30% guard's check)."""
         return self.accumulator.language_mass(**kwargs)
 
     def report(self) -> dict:

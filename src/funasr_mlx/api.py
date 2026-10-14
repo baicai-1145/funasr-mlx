@@ -59,7 +59,6 @@ __all__ = ["transcribe", "TranscribeWorker", "download_model", "pseudo_stream"]
 
 
 class TranscribeWorker:
-    """Long-lived transcription worker (use inside an existing guard)."""
 
     def __init__(self, checkpoint: str | Path, *, family: str | None = None, max_tokens: int = 96):
         from .llm_asr import LlmAsrTranscriber, resolve_family
@@ -76,7 +75,6 @@ class TranscribeWorker:
         return self._impl.transcribe_file(audio).to_dict()
 
     def pseudo_stream(self, chunk_seconds: float = 1.0):
-        """Pseudo-streaming handle over this resident model."""
         from .pseudo_streaming import PseudoStream
 
         return PseudoStream(
@@ -92,7 +90,6 @@ def transcribe(
     family: str | None = None,
     max_tokens: int = 96,
 ) -> dict[str, Any]:
-    """One-shot transcription via the guarded CLI subprocess."""
     if guarded_child_active():
         worker = TranscribeWorker(model, family=family, max_tokens=max_tokens)
         return worker.transcribe(audio)

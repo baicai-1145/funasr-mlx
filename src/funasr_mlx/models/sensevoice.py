@@ -434,7 +434,6 @@ class SenseVoiceSmall(mxnn.Module):
         use_itn: bool,
         text_norm: str | None,
     ) -> mx.array:
-        """Build the four metadata prefix frames, shape ``(B, 4, input_size)``."""
         if isinstance(language, str):
             lid = LID_DICT.get(language, 0)
         else:
@@ -458,10 +457,6 @@ class SenseVoiceSmall(mxnn.Module):
         use_itn: bool = False,
         text_norm: str | None = None,
     ) -> tuple[mx.array, mx.array]:
-        """Frontend is out of scope: ``speech`` is already ``(B, T, 560)`` fbank.
-
-        Returns ``(encoder_out, encoder_out_lens)``.
-        """
         if speech.ndim == 2:
             speech = mx.expand_dims(speech, 0)
         batch_size = speech.shape[0]
@@ -479,7 +474,6 @@ class SenseVoiceSmall(mxnn.Module):
         text_norm: str | None = None,
         ban_emo_unk: bool = False,
     ) -> mx.array:
-        """Log-softmax CTC posteriors over the *whole* sequence (incl. prefix)."""
         encoder_out, _ = self.encode(speech, speech_lengths, language, use_itn, text_norm)
         logits = self.ctc.log_softmax(encoder_out)
         if ban_emo_unk:

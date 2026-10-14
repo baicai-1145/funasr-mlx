@@ -71,7 +71,6 @@ class MemoryReport:
 
 
 def guarded_child_active() -> bool:
-    """Validate an inherited supervisor lock, nonce and parent identity."""
     try:
         descriptor = int(os.environ["FUNASR_MLX_GUARD_FD"])
         metadata = json.loads(os.pread(descriptor, 4096, 0))
@@ -235,7 +234,6 @@ def run_guarded(
     timeout_seconds: float = 300,
     configure_device: bool = True,
 ) -> MemoryReport:
-    """Run Python -m module or Python script.py under one lock and watchdog."""
     import fcntl
 
     policy = policy or MemoryPolicy()

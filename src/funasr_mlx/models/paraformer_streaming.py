@@ -111,7 +111,6 @@ def _attn_forward_chunk(attn: Any, x: mx.array, cache: dict | None, chunk_size, 
 
 
 def _encoder_layer_forward_chunk(layer, x, cache, chunk_size, look_back):
-    """``scama/encoder.py::EncoderLayerSANM.forward_chunk`` (pre-norm branch)."""
     residual = x
     if layer._normalize_before:
         x = layer.norm1(x)
@@ -240,11 +239,6 @@ def _cross_attn_forward_chunk(
 def _dec_layer_forward_chunk(
     layer, tgt: mx.array, memory: mx.array, fsmn_cache, opt_cache, chunk_size, look_back: int
 ):
-    """``paraformer/decoder.py::DecoderLayerSANM.forward_chunk`` (190-235).
-
-    Order is FFN FIRST, then decoder self-attention (FSMN), then cross-attention --
-    the reverse of the encoder layer.
-    """
     residual = tgt
     if layer._normalize_before:
         tgt = layer.norm1(tgt)
@@ -274,7 +268,6 @@ def _dec_layer_forward_chunk(
 # --------------------------------------------------------------------------- #
 @dataclass
 class ParaformerStreamingConfig(ParaformerConfig):
-    """Streaming-specific knobs; everything else mirrors offline Paraformer."""
 
     chunk_size: Sequence[int] = (0, 10, 5)
     encoder_chunk_look_back: int = 0
@@ -334,7 +327,6 @@ class ParaformerStreaming(mxnn.Module):
     def encode_chunk(
         self, speech: mx.array, speech_lengths: mx.array, cache: dict, is_final: bool = False
     ) -> tuple[mx.array, mx.array]:
-        """``scama/encoder.py::SANMEncoder.forward_chunk`` (496-549)."""
         xs_pad = speech * (self.encoder.output_size() ** 0.5)
         xs_pad = self.encoder.embed(xs_pad, cache["encoder"])
         if cache["encoder"]["tail_chunk"]:

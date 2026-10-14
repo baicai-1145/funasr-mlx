@@ -192,7 +192,6 @@ class LlmAsrTranscriber:
 
     # ---------- main entry ----------
     def transcribe_samples(self, samples: np.ndarray) -> str:
-        """Raw-waveform transcription (pseudo-streaming adapter entry)."""
         embeds, fake_len = self._audio_embeds(samples)
         text, _ = self._decode(embeds, fake_len)
         return text
@@ -305,7 +304,6 @@ class LlmAsrTranscriber:
 
 
 def resolve_family(checkpoint: str | Path, family: str | None) -> str:
-    """Map user-provided family (or None) onto a load_model family."""
     if family:
         aliases = {
             "qwen3-asr": "qwen3-asr",

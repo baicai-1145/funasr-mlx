@@ -472,17 +472,10 @@ upstream corruption is resolved.
 
 
 def _cif_stream(device: mx.array | None):
-    """Resolve the evaluation device; ``None`` means the deterministic default."""
     return CIF_DEVICE if device is None else device
 
 
 def _cif_wo_hidden_v1_impl(alphas: mx.array) -> tuple[mx.array, mx.array]:
-    """The math of ``cif_wo_hidden_v1`` with no device context of its own.
-
-    Private so the public wrapper can hold one CPU stream around the *whole*
-    computation; a nested or partially applied context would let an
-    intermediate land on the default device.
-    """
     # The reference accumulates in float64 and only then narrows:
     #   torch.cumsum(prefix_sum, dim=1, dtype=torch.float64).to(torch.float32)
     # ``mx.cumsum(..., dtype=...)`` casts the input to that type before summing,
@@ -537,7 +530,6 @@ def cif_wo_hidden_v1(
 def _cif_v1_impl(
     hidden: mx.array, alphas: mx.array, threshold: float = 1.0
 ) -> tuple[mx.array, mx.array]:
-    """The math of :func:`cif_v1` with no device context of its own."""
     fires, fire_idxs = _cif_wo_hidden_v1_impl(alphas)
     b, t, d = hidden.shape
 
@@ -891,7 +883,6 @@ class ParaformerSANMDecoder(mxnn.Module):
 # --------------------------------------------------------------------------- #
 @dataclass
 class ParaformerOutputs:
-    """Bundle returned by :meth:`Paraformer.forward`."""
 
     encoder_out: mx.array
     encoder_out_lens: mx.array

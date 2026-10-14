@@ -747,7 +747,6 @@ def _bf16_carrier_to(array: np.ndarray, dtype: str) -> np.ndarray:
 
 
 def _safetensors_source_files(source: Path) -> tuple[Path, ...]:
-    """Resolve one safetensors file or an HF-style sharded directory."""
     if source.is_file():
         return (source,)
     index = source / "model.safetensors.index.json"
@@ -863,7 +862,6 @@ def _convert_safetensors_source(
         return destination / f"model-{shard_number:05d}.safetensors"
 
     def flush() -> None:
-        """Write the buffered full-precision tensors as one single-code shard."""
         nonlocal pending, buffered
         if not pending:
             return
@@ -880,12 +878,6 @@ def _convert_safetensors_source(
         pending, buffered = {}, 0
 
     def flush_quantized() -> None:
-        """Write the buffered quantized tensors as one mixed-width shard.
-
-        A W4A16 shard holds 4-byte packed codes beside 2-byte group scales, so
-        it needs a per-tensor code map rather than the single ``code`` the
-        full-precision path uses.
-        """
         nonlocal quant_pending, quant_codes, quant_buffered
         if not quant_pending:
             return

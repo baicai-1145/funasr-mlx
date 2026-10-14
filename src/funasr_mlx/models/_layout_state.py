@@ -28,11 +28,6 @@ import mlx.core as mx
 import mlx.nn as mxnn
 
 def layout_rule(module: mxnn.Module, names: Mapping[str, str]) -> str:
-    """Rule for the owning module TYPE, looked up in the family's rule-name map.
-
-    ``names`` maps {"conv1d": ..., "conv2d": ..., "identity": ...}; each family
-    keeps its own public rule-name strings (they are API surface).
-    """
     if isinstance(module, mxnn.Conv1d):
         return names["conv1d"]
     if isinstance(module, mxnn.Conv2d):
@@ -53,7 +48,6 @@ def convert_tensor(name: str, array: mx.array, rule: str, names: Sequence[str]) 
 
 
 def resolve_child(module: Any, key: str) -> Any:
-    """Fetch a child by mapping key, falling back to a plain attribute."""
     child = module.get(key)
     if child is None:
         child = getattr(module, key, None)
@@ -61,7 +55,6 @@ def resolve_child(module: Any, key: str) -> Any:
 
 
 def assign(module: mxnn.Module, parts: Sequence[str], array: mx.array) -> None:
-    """Set ``array`` at a dotted attribute path."""
     node = module
     for part in parts[:-1]:
         child = node.get(part)

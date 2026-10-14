@@ -56,7 +56,6 @@ def qwen3asr_audio_config_from_dict(data: dict[str, Any]) -> Qwen3ASRAudioConfig
 
 
 def _get_feat_extract_output_lengths(n: int) -> int:
-    """3 x stride-2 convs, each ``ceil(L / 2)`` (padding 1, kernel 3)."""
     out = n
     for _ in range(3):
         out = (out + 1) // 2
@@ -76,7 +75,6 @@ class _Conv2dStride2(mxnn.Module):
 
 
 class _AudioAttention(mxnn.Module):
-    """``Qwen3ASRAudioAttention``: plain MHA with biases, windowed by mask."""
 
     def __init__(self, cfg: Qwen3ASRAudioConfig) -> None:
         super().__init__()
@@ -101,7 +99,6 @@ class _AudioAttention(mxnn.Module):
 
 
 class _AudioEncoderLayer(mxnn.Module):
-    """``Qwen3ASRAudioEncoderLayer``: pre-norm LayerNorm + GELU FFN."""
 
     def __init__(self, cfg: Qwen3ASRAudioConfig) -> None:
         super().__init__()
@@ -123,7 +120,6 @@ class _AudioEncoderLayer(mxnn.Module):
 
 
 class _Sinusoids(mxnn.Module):
-    """``SinusoidsPositionEmbedding``: fixed sin/cos table (Whisper style)."""
 
     def __init__(self, length: int, channels: int) -> None:
         super().__init__()
@@ -166,7 +162,6 @@ class Qwen3ASRAudioEncoder(mxnn.Module):
         self.proj2 = mxnn.Linear(cfg.d_model, cfg.output_dim)
 
     def __call__(self, mel: mx.array) -> mx.array:
-        """mel: ``(F, T)`` fp32; returns ``(1, T', output_dim)``."""
         cfg = self.cfg
         t = mel.shape[1]
 
