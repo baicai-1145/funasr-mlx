@@ -38,6 +38,8 @@ from typing import Any, Iterator, Sequence
 import mlx.core as mx
 from mlx import nn as mxnn
 
+from ._layout_state import layout_rule as _layout_rule
+
 __all__ = [
     "BasicResBlock",
     "CAMPlusConfig",
@@ -213,6 +215,11 @@ CONV1D_LAYOUT = "conv1d_torch_out_ink_to_mlx_out_ki"
 CONV2D_LAYOUT = "conv2d_torch_out_inkij_to_mlx_out_kij"
 
 
+def _conv_rule(module: mxnn.Module) -> str:
+    names = {"conv1d": CONV1D_LAYOUT, "conv2d": CONV2D_LAYOUT, "identity": IDENTITY_LAYOUT}
+    return _layout_rule(module, names)
+
+
 def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_LAYOUT):
     """Convert one PyTorch checkpoint tensor into the MLX layout.
 
@@ -243,13 +250,6 @@ def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_L
         raise ValueError(f"unknown layout rule {rule!r} for parameter {name!r}")
     return array
 
-
-def _conv_rule(module: mxnn.Module) -> str:
-    if isinstance(module, mxnn.Conv1d):
-        return CONV1D_LAYOUT
-    if isinstance(module, mxnn.Conv2d):
-        return CONV2D_LAYOUT
-    return IDENTITY_LAYOUT
 
 
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:

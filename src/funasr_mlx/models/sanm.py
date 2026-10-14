@@ -85,6 +85,10 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import mlx.core as mx
 from mlx import nn as mxnn
 
+from ._layout_state import convert_tensor as _convert_tensor
+from ._layout_state import layout_rule as _layout_rule
+
+
 __all__ = [
     "CONV1D_LAYOUT",
     "CONV2D_LAYOUT",
@@ -191,6 +195,9 @@ IDENTITY_LAYOUT = "identity"
 CONV1D_LAYOUT = "conv1d_torch_out_ink"
 CONV2D_LAYOUT = "conv2d_torch_out_ink"
 
+_RULE_NAMES = {"conv1d": CONV1D_LAYOUT, "conv2d": CONV2D_LAYOUT, "identity": IDENTITY_LAYOUT}
+_IDENTITY_RULES = (IDENTITY_LAYOUT, None)
+
 _LAYOUT_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(^|\.)fsmn_block\.weight$"), CONV1D_LAYOUT),
     (re.compile(r"(^|\.)cif_conv1d\.weight$"), CONV1D_LAYOUT),
@@ -214,42 +221,19 @@ class CheckpointKeyError(KeyError):
     """
 
 
+
 def _module_layout_rule(module: mxnn.Module) -> str:
-    """Layout rule derived from the *owning module type*, not from its name."""
-    if isinstance(module, mxnn.Conv1d):
-        return CONV1D_LAYOUT
-    if isinstance(module, mxnn.Conv2d):
-        return CONV2D_LAYOUT
-    return IDENTITY_LAYOUT
+    return _layout_rule(module, _RULE_NAMES)
 
 
 def convert_checkpoint_tensor(name: str, array: mx.array, rule: str | None = None) -> mx.array:
-    """Convert one PyTorch checkpoint tensor into the MLX layout.
-
-    ``Linear``/``LayerNorm``/``Embedding`` weights already match.  Only
-    ``Conv1d``/``Conv2d`` kernels need a transpose.
-
-    Parameters
-    ----------
-    name:
-        Parameter name, used only when ``rule`` is not supplied.
-    array:
-        The tensor to convert.
-    rule:
-        Explicit rule name (from :func:`flatten_state_dict_with_rules`).  Preferred
-        over name matching because it cannot mis-convert a renamed submodule.
-    """
+    """Convert one PyTorch checkpoint tensor into the MLX layout (shared kernel)."""
     if rule is None:
         rule = _rule_for_name(name)
-    if rule == CONV1D_LAYOUT:
-        # torch: (out, in/groups, k) -> mlx: (out, k, in/groups)
-        return mx.transpose(array, (0, 2, 1))
-    if rule == CONV2D_LAYOUT:
-        # torch: (out, in, kh, kw) -> mlx: (out, kh, kw, in)
-        return mx.transpose(array, (0, 2, 3, 1))
-    if rule not in (IDENTITY_LAYOUT, None):
+    out = _convert_tensor(name, array, rule, (CONV1D_LAYOUT, CONV2D_LAYOUT))
+    if out is array and rule not in _IDENTITY_RULES:
         raise ValueError(f"unknown layout rule {rule!r} for parameter {name!r}")
-    return array
+    return out
 
 
 def _rule_for_name(name: str) -> str:

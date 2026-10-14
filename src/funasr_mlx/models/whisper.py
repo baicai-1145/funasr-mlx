@@ -66,6 +66,8 @@ from typing import Any, Iterator, Sequence
 
 import mlx.core as mx
 from mlx import nn as mxnn
+
+from ._layout_state import layout_rule as _layout_rule
 from mlx.nn import log_softmax
 
 __all__ = [
