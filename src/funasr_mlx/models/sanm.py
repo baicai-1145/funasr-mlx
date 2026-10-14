@@ -1,79 +1,6 @@
 """Shared SANM (self-attention with memory) blocks for the MLX ASR ports.
 
-This module is the single source of truth for every block that FunASR's
-``paraformer`` and ``sense_voice`` models share.  It is a direct port of the
-following reference files (read-only, ``/Users/baicai1145/repos/funasr``):
-
-* ``funasr/models/sanm/attention.py``
-  (``MultiHeadedAttentionSANM``, ``MultiHeadedAttentionSANMDecoder``,
-  ``MultiHeadedAttentionCrossAtt``)
-* ``funasr/models/sanm/encoder.py`` (``EncoderLayerSANM``)
-* ``funasr/models/sanm/positionwise_feed_forward.py``
-  (``PositionwiseFeedForwardDecoderSANM``)
-* ``funasr/models/transformer/positionwise_feed_forward.py``
-  (``PositionwiseFeedForward``)
-* ``funasr/models/transformer/layer_norm.py`` (``LayerNorm``, ``eps=1e-12``)
-* ``funasr/models/transformer/embedding.py``
-  (``PositionalEncoding``, ``SinusoidalPositionEncoder``)
-* ``funasr/models/transformer/utils/subsampling.py``
-  (``Conv2dSubsampling``, ``Conv2dSubsampling2``)
-* ``funasr/models/transformer/utils/nets_utils.py`` (``make_pad_mask``)
-* ``funasr/models/scama/utils.py`` (``sequence_mask``)
-* ``funasr/models/transformer/utils/repeat.py`` (``repeat``/``MultiSequential``)
-
-Design rules enforced here
---------------------------
-1. **Checkpoint-compatible parameter names.**  FunASR keeps its repeated
-   encoder/decoder layers in ``nn.Sequential`` (via ``repeat``) or in
-   ``nn.ModuleList``.  Both produce ``"<parent>.<index>.<leaf>"`` keys in a
-   PyTorch ``state_dict``.  MLX's ``nn.Sequential``/``nn.ModuleList`` would add
-   an extra ``layers`` level, so :class:`ModuleStack` registers children under
-   their bare numeric index instead.
-2. **Explicit tensor-layout conversion rules.**  PyTorch stores conv weights as
-   ``(out, in/groups, k)`` / ``(out, in, kh, kw)``; MLX uses
-   ``(out, k, in/groups)`` / ``(out, kh, kw, in)``.  See
-   :data:`LAYOUT_RULES` and :func:`convert_checkpoint_tensor`.
-   MLX convolutions are also **channels-last** (``mx.conv1d`` consumes ``NLC``,
-   ``mx.conv2d`` consumes ``NHWC``) whereas PyTorch uses ``NCL``/``NCHW``; every
-   conv call site here therefore feeds a channels-last tensor and pads the time
-   axis explicitly with ``axis=1``.
-3. **Strict loading.**  :func:`load_strict` refuses missing/unexpected keys and
-   never silently skips a mismatch.
-4. **Inference only.**  Every dropout in the reference is an identity in eval
-   mode and is therefore elided; stochastic depth (train-time only) is dropped.
-   No training losses are ported.
-
-Known deviations and deliberately not-ported surface
------------------------------------------------------
-These are intentional and reviewed; none of them is a silent partial
-implementation.
-
-* **Streaming / chunked paths are not ported.**  ``forward_chunk``,
-  ``mask_shfit_chunk``, ``mask_chunk_predictor``, ``forward_one_step``,
-  ``forward_asf2``, ``SANMVadEncoder`` / ``SANMEncoder.forward(vad_indexes=...)``,
-  ``mask_att_chunk_encoder``, and the ``fa-zh`` timestamp prediction are
-  training/streaming-only in the reference and are absent here.
-* **``MultiHeadedAttentionSANMDecoder`` cache layout deviates (NLC, not NCL).**
-  The reference keeps the streaming cache in ``(b, d, L)`` (``cache = x`` taken
-  before the transpose); this port keeps ``(b, L, d)``.  Internally consistent
-  and behaviourally identical for offline inference, but it is a *different
-  runtime contract* from the reference's export/streaming path, so a cache
-  written by one cannot be read by the other.  Two further reference branches
-  are streaming-only and therefore absent: the
-  ``if x.size(1) != inputs.size(1): inputs = inputs[:, -1, :]`` step-position
-  guard, and populating the cache on the first (``cache is None``) call.
-* **``decimate_mask`` emulates ``x_mask[:, :, :-2:2][:, :, :-2:2]``** with an
-  explicit index list plus ``mx.take(..., axis=-1)``.  Behaviourally identical to
-  the slice, just not as cheap.
-* **CIF accumulation is float32.**  The reference uses float64 in
-  ``cif_v1``/``cif_wo_hidden_v1``; the peak-index thresholding in ``cif_v1`` is
-  the sensitive part and can differ by a hair near an exact tie.
-* **``cif_v1`` clamps ``max_label_len = min(max_label_len, t)``**; the reference
-  has no clamp (``cif_predictor.py:880``).  It is unreachable in practice since
-  ``alphas <= 1`` per frame plus at most one 0.45 tail gives ``floor(sum) <= t``.
-* **``PositionalEncoding(reverse=True)``** flips the position index where the
-  reference reverses an already-built table of length ``max_len``.  Identical for
-  ``reverse=False``, the only configured path.
+Full port notes (upstream file map, design rules, known deviations): docs/port-notes/sanm.py.md
 """
 
 from __future__ import annotations
@@ -271,22 +198,7 @@ def _flatten(module: mxnn.Module, prefix: str = "") -> tuple[dict[str, mx.array]
 def attention_blocked(mask: mx.array) -> mx.array:
     """Boolean ``True`` where attention is blocked, for any mask dtype.
 
-    The reference does ``mask.unsqueeze(1).eq(0)`` on the **float** 1.0/0.0 mask
-    that FunASR's ``sequence_mask`` produces (its ``dtype`` defaults to
-    ``torch.float32``), so ``.eq(0)`` marks the padded positions.
-
-    Rather than re-implementing ``== 0`` on a dtype-agnostic array -- whose
-    answer depends on MLX's comparison type promotion between ``bool`` and
-    ``int``, i.e. whether ``False == 0`` is honoured -- this branches on the
-    mask's own dtype explicitly:
-
-    * ``bool`` masks mean "True = valid", so blocked is the logical negation.
-      ``logical_not`` is unambiguous and needs no promotion.
-    * numeric masks reproduce the reference's ``.eq(0)`` exactly, comparing
-      within a single dtype.
-
-    Both conversions are exact for the float masks this port actually produces,
-    so behaviour is unchanged while a boolean mask stops being silently ignored.
+    Full notes: docs/port-notes/functions.md :: attention_blocked
     """
     if mask.dtype == mx.bool_:
         blocked = mx.logical_not(mask)
@@ -298,16 +210,7 @@ def attention_blocked(mask: mx.array) -> mx.array:
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
     """Collect tensors from a module tree.
 
-    ``mlx.nn.Module`` **subclasses ``dict``** (``class Module(dict)`` in
-    ``mlx/nn/layers/base.py``).  Its ``__setattr__`` routes arrays, dicts, lists,
-    tuples and *sub-modules* (a ``Module`` is itself a ``dict``, so
-    ``isinstance(v, dict)`` holds) into the **mapping** storage via
-    ``self[key] = val``; everything else -- ints, strings, dataclasses and the
-    ``_``-prefixed configuration attached here -- goes to ``__dict__``.
-
-    Consequently ``vars(module)`` contains **no tensors at all** (only
-    ``_no_grad``/``_training``), and flattening through it silently yields an
-    empty dict.  The mapping storage is walked instead.
+    Full notes: docs/port-notes/functions.md :: _flatten_into
     """
     for key, value in dict.items(module):
         name = f"{prefix}.{key}" if prefix else key
@@ -362,32 +265,7 @@ def load_strict(
 ) -> list[str]:
     """Load ``tensors`` into ``module``, refusing any key mismatch.
 
-    Parameters
-    ----------
-    module:
-        Destination module.
-    tensors:
-        ``{name: array}`` using FunASR/PyTorch names, e.g.
-        ``encoder.encoders.0.self_attn.fsmn_block.weight``.  The *arrays* must
-        already be in MLX layout unless ``convert=True``.
-    prefix:
-        Optional key prefix shared by ``tensors`` (e.g. ``"model."``).
-    convert:
-        ``True`` when ``tensors`` come straight from a PyTorch ``state_dict``;
-        applies :func:`convert_checkpoint_tensor` (conv weight transposes).
-    dtype:
-        Optional cast applied *after* the layout conversion.
-
-    Returns
-    -------
-    list[str]
-        The names that were loaded, sorted.
-
-    Raises
-    ------
-    CheckpointKeyError
-        If any expected parameter is missing or any checkpoint tensor is
-        unexpected.  Shape mismatches raise ``ValueError``.
+    Full notes: docs/port-notes/functions.md :: load_strict
     """
     expected, rules = flatten_state_dict_with_rules(module)
     expected_names = {f"{prefix}{k}" for k in expected}
@@ -429,16 +307,7 @@ def load_strict(
 class ModuleStack(mxnn.Module):
     """A stack of sibling modules with PyTorch-compatible parameter names.
 
-    FunASR's ``repeat()`` builds an ``nn.Sequential`` (``encoders.0.<leaf>``) and
-    the SenseVoice encoder uses ``nn.ModuleList`` (``encoders.0.<leaf>``).
-    MLX's own containers would nest everything under ``layers``, so children
-    are registered directly under their numeric index.
-
-    ``mlx.nn.Module`` subclasses ``dict``, so those children live in the mapping
-    storage under the keys ``"0"``, ``"1"``, ... -- which is exactly the PyTorch
-    ``state_dict`` spelling.  The dunders below therefore forward to ``dict`` and
-    must not shadow it: MLX internally calls ``dst[key]``, ``key in dst`` and
-    ``dst.items()``, so ``__getitem__`` accepts string keys unchanged.
+    Full notes: docs/port-notes/functions.md :: ModuleStack
     """
 
     def __init__(self, blocks: Sequence[mxnn.Module]) -> None:
@@ -526,17 +395,7 @@ class Float32LayerNorm(mxnn.LayerNorm):
 class PositionalEncoding(mxnn.Module):
     """``funasr.models.transformer.embedding.PositionalEncoding``.
 
-    Fixed sin/cos table scaled by ``sqrt(d_model)``.  The table is not a
-    checkpoint parameter in FunASR (it is a plain attribute there), so it is
-    regenerated on demand here instead of being stored as a buffer.
-
-    **Interleaved, not concatenated.**  The reference writes
-    ``pe[:, 0::2] = sin(...)`` / ``pe[:, 1::2] = cos(...)``, i.e. even columns
-    hold sin and odd columns hold cos.  Do not "simplify" this into a
-    ``concatenate([sin, cos])``: that is a different table and every column from
-    ``d_model // 2`` onward would be wrong.  Note that
-    :class:`SinusoidalPositionEncoder` genuinely *does* concatenate (see
-    ``embedding.py``), so the two must not be made to match.
+    Full notes: docs/port-notes/functions.md :: PositionalEncoding
     """
 
     def __init__(

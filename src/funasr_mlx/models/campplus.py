@@ -1,31 +1,6 @@
 """Native MLX inference port of FunASR's CAM++ speaker-verification model.
 
-Reference (read-only, ``/Users/baicai1145/repos/funasr``):
-
-* ``funasr/models/campplus/components.py``
-* ``funasr/models/campplus/model.py``
-* ``funasr/models/campplus/template.yaml`` (published defaults)
-
-This module is deliberately **self-contained** (it duplicates the small
-container / checkpoint helpers instead of importing ``funasr_mlx.models.sanm``)
-so that it stays correct while the ASR modules are under review, and so that it
-adds no dependency between model files.
-
-Layout rules that matter
-------------------------
-1. **Channels-last convolutions.**  MLX's ``Conv1d`` consumes ``NLC`` and
-   ``Conv2d`` consumes ``NHWC``; PyTorch uses ``NCL``/``NCHW``.  This port keeps
-   the network's *activation* layout channels-last and therefore transposes only
-   the reference's two explicit layout changes (FCM's final reshape and
-   ``output_level == "frame"``).  See :meth:`FCM.__call__`.
-2. **BatchNorm buffers.**  ``nn.BatchNorm{1,2}d`` carries ``weight``/``bias``
-   (only when ``affine=True``) plus the persistent buffers ``running_mean`` and
-   ``running_var``, and a torch-only scalar ``num_batches_tracked`` that MLX has
-   no equivalent for.  :func:`load_strict` reports the dropped torch-only buffer
-   explicitly instead of skipping it silently.
-3. **Statistics pooling.**  The reference reduces the *time* axis of an NCL
-   tensor.  This port reduces axis 1 of an NLC tensor, which is exactly the same
-   quantity; see :class:`StatsPool`.
+Full port notes (upstream file map, design rules, known deviations): docs/port-notes/campplus.py.md
 """
 
 from __future__ import annotations
@@ -215,22 +190,7 @@ def _conv_rule(module: mxnn.Module) -> str:
 def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_LAYOUT):
     """Convert one PyTorch checkpoint tensor into the MLX layout.
 
-    Parameters
-    ----------
-    name:
-        Parameter name, used only for diagnostics and error messages.
-    array:
-        The tensor to convert.
-    rule:
-        **Explicit** rule name, normally taken from
-        :func:`flatten_state_dict`, which derives it from the owning module type.
-        There is deliberately **no name-based inference**: in this architecture the
-        same attribute name (``linear``) belongs to an ``nn.Linear`` in
-        ``DenseLayer``/``TransitLayer``'s sibling and to a ``nn.Conv1d`` in
-        ``TDNNLayer``, so guessing from the name could silently apply the wrong
-        transpose.  The default is identity, and a wrong choice surfaces as a
-        clear shape mismatch at load time rather than as a silently mis-converted
-        weight.
+    Full notes: docs/port-notes/functions.md :: convert_checkpoint_tensor
     """
     if rule == CONV1D_LAYOUT:
         # torch (out, in/groups, k)  ->  MLX (out, k, in/groups)
@@ -247,16 +207,7 @@ def convert_checkpoint_tensor(name: str, array: mx.array, rule: str = IDENTITY_L
 def _flatten_into(module: Any, prefix: str, tensors: dict, rules: dict) -> None:
     """Collect tensors from a module tree.
 
-    ``mlx.nn.Module`` **subclasses ``dict``** (``class Module(dict)`` in
-    ``mlx/nn/layers/base.py``).  Its ``__setattr__`` routes arrays, dicts, lists,
-    tuples and *sub-modules* (a ``Module`` is itself a ``dict``, so
-    ``isinstance(v, dict)`` holds) into the **mapping** storage via
-    ``self[key] = val``; everything else -- ints, strings, dataclasses and the
-    ``_``-prefixed configuration attached here -- goes to ``__dict__``.
-
-    Consequently ``vars(module)`` contains **no tensors at all** (only
-    ``_no_grad``/``_training``), and flattening through it silently yields an
-    empty dict.  The mapping storage is walked instead.
+    Full notes: docs/port-notes/functions.md :: _flatten_into
     """
     for key, value in dict.items(module):
         name = f"{prefix}.{key}" if prefix else key
@@ -363,31 +314,7 @@ def load_strict(
 ) -> LoadReport:
     """Load ``tensors`` into ``module``, refusing any key mismatch.
 
-    Parameters
-    ----------
-    module:
-        Destination module.
-    tensors:
-        ``{name: array}`` using FunASR/PyTorch names, e.g.
-        ``xvector.block1.tdnnd1.cam_layer.linear1.weight``.  Arrays must
-        already be in MLX layout unless ``convert=True``.
-    prefix:
-        Optional shared key prefix (e.g. ``"model."``).
-    convert:
-        ``True`` when ``tensors`` come straight from a PyTorch ``state_dict``.
-    dtype:
-        Optional cast applied after the layout conversion.
-    allow_torch_only_buffers:
-        Accept (and report) torch-only BatchNorm scalars such as
-        ``num_batches_tracked``, which MLX does not model.  Set ``False`` to make
-        their presence an error.
-
-    Raises
-    ------
-    CheckpointKeyError
-        On missing or unexpected keys (other than the allowed buffers).
-    ValueError
-        On any shape mismatch.
+    Full notes: docs/port-notes/functions.md :: load_strict
     """
     report = flatten_state_dict(module)
     expected = {f"{prefix}{k}": v for k, v in report.tensors.items()}
@@ -489,17 +416,7 @@ def _reset_conv_linear(module: mxnn.Module) -> None:
 class BatchNorm(mxnn.Module):
     """``torch.nn.BatchNorm{1,2}d`` for channels-last MLX activations.
 
-    The input's **last** axis must be the channel axis, so statistics are
-    reduced over every leading axis, exactly like the reference reduces over
-    ``(N, L)`` / ``(N, H, W)``.
-
-    Eval semantics (the only mode used for inference) are
-    ``(x - running_mean) / sqrt(running_var + eps) * weight + bias`` with
-    ``running_var`` holding the *unbiased* sample variance, as in PyTorch.
-
-    ``torch.nn.BatchNorm*`` additionally persists a scalar
-    ``num_batches_tracked`` that has no computational role and no MLX analogue;
-    :func:`load_strict` reports it in ``LoadReport.dropped``.
+    Full notes: docs/port-notes/functions.md :: BatchNorm
     """
 
     def __init__(
@@ -663,15 +580,7 @@ class BasicResBlock(mxnn.Module):
 class FCM(mxnn.Module):
     """``components.FCM`` -- the mel-axis feature-map module.
 
-    The reference treats the mel axis as the spatial *height* (it halves it
-    eight times in total via two stride-2 residual stages and a stride-2 conv)
-    and the time axis as the *width*.  Its final
-    ``out.reshape(B, C * H, W)`` therefore folds channels into the mel axis,
-    producing ``(B, m_channels * (feat_dim // 8), T)``.
-
-    Here the tensor is ``(B, H, W, C)`` throughout, so the equivalent result is
-    ``(B, W, C * H)`` obtained by transposing to ``(B, W, C, H)`` before the
-    reshape -- which keeps PyTorch's ``(C, H)`` row-major ordering.
+    Full notes: docs/port-notes/functions.md :: FCM
     """
 
     def __init__(
@@ -1158,20 +1067,7 @@ class CAMPPlus(mxnn.Module):
     def embed(self, speech: mx.array, speech_lengths: mx.array | None = None) -> mx.array:
         """Length-aware embedding extraction for a padded batch.
 
-        Each utterance is cropped to its true length and forwarded
-        **individually**.  A padded batch is deliberately *not* forwarded as-is:
-        CAM++'s convolutional trunk sees the whole time axis, including
-        ``CAMLayer.seg_pooling``, which averages over **all** frames.  Masking
-        only the final statistics pooling therefore cannot undo the leak, and
-        the reference has exactly the same property -- it pools ``hidden`` with no
-        mask at all (``CAMPPlus.forward``).  Cropping per utterance is what makes
-        this equivalent to the reference's real usage, where
-        ``funasr/models/campplus/utils.py::extract_feature`` produces
-        per-utterance features and batching is only a convenience.
-
-        Cost: one forward per utterance instead of one per batch.  For
-        ``output_level="frame"`` the rows have different lengths, so the padded
-        batch is returned unchanged (and callers must mask themselves).
+        Full notes: docs/port-notes/functions.md :: embed
         """
         if speech_lengths is None or self.output_level == "frame":
             return self.forward(speech)

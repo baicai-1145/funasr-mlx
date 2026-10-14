@@ -1,23 +1,6 @@
 """Pseudo-streaming layer for ALL model families.
 
-One protocol, every model: audio arrives in a growing buffer; each
-``push()`` transcribes ``buffer[0:current]`` from scratch (cheap: classic
-models are single-pass; LLM towers are bounded), ``stream()`` yields the
-transient best-effort text. The final ``close()`` output is BIT-IDENTICAL
-to offline transcription of the full audio (same computation by
-construction).
-
-Family support matrix:
-- sensevoice / paraformer / whisper: single forward on the prefix; the
-  text just stops early (no premature punctuation machinery -- non-AR
-  or fixed-vocab decoding does not invent sentence endings).
-- qwen3-asr / glm-asr-nano / moss / fun-asr-nano: re-run tower+prefill+
-  greedy per push (the tail-roll behavior measured at 94.6% char survival,
-  .tmp/opt/LOG.md).
-- ct-punc / campplus / emotion2vec / fsmn-vad: not audio-transcription
-  models; excluded by construction (Transcriber raises).
-
-This module is display-layer glue; it adds no numeric behavior of its own.
+Full port notes (upstream file map, design rules, known deviations): docs/port-notes/pseudo_streaming.py.md
 """
 from __future__ import annotations
 
@@ -49,18 +32,7 @@ class StreamEvent:
 class PseudoStream:
     """Growing-buffer pseudo-streaming over any transcription callable.
 
-    Parameters
-    ----------
-    transcribe_fn:
-        ``f(samples: np.ndarray) -> str`` -- OFFLINE transcription of a
-        waveform prefix. For classic models use
-        :func:`funasr_mlx.pseudo_streaming.classic_transcriber`; for LLM
-        families use :meth:`LlmAsrTranscriber.transcribe_samples` via
-        :func:`llm_transcriber`.
-    sample_rate: expected rate (only for reporting seconds).
-    chunk_seconds: push granularity the caller commits to (informational;
-      the protocol is pull-based, any push size works).
-    min_push_seconds: ignore pushes smaller than this to bound recompute.
+    Full notes: docs/port-notes/functions.md :: PseudoStream
     """
 
     transcribe_fn: Callable[[np.ndarray], str]

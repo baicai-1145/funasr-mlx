@@ -1,31 +1,6 @@
 """W4A16 weight quantization for the LLM-ASR decoder stacks.
 
-Scheme: MLX **affine group quantization** (``mx.quantize``), the same layout
-``mlx-lm`` uses -- per-group ``scales``/``biases`` carried in the checkpoint
-dtype and the weights packed into ``uint32`` words.  ``nn.quantize`` turns each
-selected ``nn.Linear`` into ``nn.QuantizedLinear``, whose ``weight`` /
-``scales`` / ``biases`` parameters are exactly the three tensors the converter
-writes, so a quantized checkpoint strict-loads through the ordinary
-``pipeline.load_model`` path with no special-casing anywhere else.
-
-The whole configuration lives in the native ``config.json``::
-
-    "quantization": {"bits": 4, "group_size": 64, "mode": "affine",
-                     "targets": ["thinker.model.layers."]}
-
-``targets`` are module-path prefixes.  Only ``nn.Linear`` modules under one of
-them are quantized, so the token embeddings, the LM head, every convolution and
-every norm keep the checkpoint dtype.  The converter in
-:mod:`funasr_mlx.checkpoints` applies the *same* rule to tensor names
-(``<module path>.weight``); because the two rules must agree for the strict
-loader to find ``.scales``/``.biases``, any divergence fails loudly at load
-time instead of silently mis-binding weights.
-
-Why decoder-only by default: decode at bs=1 streams the decoder weights once
-per step, so 4-bit decoder weights cut the step's dominant traffic ~3.5x.  The
-audio tower runs once per utterance (prefill side), so quantizing it buys
-memory but not decode time; it is offered as an extra target prefix for
-families whose memory budget needs it.
+Full port notes (upstream file map, design rules, known deviations): docs/port-notes/quant.py.md
 """
 
 from __future__ import annotations
@@ -343,23 +318,7 @@ class QuantizationResult:
 def activation_dtype(module: nn.Module) -> mx.Dtype:
     """The dtype a weight-bearing module emits, for activations to follow.
 
-    A family splices the audio tower's output into the decoder's token stream,
-    and has to cast it to the dtype the decoder expects; every such site reads
-    it off ``embed_tokens``.  For a plain module that is ``weight.dtype``.
-
-    That is WRONG once the module is quantized: ``QuantizedEmbedding`` (and
-    ``QuantizedLinear``) store ``weight`` as packed ``uint32`` *codes*, so
-    ``weight.dtype`` is ``uint32`` and the cast turns the audio embeddings into
-    integers -- silently destroying every one of them before the first decoder
-    layer.  The dtype that actually flows out is the side tensor's (``scales``),
-    which the converter writes in the checkpoint's 16-bit dtype.
-
-    This was a real, hard-to-see failure: a quantized checkpoint produced
-    garbage from step 0 (``'language None<|im_start|><|im_end|>'``) while the
-    bf16 checkpoint was perfect, and it looked exactly like "4-bit is too coarse
-    for the tied embedding" -- so it was chased as an accuracy problem across
-    GPTQ, act-order, w8, and mixed Hessians before the cast was found.  No
-    quantization scheme can fix it; the bug is in the cast.
+    Full notes: docs/port-notes/functions.md :: activation_dtype
     """
     weight = getattr(module, "weight", None)
     if weight is None:

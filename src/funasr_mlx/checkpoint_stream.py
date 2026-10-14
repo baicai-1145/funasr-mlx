@@ -54,15 +54,7 @@ def write_shard(
 ) -> None:
     """Write a whole shard whose tensors are all carried in one dtype.
 
-    ``code`` is the safetensors type code written for every tensor. It exists
-    because a bfloat16 shard has to be written as raw ``uint16`` words under
-    the ``BF16`` code -- NumPy cannot name a bfloat16 dtype, so
-    ``safetensors.numpy.save_file`` would write ``U16`` and the loader would
-    then see integer weights.
-    ``codes`` overrides the code per tensor name, for shards that mix element
-    widths: a W4A16 shard holds 4-byte packed ``uint32`` codes beside 2-byte
-    ``BF16`` group scales. Exactly one of ``code``/``codes`` must be given, and
-    every per-tensor code is still checked against that tensor's element width.
+    Full notes: docs/port-notes/functions.md :: write_shard
     """
     if (code is None) == (codes is None):
         raise ValueError("Pass exactly one of code or codes")

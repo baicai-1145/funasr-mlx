@@ -1,63 +1,6 @@
 """Native MLX inference port of ``emotion2vec_plus_large``.
 
-Source of truth (read-only, pinned):
-
-* ``github.com/ddlBoJack/emotion2vec`` @ ``main``, ``upstream/models/``
-  ``audio.py`` (blob ``329222b2``), ``base.py`` (``c63de01c``),
-  ``emotion2vec.py`` (``fe71a344``), ``modules.py`` (``dae553af``),
-  ``config.py`` (``29eae511``).
-* ``huggingface/emotion2vec/emotion2vec_plus_large`` @ ``6c303ba9``,
-  ``config.yaml``.
-* ``ConvFeatureExtractionModel`` from ``fairseq`` v0.12.2
-  ``fairseq/models/wav2vec/wav2vec2.py``, lines 819-895.  Note this file is
-  *not* ``conv_feature.py`` (that path 404s and is absent from fairseq's
-  history); ``wav2vec2.py`` is where the class lives.
-* Classifier head from the FunASR wrapper
-  ``modelscope/FunASR`` @ ``main``, ``funasr/models/emotion2vec/model.py``
-  (``Emotion2vec.inference``).  The upstream ``emotion2vec.py`` contains only
-  ``Data2VecMultiModel`` and has no head, and the Hub repository ships no
-  ``auto_map``/modeling file, so that wrapper is the only source for it.
-
-Architecture for ``emotion2vec_plus_large`` (from the pinned ``config.yaml``):
-``embed_dim=1024``, ``depth=8``, ``num_heads=16``, ``mlp_ratio=4.0``,
-``norm_eps=1e-5``, ``norm_affine=true``, ``layer_norm_first=false`` (post-norm),
-``feature_encoder_spec='[(512, 10, 5)] + [(512, 3, 2)] * 4 + [(512, 2, 2)] +
-[(512, 2, 2)]'``, ``extractor_mode=layer_norm``, ``conv_bias=false``,
-``normalize=true``, ``conv_pos_depth=5`` / ``conv_pos_width=95`` /
-``conv_pos_groups=16`` / ``conv_pos_pre_ln=false`` (so ``k = max(3, 95 // 5) =
-19``; the conv's ``padding = 9`` already preserves the time axis and
-``SamePad(19)`` is the identity on top of it -- for an even ``k`` fairseq's
-``SamePad`` crops the final time slot instead),
-``prenet_depth=4``, ``num_extra_tokens=10``, ``learned_alibi=false``,
-``learned_alibi_scale=true`` with ``per_head=true`` / ``per_layer=false``,
-``use_alibi_encoder=true``, ``num_alibi_heads=16``, ``alibi_scale=1.0``.
-
-Deliberately excluded (training-only, see :data:`INFERENCE_ONLY_PREFIXES`):
-``modality_encoders.AUDIO.decoder.*`` (:class:`Decoder1d`), the EMA, mask
-construction (``compute_mask``/``apply_mask``/``MaskInfo``), layerdrop,
-drop-path, and every dropout.  At inference they are identities.
-
-Layout rules (checkpoint ``state_dict`` -> MLX)
-
-=========================  =========================  =====================
-key suffix                 PyTorch shape             MLX shape
-=========================  =========================  =====================
-``*.conv_layers.N.0.weight``  ``(out, in//g, K)``     ``(out, K, in//g)``
-``*.project_features.2.weight`` ``(out, in)``       ``(out, in)``
-``*.relative_positional_encoder.N.0.weight`` ``(C, C//g, K)`` ``(C, K, C//g)``
-``*.norm1.weight`` / ``.bias``  ``(D,)``           ``(D,)``
-``*.extra_tokens``         ``(1, N, D)``            ``(1, N, D)``
-``*.alibi_scale``          ``(1, 1, H, 1, 1)``       ``(1, 1, H, 1, 1)``
-=========================  =========================  =====================
-
-Traps this file deliberately avoids: MLX ``nn.Module`` stores children in its
-*dict* part (so the loader uses ``module.parameters()``, never ``vars(module)``);
-``mx.transpose`` takes a single axes sequence; every ``mx.nn.Conv*`` is
-channels-last so each call site transposes ``NCT -> NTC`` and back; ``mx.take``
-is always given an explicit ``axis``.
-
-No numerical test was executed for this port; see the task report for what is
-and is not verified.
+Full port notes (upstream file map, design rules, known deviations): docs/port-notes/emotion2vec.py.md
 """
 
 from __future__ import annotations
@@ -390,17 +333,7 @@ class ConvFeatureBlock(OrderedModules):
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``NCT`` (PyTorch layout); returns ``NCT``.
 
-        The children are registered **directly** under their Sequential indices,
-        so the checkpoint keys are exactly ``conv_layers.<i>.0.weight`` and
-        ``conv_layers.<i>.2.1.weight`` / ``.bias``.  An intermediate attribute
-        would insert a spurious ``.block`` namespace level.
-
-        **Layout contract.** The container is the source's chain and every child
-        does exactly what the source does -- ``TransposeLast`` is a **real**
-        ``swapaxes(-2, -1)`` here, not a marker -- so the chain runs in ``NCT``
-        and only the conv boundary needs help: MLX's ``Conv1d`` is
-        channels-*last*.  Swapping in and back out around it is the single
-        deviation; everything after it is the untouched source order.
+        Full notes: docs/port-notes/functions.md :: __call__
         """
         ntc = self["0"](mx.swapaxes(x, 1, 2))  # NTC conv boundary -> NTC out
         nct = mx.swapaxes(ntc, 1, 2)  # back to NCT for the rest of the chain
@@ -442,18 +375,7 @@ class ConvFeatureExtraction(nn.Module):
 class SamePad(OrderedModules):
     """``fairseq.modules.SamePad`` (non-causal), ``same_pad.py:18-22``.
 
-    ``remove = 1 if k is even else 0`` and the module **crops**, it never pads::
-
-        if self.remove > 0:
-            x = x[:, :, : -self.remove]
-
-    So ``k = 19`` (the large config) is the identity for every length, and an even
-    ``k`` drops the **last** time element.  Combined with the conv's
-    ``padding = k // 2`` the time axis is preserved exactly.
-
-    The reference slice indexes the last axis; :class:`PositionalBlock` therefore
-    presents the tensor as ``NCT`` across this call, because MLX's ``Conv1d``
-    needs channels-last while the crop needs time-last.
+    Full notes: docs/port-notes/functions.md :: SamePad
     """
 
     def __init__(self, kernel_size: int) -> None:
@@ -494,40 +416,7 @@ class PositionalBlock(OrderedModules):
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``NTC`` (channels-last); returns ``NTC``.
 
-        **Layout contract.** MLX's ``Conv1d`` is channels-*last* while the
-        reference works in channels-*first* ``NCT``, so the two cannot literally
-        be fed the same axes:
-
-        ==============  ==========================  ==========================
-        source step     what it needs               what this port feeds it
-        ==============  ==========================  ==========================
-        ``0`` conv      ``NCT`` (N, C, T)           ``NTC`` -- swapped in
-                                                     before the call and back
-        ``1`` SamePad   last axis must be **time**  ``NCT``, so the reference's
-                                                     ``x[:, :, :-remove]``
-                                                     crop applies to T
-        ``3`` LayerNorm last axis must be **C**    ``NTC``, swapped in and back
-        ==============  ==========================  ==========================
-
-        Handing the raw conv an ``NCT`` tensor makes MLX read the channel count
-        as the *length*, which fails loudly whenever the channel count is not
-        divisible by ``groups`` -- e.g. an 8-channel tensor reaching a
-        ``groups=4`` conv as ``(1, 8, 5)``.
-
-        ``TransposeLast`` is a **real** ``swapaxes(-2, -1)``, not a marker, so the
-        untouched source chain runs in ``NCT`` and only the conv boundary
-        deviates:
-
-        ==============  ==========================  ========================
-        source step     what it does                what this port feeds it
-        ==============  ==========================  ========================
-        ``0`` conv      ``NCT`` in, ``NCT`` out     ``NTC`` boundary, swapped
-                                                      in and back out
-        ``1`` SamePad   crop the last axis == **T** ``NCT``
-        ``2``/``4``     ``NCT`` -> ``NTC`` ->       keeps the channels on the
-                       ``NCT``                    norm's last axis
-        ``3`` LayerNorm reduce the channel axis    ``NTC``
-        ==============  ==========================  ========================
+        Full notes: docs/port-notes/functions.md :: __call__
         """
         ntc = self["0"](mx.swapaxes(x, 1, 2))  # NTC conv boundary -> NTC out
         nct = mx.swapaxes(ntc, 1, 2)  # NCT: SamePad's last axis is time
@@ -1135,26 +1024,7 @@ class Emotion2VecModel(nn.Module):
 def flat_parameter_names(module: nn.Module) -> dict[str, mx.array]:
     """``{dotted.name: array}`` for every parameter leaf.
 
-    Uses ``mlx.utils.tree_flatten`` on the module itself -- **not**
-    ``vars(module)``, because ``nn.Module`` is a ``dict`` subclass and
-    ``__setattr__`` stores arrays and submodules in the dict part, so ``vars()``
-    reports zero tensors.
-
-    ``mlx.utils.tree_flatten`` returns a **list of ``(key, value)`` tuples by
-    default**; passing ``destination={}`` is what makes it return the dict form,
-    so calling ``.items()`` on the default return raises.  ``vars(module)`` is
-    not used either, because ``nn.Module`` is a ``dict`` subclass and
-    ``__setattr__`` stores arrays and submodules in the dict part, so ``vars()``
-    reports zero tensors.
-
-    ``module.parameters()`` would also work here: its ``valid_parameter_filter``
-    (``mlx/nn/layers/base.py:235``) is
-    ``isinstance(value, (dict, list, mx.array)) and not key.startswith("_")``,
-    so biases, LayerNorm weights, ``extra_tokens`` and ``alibi_scale`` are all
-    retained.  ``tree_flatten`` is used directly because it needs no filter
-    argument and keeps the full key space.
-
-    Non-array leaves (ints, strings, tuples) are filtered out.
+    Full notes: docs/port-notes/functions.md :: flat_parameter_names
     """
     flat = tree_flatten(module, destination={})
     return {key: value for key, value in flat.items() if isinstance(value, mx.array)}

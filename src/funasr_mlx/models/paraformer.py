@@ -1,39 +1,6 @@
 """MLX inference port of FunASR's ``Paraformer``.
 
-Reference (read-only, ``/Users/baicai1145/repos/funasr``):
-
-* ``funasr/models/sanm/encoder.py`` -> :class:`SANMEncoder`
-* ``funasr/models/paraformer/cif_predictor.py`` -> :class:`CifPredictorV2`,
-  :func:`cif_v1`, :func:`cif_wo_hidden_v1`
-* ``funasr/models/paraformer/decoder.py`` -> :class:`ParaformerSANMDecoder`
-* ``funasr/models/paraformer/model.py`` -> :class:`Paraformer`
-* ``funasr/models/ctc/ctc.py`` -> :class:`CTC`
-* ``funasr/utils/timestamp_tools.py`` ->
-  :func:`ts_prediction_lfr6_standard` (timestamp projection)
-
-What is ported
---------------
-``encoder -> CIF predictor -> SANM decoder -> log_softmax``, i.e. the complete
-non-autoregressive inference path, plus greedy token decoding and the
-CIF-peak-based character timestamps.
-
-What is *not* ported (deliberately)
-----------------------------------
-Label-smoothing / CTC / MAE losses, the training-time ``sampler``
-(``sampling_ratio``), beam search with CTC or n-gram scorers, SpecAug and
-feature extraction.  LoRA variants of the SANM blocks are rejected explicitly
-instead of being silently ignored.
-
-Parity notes
-------------
-* The decoder consumes the **acoustic embeddings produced by the CIF predictor**
-  as ``ys_in_pad``; ``self.embed`` is *not* applied during inference (it is only
-  used by the training sampler), which is why the checkpoint still carries
-  ``decoder.embed.0.weight``.
-* ``CifPredictorV2.tail_process_fn`` reproduces the reference's shift-based mask
-  trick exactly, including the behaviour that a full-length (unpadded) utterance
-  gets a zero tail.
-* ``decoder.decoders2.w_2`` has **no bias** (``PositionwiseFeedForwardDecoderSANM``).
+Full port notes (upstream file map, design rules, known deviations): docs/port-notes/paraformer.py.md
 """
 
 from __future__ import annotations
@@ -509,15 +476,7 @@ def cif_wo_hidden_v1(
 ):
     """Port of ``funasr.models.paraformer.cif_predictor.cif_wo_hidden_v1``.
 
-    ``threshold`` is unused in the reference implementation (it only gates the
-    downstream comparison) but is kept for signature parity.
-
-    Evaluated on :data:`CIF_DEVICE` unless ``device`` overrides it; the whole
-    subtree is forced inside that stream so no intermediate escapes.
-
-    The prefix sum accumulates in ``float64`` and is narrowed to ``float32``
-    afterwards, exactly like the reference's
-    ``torch.cumsum(..., dtype=torch.float64).to(torch.float32)``.
+    Full notes: docs/port-notes/functions.md :: cif_wo_hidden_v1
     """
     with mx.stream(_cif_stream(device)):
         fires, fire_idxs = _cif_wo_hidden_v1_impl(alphas)
@@ -613,19 +572,7 @@ def cif_v1(
 ):
     """Port of ``funasr.models.paraformer.cif_predictor.cif_v1``.
 
-    Returns ``(frame_fires, fires)`` where ``frame_fires`` has shape
-    ``(B, max_label_len, D)``.  ``fires`` is the ``cif_peak`` signal used for
-    timestamps (values ``>= 1.0`` mark an integration boundary).
-
-    The fire ordering, the boundary algebra and the lengths mask are the
-    reference's; only the *device* differs, and it is pinned to
-    :data:`CIF_DEVICE` because the Metal backend has been observed to corrupt
-    the index arrays this depends on.  See :data:`CIF_DEVICE` for the evidence
-    and for why this is not a warmup.  ``device=mx.gpu`` opts back into the GPU
-    path for future verification; it is not known to be correct.
-
-    ``mx.eval`` returns ``None`` here (unlike ``torch``), so the values are
-    read back from the already-materialised arrays rather than its return value.
+    Full notes: docs/port-notes/functions.md :: cif_v1
     """
     with mx.stream(_cif_stream(device)):
         frames, fires = _cif_v1_impl(hidden, alphas, threshold)
@@ -667,22 +614,7 @@ class CifPredictorV2(mxnn.Module):
     def tail_process_fn(self, hidden: mx.array, alphas: mx.array, mask: mx.array | None):
         """Port of ``CifPredictorV2.tail_process_fn`` with ``tail_mask=True``.
 
-        The reference builds ``tail_threshold * (cat([ones, mask]) - cat([mask,
-        zeros]))`` and adds it to a zero-padded ``alphas``.  Working through that
-        shift-and-subtract, the coefficient is ``1.0`` at index ``i`` when
-        ``mask[i-1] != mask[i]``, and at the **appended** slot when
-        ``mask[T-1] == 1``.  So:
-
-        * a **full** mask (the utterance fills the padded window) puts the
-          threshold on the **appended** column -- it is *not* zeroed;
-        * a **padded** mask puts it on the **first padded frame**, and the
-          appended column stays zero.
-
-        Both branches are reproduced verbatim; see
-        ``tests/test_asr.py::test_cif_tail_lands_on_the_first_padded_frame_or_the_appended_slot``.
-
-        ``token_num`` is floored here (reference ``cif_predictor.py:461``), which
-        is the only place a floor belongs.
+        Full notes: docs/port-notes/functions.md :: tail_process_fn
         """
         b, _, d = hidden.shape
         if mask is not None and self._tail_mask:

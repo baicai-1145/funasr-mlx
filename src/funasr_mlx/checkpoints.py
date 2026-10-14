@@ -175,25 +175,7 @@ def quantize_bf16_weight(
 ) -> dict[str, np.ndarray]:
     """Pack one 16-bit weight with MLX group quantization.
 
-    ``array`` arrives as a NumPy carrier: ``uint16`` raw words for a bfloat16
-    source (NumPy has no bfloat16) or a real ``float16`` array. The result is
-    keyed by native parameter name: ``<module>.weight`` (``uint32`` packed
-    codes), ``<module>.scales`` and ``<module>.biases`` (both carried in the
-    source's 16-bit dtype). Those are exactly the three parameter names
-    ``nn.QuantizedLinear`` owns -- note the side tensors hang off the *module*,
-    not off ``weight``.
-
-    The quantization itself runs in MLX (``mx.quantize``) on the device, which
-    is the only implementation guaranteed to agree bit-for-bit with
-    ``mx.quantized_matmul``'s expectations; the input is freed before the
-    packed copy is materialised on the host.
-
-    ``gptq`` switches the *values* to Hessian-based error compensation while
-    keeping the layout identical.  It is a :class:`GptqWeight`: the matrix's
-    ``H = 2 X^T X`` plus the GPTQ hyper-parameters, keyed by native tensor name
-    so a converter can pass one mapping for every quantized tensor it meets.
-    The packing still goes through the same bit order, so nothing downstream
-    changes.
+    Full notes: docs/port-notes/functions.md :: quantize_bf16_weight
     """
     import mlx.core as mx
 
@@ -495,22 +477,7 @@ def convert_checkpoint(
 ) -> CheckpointInfo:
     """Convert a local checkpoint to the native layout, one tensor at a time.
 
-    Two source formats are supported: a torch ZIP (``.pt``, mmap+``weights_only``)
-    and HF/native ``.safetensors``. The safetensors path never materialises the
-    whole state dict: each shard is mmapped, its tensor copied one at a time, and
-    the copy released before the next (see :func:`_convert_safetensors_source`).
-
-    ``source_rule`` selects a declared :data:`SOURCE_RULES` entry, which both
-    renames keys and (via :func:`convert_tensor`) fixes tensor layout. A
-    safetensors source without a rule keeps its parameter names unchanged, so
-    the family's model class must expect exactly those names.
-
-    ``gptq`` supplies per-tensor Hessians (:class:`GptqWeight`) so the selected
-    matrices get Hessian-compensated values instead of round-to-nearest.  The
-    output layout is unchanged either way.
-
-    Only call inside the guarded launcher. No network or pickle fallback.
-    Strict inference loading later checks the architecture's keys and shapes.
+    Full notes: docs/port-notes/functions.md :: convert_checkpoint
     """
     from .memory import MemoryPolicy, guarded_child_active
 
@@ -789,15 +756,7 @@ def _convert_safetensors_source(
 ) -> CheckpointInfo:
     """One-tensor-at-a-time conversion of a safetensors source.
 
-    Memory contract: each shard is mmapped by the safetensors reader, one
-    tensor is copied into a small owned buffer, converted, and released before
-    the next tensor is touched. Peak extra memory is one tensor, not one model.
-
-    Key discipline: every source key is passed through the declared
-    ``source_rule`` (which raises on an unrecognised key) and duplicate native
-    names are rejected, so a renamed or partially-downloaded upstream
-    checkpoint fails the conversion instead of silently producing an
-    incomplete native checkpoint.
+    Full notes: docs/port-notes/functions.md :: _convert_safetensors_source
     """
     from safetensors import safe_open
 

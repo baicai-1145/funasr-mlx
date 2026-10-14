@@ -1,74 +1,6 @@
 """GPTQ (Hessian-based error-compensating PTQ) for the LLM-ASR weight matrices.
 
-Why this module exists
-----------------------
-The tied LM head / token embedding of the qwen3-shaped families is 311-485 MB of
-the bf16 checkpoint and is streamed once per decode step, so it is a hard floor
-on decode speed (task-9's ledger: 44% of the quantized step).  Round-to-nearest
-group quantization of that matrix (``mx.quantize``) is measured to destroy the
-transcript from step 0, so it was left at bf16.
-
-GPTQ (Frantar et al., 2022) keeps the *exact same runtime layout* -- standard MLX
-affine group quantization, so the existing ``QuantizedLinear`` loader, scope
-predicates and verification harness are reused unchanged -- and only computes
-better *values* for the packed codes, ``scales`` and ``biases``.  The error of
-each column is compensated in the not-yet-quantized columns, using the
-second-order statistics of the layer's real input distribution.
-
-Algorithm
----------
-For a target matrix ``W`` of shape ``[out, in]`` and calibration activations
-``X`` of shape ``[N, in]`` collected through the real (frozen) forward pass::
-
-    H   = 2 X^T X                      (float32 accumulation, [in, in])
-    H  += lambda * I,  lambda = damp_percent * mean(diag(H))
-    U   = chol(inv(H))^T               (upper triangular: Hinv = U^T U)
-    for each block of `block_size` columns:
-        for each column i in the block:
-            q_i = quantize(W[:, i])            # the MLX affine quantizer
-            err = (W[:, i] - q_i) / U[i, i]
-            W[:, i:] -= err * U[i, i:]
-
-``act_order`` permutes the columns into descending ``diag(H)`` order first (and
-back afterwards), which matters most for embedding-like matrices with outlier
-directions: the most influential columns are quantized first, so their error is
-compensated by the columns that still have room to absorb it.  Because the
-permutation makes a stored group's columns non-contiguous, act-order is paired
-with **static groups** -- the group parameters are taken once, from the original
-matrix, over each group's own columns in storage order.  Without act-order the
-columns are visited in storage order and the parameters are taken dynamically
-from the running (already error-compensated) matrix, as Frantar describes.
-
-The quantizer is :class:`AffineQuantizer`, a bit-exact port of MLX's
-``affine_quantize`` kernel (``mlx/backend/metal/kernels/quantized.h``), so GPTQ
-output loads through ``mx.quantized_matmul`` with no runtime change at all.  The
-kernel's exact form matters and is *not* the textbook ``(max - min) / 2^b - 1``:
-it picks the sign of the scale by which end of the group has the larger
-magnitude and then renormalizes the scale so that end lands exactly on an
-integer code, which is why a naive reimplementation disagrees with MLX on real
-weights (see ``tests/test_gptq.py``).
-
-The inner loop stores the codes and the group parameters **as it chooses them**.
-Re-deriving the triple afterwards by re-quantizing the finished matrix looks
-equivalent (the triple stays self-consistent) but is not: it moved this
-implementation's layer-output error from 135 to 598 on the module's own test
-problem, destroying most of the gain.  The stored triple is what the error
-metrics are computed on.
-
-Numeric contract
-----------------
-* All Hessian accumulation and the whole GPTQ inner loop run in **float32**,
-  whatever the checkpoint dtype is.
-* ``scales`` and ``biases`` are rounded to the **storage dtype** before the
-  codes are computed from them, so the stored triple dequantizes exactly as the
-  runtime sees it (bit-exact against ``mx.dequantize``).
-* No MLX is required to run the core; ``mlx.core`` is imported lazily, only for
-  the dtype cast of the side tensors (bf16 has no NumPy representation).
-
-This module is deliberately free of model knowledge: it takes a weight, a
-Hessian and a config.  Collecting the Hessian through the real model is the
-caller's job (:class:`HessianAccumulator` provides the accumulation and the
-language-balance guard).
+Full port notes (upstream file map, design rules, known deviations): docs/port-notes/gptq.py.md
 """
 
 from __future__ import annotations
@@ -162,16 +94,7 @@ class AffineQuantizer:
     def params(self, block: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Per-row ``(scale, bias)`` for one group, exactly as the kernel does.
 
-        ``block`` is ``[rows, group_size]`` float32.  The kernel's three steps
-        are reproduced verbatim:
-
-        1. ``scale = max((max - min) / n_bins, eps)``, with ``max`` floored at
-           zero (the kernel initializes ``w_max = 0``);
-        2. the sign is chosen by which end has the larger magnitude -- so the
-           stored bias is that end and the scale's sign matches;
-        3. the scale is renormalized to ``edge / round(edge / scale)``, so the
-           edge value lands exactly on an integer code.  A group whose edge
-           rounds to zero keeps the raw scale and a zero bias.
+        Full notes: docs/port-notes/functions.md :: params
         """
         block = np.asarray(block, dtype=np.float32)
         if block.ndim != 2 or block.shape[1] != self.group_size:
@@ -330,22 +253,7 @@ class GptqConfig:
 class GptqOutcome:
     """The three tensors a quantized checkpoint stores, plus error accounting.
 
-    Two error metrics are reported, and they are not interchangeable:
-
-    ``error``
-        Mean squared **Frobenius** error ``mean((W - Ŵ)^2)`` -- the plain
-        elementwise distance.
-    ``output_error``
-        The quantity GPTQ actually minimizes: ``trace(D (H/2) D^T)`` with
-        ``D = W - Ŵ``, i.e. the total squared error of the layer's *outputs*,
-        ``sum_n ||(W - Ŵ) x_n||^2``, over the calibration activations.  This is
-        the metric that matters for the LM head (it is the logits error), and
-        it is computable from the Hessian alone.
-
-    GPTQ is guaranteed to beat round-to-nearest on ``output_error``, not on
-    ``error``: it deliberately spends unweighted error to buy weighted error.
-    Reporting only the Frobenius number would make a working GPTQ look worse
-    than RTN, so both are always carried.
+    Full notes: docs/port-notes/functions.md :: GptqOutcome
     """
 
     #: ``uint32`` packed codes, ``[out, in * bits / 32]``.
@@ -392,17 +300,7 @@ class GptqOutcome:
 def output_error(weight: np.ndarray, reconstructed: np.ndarray, hessian: np.ndarray) -> float:
     """Total squared layer-output error of a reconstruction, from ``H`` alone.
 
-    For ``D = W - Ŵ`` and ``H = 2 X^T X``::
-
-        sum_n ||D x_n||^2 = trace(D (H/2) D^T)
-
-    so no activations are needed once the Hessian exists -- which is what makes
-    this reportable for a matrix whose calibration set is 600 utterances long.
-
-    Computed in row blocks.  ``trace(D M D^T)`` decomposes as a sum over the
-    ROWS of ``D`` (the ``i``-th row contributes ``D[i] M D[i]^T``), so this is
-    exact -- and it has to be blocked, because materialising ``D @ M @ D.T`` for
-    a 151936-row head needs a 151936x151936 intermediate.
+    Full notes: docs/port-notes/functions.md :: output_error
     """
     difference = np.asarray(weight, dtype=np.float32) - np.asarray(
         reconstructed, dtype=np.float32
@@ -763,16 +661,7 @@ def _pack_triple(
 class HessianAccumulator:
     """``H = 2 X^T X`` in float32, with a per-language balance guard.
 
-    Calibration activations are added per utterance with a ``language`` tag.
-    Because Chinese and English have far more local data than the other eight
-    languages, raw row counts would put ~85% of the Hessian mass on two
-    languages; :meth:`hessian` therefore reweights each language's contribution
-    so every language contributes the same number of effective rows (see the
-    ``balance`` argument), which keeps any single language below the ~30% mass
-    guard the brief sets.
-
-    The accumulator is model-agnostic: the caller decides which activations to
-    feed it.  ``columns`` must be the matrix's input dimension.
+    Full notes: docs/port-notes/functions.md :: HessianAccumulator
     """
 
     columns: int
@@ -816,23 +705,7 @@ class HessianAccumulator:
     ) -> np.ndarray:
         """The combined ``H = 2 X^T X``, optionally language-balanced.
 
-        ``balance=True`` scales each language's contribution to the smallest
-        per-language row count, so every language contributes equally and none
-        can exceed ``1 / n_languages`` of the mass.  ``cap_fraction`` instead
-        caps the largest language's *share* at that fraction by lowering a
-        common row threshold (see :meth:`_effective_rows`), which keeps more of
-        a large corpus while still bounding the dominant language.
-
-        ``language_weights`` multiplies the balanced per-language contributions
-        by explicit factors.  Equal mass is the right *default* (it is what the
-        brief's 30% guard asks for), but it is not the right target when the
-        languages do not quantize equally well: if one language's transcripts
-        diverge far more than another's at the same bit width, equal mass is
-        under-weighting exactly the directions that are failing.  Weighting by
-        measured divergence spends a fixed bit budget where the error actually
-        shows up.  Weights are renormalised, so this redistributes mass between
-        languages without changing the total -- an overall scale would silently
-        alter the damping, which is defined relative to the mean diagonal.
+        Full notes: docs/port-notes/functions.md :: hessian
         """
         if not self.sums:
             raise ValueError("No activations have been accumulated")
