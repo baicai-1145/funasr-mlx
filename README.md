@@ -183,9 +183,11 @@ big checkpoints load. It is NOT a project requirement:
 
 * Library callers (`funasr_mlx.api`, `pipeline.load_model`) load and run
   in-process by default, with no guard and no policy environment.
-* `funasr-mlx` CLI still wraps execution in the guard by default
-  (`--memory-gb`), convenient for constrained machines; set
-  `FUNASR_MLX_MEMORY_POLICY=""` handling per platform if you want to bypass.
+* `funasr-mlx` CLI wraps execution in the guard by default
+  (`--memory-gb`); pass `--no-guard` (or set `FUNASR_MLX_NO_GUARD=1`)
+  to run in-process with library semantics.
+* The 12GB `HARD_CEILING` is a host default, not a law: override with
+  `MemoryPolicy(hard_ceiling=...)` on bigger machines.
 * Budget checks (weights-vs-limit, shard caps) apply only when a policy is
   present in the environment.
 

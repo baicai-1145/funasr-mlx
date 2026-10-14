@@ -16,6 +16,8 @@ import sys
 import time
 from typing import Sequence
 
+#: Default host ceiling. This was this project's dev machine (16GB MBA);
+#: hosts with more memory override it via MemoryPolicy(hard_ceiling=...).
 HARD_CEILING = 12_000_000_000
 MB = 1_000_000
 GB = 1_000_000_000
@@ -35,14 +37,17 @@ class MemoryPolicy:
     headroom: int = 500 * MB
     poll_seconds: float = 0.05
     enforce_min_available: bool = False
+    hard_ceiling: int = HARD_CEILING
 
     def __post_init__(self):
-        for name in ("process_limit", "project_limit", "mlx_limit", "min_available", "headroom"):
+        for name in ("process_limit", "project_limit", "mlx_limit", "min_available", "headroom", "hard_ceiling"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive byte count")
-        if self.project_limit + self.headroom >= HARD_CEILING:
-            raise ValueError("Project budget plus headroom must remain below 12 GB")
+        if self.project_limit + self.headroom >= self.hard_ceiling:
+            raise ValueError(
+                f"Project budget plus headroom must remain below {self.hard_ceiling / 1e9:.0f} GB"
+            )
         if self.process_limit + self.headroom > self.project_limit:
             raise ValueError("Process budget leaves insufficient project headroom")
         if not 0 <= self.cache_limit < self.mlx_limit < self.process_limit:

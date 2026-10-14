@@ -17,6 +17,11 @@ def _parser():
     parser = argparse.ArgumentParser(prog="funasr-mlx")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument("--memory-gb", type=int, choices=[1, 2, 3, 4], default=2)
+    parser.add_argument(
+        "--no-guard",
+        action="store_true",
+        help="Run in-process without the memory guard wrapper (library semantics)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     inspect = commands.add_parser("inspect", help="Inspect safetensors without loading weights")
     inspect.add_argument("checkpoint", type=Path)
@@ -257,6 +262,9 @@ def main(argv=None):
     if "FUNASR_MLX_MEMORY_POLICY" in os.environ:
         if not guarded_child_active():
             raise RuntimeError("Memory-policy environment is not an authenticated guarded child")
+        _execute(args)
+        return 0
+    if args.no_guard or os.environ.get("FUNASR_MLX_NO_GUARD") == "1":
         _execute(args)
         return 0
     policy = MemoryPolicy(process_limit=args.memory_gb * GB, mlx_limit=args.memory_gb * 625 * MB)
