@@ -149,6 +149,32 @@ Supported families: `qwen3-asr` (0.6B/1.7B), `glm-asr-nano`,
 `moss-transcribe-diarize`, `fun-asr-nano` (family inferred from the
 checkpoint directory name when omitted).
 
+## Pseudo-streaming (all transcription families)
+
+`funasr_mlx.pseudo_streaming.PseudoStream` gives every transcription model
+a streaming-style API over a growing audio buffer: each `push()` re-runs the
+model on `buffer[0:t]`, `close()` returns output bit-identical to offline
+(measured: 94.6% of displayed characters survive to final; revisions are
+confined to the rolling tail, .tmp/opt/LOG.md).
+
+- LLM families (`qwen3-asr`, `glm-asr-nano`, `moss`, `fun-asr-nano`):
+  `TranscribeWorker.pseudo_stream()`; tower+prefill recompute per push
+  (~150-800ms per 1s chunk on the 0.6B w4).
+- Classic families (`sensevoice`, `paraformer`): single-pass per push;
+  `classic_transcriber(model, config, family=..., tokens=..., cmvn=...)`
+  (cmvn REQUIRED for sensevoice -- without `am.mvn` the encoder collapses
+  to all blanks).
+
+```python
+from funasr_mlx.api import TranscribeWorker
+worker = TranscribeWorker("models/qwen3-asr-0.6b-mlx/w4a16")
+stream = worker.pseudo_stream(chunk_seconds=1.0)
+for chunk in mic:                 # numpy float32 @16k, any sizes
+    ev = stream.push(chunk)
+    if ev: render(ev.text)        # stable prefix + rolling tail
+final = stream.close()            # == offline transcription
+```
+
 ## Memory Policy
 
 The hard ceiling is 12 GB (decimal) for project processes. Numerical jobs

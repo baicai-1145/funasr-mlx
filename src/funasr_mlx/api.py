@@ -32,7 +32,30 @@ def download_model(repo, *, variant=None, dest=".", owner=None):
     return download(repo, **kwargs)
 
 
-__all__ = ["transcribe", "TranscribeWorker", "download_model"]
+def pseudo_stream(model, *, family: str | None = None, chunk_seconds: float = 1.0):
+    """Create a PseudoStream bound to a loaded LLM transcriber.
+
+    Must run inside a guard (use with TranscribeWorker / guarded child):
+
+        worker = TranscribeWorker(model)
+        stream = worker.pseudo_stream(chunk_seconds=1.0)
+        for chunk in mic_chunks:
+            ev = stream.push(chunk)
+            if ev: render(ev.text)
+        final = stream.close()   # == offline output, bit-identical
+    """
+    from .pseudo_streaming import PseudoStream
+
+    transcriber = model if hasattr(model, "transcribe_samples") else TranscribeWorker(
+        model, family=family
+    )._impl
+    return PseudoStream(
+        transcribe_fn=transcriber.transcribe_samples,
+        chunk_seconds=chunk_seconds,
+    )
+
+
+__all__ = ["transcribe", "TranscribeWorker", "download_model", "pseudo_stream"]
 
 
 class TranscribeWorker:
@@ -51,6 +74,15 @@ class TranscribeWorker:
 
     def transcribe(self, audio: str | Path) -> dict[str, Any]:
         return self._impl.transcribe_file(audio).to_dict()
+
+    def pseudo_stream(self, chunk_seconds: float = 1.0):
+        """Pseudo-streaming handle over this resident model."""
+        from .pseudo_streaming import PseudoStream
+
+        return PseudoStream(
+            transcribe_fn=self._impl.transcribe_samples,
+            chunk_seconds=chunk_seconds,
+        )
 
 
 def transcribe(

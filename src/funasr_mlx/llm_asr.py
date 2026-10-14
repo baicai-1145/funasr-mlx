@@ -191,6 +191,12 @@ class LlmAsrTranscriber:
         raise ValueError(self._kind)
 
     # ---------- main entry ----------
+    def transcribe_samples(self, samples: np.ndarray) -> str:
+        """Raw-waveform transcription (pseudo-streaming adapter entry)."""
+        embeds, fake_len = self._audio_embeds(samples)
+        text, _ = self._decode(embeds, fake_len)
+        return text
+
     def transcribe_file(self, audio_path: str | Path) -> TranscribeResult:
         import time
 
@@ -291,12 +297,11 @@ class LlmAsrTranscriber:
         raise ValueError(self._kind)
 
     def _decode_tokens(self, out, *, glm=False, moss=False):
-        if glm:
-            # glm's ids share the qwen3-style tokenizer source in this port
-            tok = self._tok()
-            return tok.decode(out)
         tok = self._tok()
-        return tok.decode(out)
+        text = tok.decode(out)
+        for tag in ("<|im_end|>", "<|endofspeech|>"):
+            text = text.replace(tag, "")
+        return text.strip()
 
 
 def resolve_family(checkpoint: str | Path, family: str | None) -> str:
