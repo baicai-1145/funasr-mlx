@@ -132,8 +132,9 @@ funasr-mlx transcribe /path/to/qwen3-asr-0.6b-w4a16-awq-w8tower-g32 --audio reco
 Python API (routes through the guarded subprocess automatically):
 
 ```python
-from funasr_mlx.api import transcribe
-result = transcribe("recording.wav", model="/path/to/checkpoint")
+from funasr_mlx.api import transcribe, download_model
+path = download_model("qwen3-asr-0.6b-mlx", variant="w4a16", dest="./models")
+result = transcribe("recording.wav", model=path / "w4a16")
 print(result["text"])
 ```
 

@@ -22,7 +22,17 @@ from typing import Any
 
 from .memory import GB, MB, MemoryPolicy, guarded_child_active
 
-__all__ = ["transcribe", "TranscribeWorker"]
+def download_model(repo, *, variant=None, dest=".", owner=None):
+    """Download a published checkpoint (see funasr_mlx.download.download)."""
+    from .download import download
+
+    kwargs = {"variant": variant, "dest": dest}
+    if owner is not None:
+        kwargs["owner"] = owner
+    return download(repo, **kwargs)
+
+
+__all__ = ["transcribe", "TranscribeWorker", "download_model"]
 
 
 class TranscribeWorker:
