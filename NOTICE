@@ -1,0 +1,22 @@
+funasr-mlx
+Copyright 2026 funasr-mlx contributors
+
+Licensed under the Apache License, Version 2.0.
+
+--------------------------------------------------------------------------
+This product includes software developed by Apple Inc.
+
+  mlx-lm — https://github.com/ml-explore/mlx-lm
+  Copyright (c) 2023-2024 Apple Inc.
+  Licensed under the Apache License, Version 2.0
+
+Vendored portions: the Qwen3/Llama decoder layouts and the basic KV cache
+under src/funasr_mlx/models/llm/. These are trimmed adaptations of upstream
+mlx_lm.models.llama and mlx_lm.models.cache; the quantized, rotating, and
+paged cache variants of upstream are not included.
+
+Per-module provenance and modification notes: docs/port-notes/
+--------------------------------------------------------------------------
+Model architectures follow their official references (FunASR, OpenAI
+Whisper, Qwen, GLM, OpenMOSS). No source code from those projects is
+included; the implementations are independent.

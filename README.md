@@ -196,9 +196,10 @@ per-family numbers are in `.tmp/t9/RESULTS.md`.
 
 Qwen3/Llama decoder layouts and the KV cache are vendored (trimmed) from
 [mlx-lm](https://github.com/ml-explore/mlx-lm) (Apache 2.0, Copyright ©
-2023-2024 Apple Inc.); source and license notes are in the module
-docstrings. Model architectures follow their official references
-(FunASR, OpenAI Whisper, Qwen, GLM, OpenMOSS).
+2023-2024 Apple Inc.). See [NOTICE](NOTICE) and `docs/port-notes/` for
+per-module provenance and modification notes. Model architectures follow
+their official references (FunASR, OpenAI Whisper, Qwen, GLM, OpenMOSS);
+no source code from those projects is included.
 
 ## Status
 
